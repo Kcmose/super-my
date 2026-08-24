@@ -443,8 +443,8 @@ load_probe_env() {
         die "replace the example Agent public origin in $PROBE_ENV_FILE"
     [[ -n "${seen[PROBE_AGENT_INSTALLER_URL]+x}" ]] ||
         die "PROBE_AGENT_INSTALLER_URL must be set explicitly in $PROBE_ENV_FILE"
-    [[ "${PROBE_AGENT_INSTALLER_URL:-}" =~ ^https://raw[.]githubusercontent[.]com/Kcmose/my-agent/([0-9a-f]{40}|refs/tags/v1[.]0[.]1)/deploy/install[.]sh$ ]] ||
-        die "PROBE_AGENT_INSTALLER_URL must use an immutable Kcmose/my-agent GitHub commit or the verified refs/tags/v1.0.1 release"
+    [[ "${PROBE_AGENT_INSTALLER_URL:-}" =~ ^https://raw[.]githubusercontent[.]com/Kcmose/my-agent/([0-9a-f]{40}|refs/tags/v1[.]0[.]2)/deploy/install[.]sh$ ]] ||
+        die "PROBE_AGENT_INSTALLER_URL must use an immutable Kcmose/my-agent GitHub commit or the verified refs/tags/v1.0.2 release"
     [[ -n "${seen[PROBE_AGENT_INSTALL_CA_FILE]+x}" ]] ||
         die "PROBE_AGENT_INSTALL_CA_FILE must be set explicitly, using an empty value in domain mode"
     [[ "${PROBE_ADMIN_ALLOWLIST_FILE:-}" == "$PROBE_ALLOWLIST_FILE" ]] ||

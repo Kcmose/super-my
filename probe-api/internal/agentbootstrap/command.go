@@ -34,7 +34,7 @@ func (generator Generator) Build(enrollmentToken string) string {
 		"--tlsv1.2", "--connect-timeout", "15", "--max-time", "60", shellQuote(generator.installerURL),
 	}
 	install := []string{
-		"sudo", "bash", "-s", "--", "-e", shellQuote(generator.publicURL), "-t", shellQuote(enrollmentToken),
+		"bash", "-s", "--", "-e", shellQuote(generator.publicURL), "-t", shellQuote(enrollmentToken),
 	}
 	if generator.caSHA256 != "" {
 		install = append(install, "-c", shellQuote(generator.caSHA256))

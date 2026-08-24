@@ -16,7 +16,7 @@ SUPER_MY_ROOT="$(readlink -f -- "${SCRIPT_DIR}/../../..")"
 readonly SUPER_MY_ROOT
 readonly SUPER_MY_REF="refs/tags/v1.1.0"
 readonly WEB_REF="refs/tags/v1.0.0"
-readonly AGENT_REF="refs/tags/v1.0.1"
+readonly AGENT_REF="refs/tags/v1.0.2"
 readonly SUPER_MY_REMOTE="https://github.com/Kcmose/super-my.git"
 readonly WEB_REMOTE="https://github.com/Kcmose/my.git"
 readonly AGENT_REMOTE="https://github.com/Kcmose/my-agent.git"

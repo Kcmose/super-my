@@ -243,8 +243,8 @@ func TestAdminManagementTokenResponsesAreOneTimeAndNeverCached(t *testing.T) {
 				body := response.Body.String()
 				for _, expected := range []string{
 					"install_command",
-					"https://raw.githubusercontent.com/Kcmose/my-agent/refs/tags/v1.0.1/deploy/install.sh",
-					"sudo bash -s --", "-e", "https://api.example.com", "-t",
+					"https://raw.githubusercontent.com/Kcmose/my-agent/refs/tags/v1.0.2/deploy/install.sh",
+					"bash -s --", "-e", "https://api.example.com", "-t",
 				} {
 					if !strings.Contains(body, expected) {
 						t.Fatalf("enrollment response is missing %q: %s", expected, body)

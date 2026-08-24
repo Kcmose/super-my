@@ -207,6 +207,35 @@ PATH=$STUB_ROOT PROBE_BOOTSTRAP_TRUNCATION_MARKER=$MARKER /bin/bash "$WITHOUT_EN
     fail 'function-only installer should parse without executing'
 [ ! -e "$MARKER" ] || fail 'installer without final entrypoint executed an external command'
 
+ENTRY_SIM_ROOT=$TEST_ROOT/directory-entry-validation
+mkdir -p "$ENTRY_SIM_ROOT/empty" "$ENTRY_SIM_ROOT/allowed" \
+    "$ENTRY_SIM_ROOT/unexpected-visible" "$ENTRY_SIM_ROOT/unexpected-hidden"
+: > "$ENTRY_SIM_ROOT/allowed/release"
+: > "$ENTRY_SIM_ROOT/allowed/.managed"
+: > "$ENTRY_SIM_ROOT/allowed/..double-dot-name"
+: > "$ENTRY_SIM_ROOT/unexpected-visible/release"
+: > "$ENTRY_SIM_ROOT/unexpected-visible/foreign"
+: > "$ENTRY_SIM_ROOT/unexpected-hidden/release"
+: > "$ENTRY_SIM_ROOT/unexpected-hidden/.foreign"
+/bin/bash -c '
+    source "$1"
+    assert_directory_contains_only empty "$2/empty"
+    assert_directory_contains_only allowed "$2/allowed" release .managed ..double-dot-name
+' probe-directory-entry-allowed "$WITHOUT_ENTRYPOINT" "$ENTRY_SIM_ROOT" ||
+    fail 'directory entry validation rejected an empty or exact allowlisted layout'
+if /bin/bash -c '
+    source "$1"
+    assert_directory_contains_only visible "$2/unexpected-visible" release
+' probe-directory-entry-visible "$WITHOUT_ENTRYPOINT" "$ENTRY_SIM_ROOT" >/dev/null 2>&1; then
+    fail 'directory entry validation accepted an unexpected visible entry'
+fi
+if /bin/bash -c '
+    source "$1"
+    assert_directory_contains_only hidden "$2/unexpected-hidden" release
+' probe-directory-entry-hidden "$WITHOUT_ENTRYPOINT" "$ENTRY_SIM_ROOT" >/dev/null 2>&1; then
+    fail 'directory entry validation accepted an unexpected hidden entry'
+fi
+
 SOCKET_SIM_ROOT=$TEST_ROOT/socket-rollback
 SOCKET_SIM_LOG=$SOCKET_SIM_ROOT/systemctl.log
 mkdir "$SOCKET_SIM_ROOT"
@@ -252,9 +281,10 @@ for contract in \
     'PANEL_VERSION="${PROBE_PANEL_RELEASE_VERSION:-v1.1.0}"' \
     'SUPER_MY_REF="refs/tags/v1.1.0"' \
     'WEB_REF="refs/tags/v1.0.0"' \
-    'AGENT_REF="refs/tags/v1.0.1"' \
+    'AGENT_REF="refs/tags/v1.0.2"' \
     'LEGACY_PANEL_VERSION="v1.0.0"' \
     'LEGACY_SUPER_MY_REF="refs/tags/v1.0.0"' \
+    'LEGACY_AGENT_REF="refs/tags/v1.0.1"' \
     'probe-panel-${PANEL_VERSION}-linux-${architecture}.tar.gz' \
     "https://github.com/Kcmose/super-my/releases/download/" \
     "--proto '=https'" \
@@ -306,6 +336,9 @@ for contract in \
     'migrate-bootstrap) migrate_bootstrap_action' \
     'validate_legacy_release_bundle()' \
     'validate_legacy_bootstrap_metadata()' \
+    'assert_directory_contains_only()' \
+    'assert_root_regular_file "$root/BUNDLE-SHA256SUMS" 600' \
+    'require_dir(release_ui, 0o700)' \
     'only pending or configuring v1.0.0 bootstrap state can be migrated' \
     'the v1.0.0 immutable release failed its internal SHA256 verification' \
     'the active setup binary does not match the immutable v1.0.0 release' \

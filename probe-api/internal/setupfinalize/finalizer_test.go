@@ -920,7 +920,7 @@ func writeTestBundle(t *testing.T, root string) {
 			"PROBE_API_LISTEN_ADDR=127.0.0.1:8080", "PROBE_DATABASE_URL=postgresql://placeholder",
 			"PROBE_INGRESS_MODE=domain",
 			"PROBE_ADMIN_ORIGIN=https://admin.example.com", "PROBE_AGENT_PUBLIC_URL=https://api.example.com",
-			"PROBE_AGENT_INSTALLER_URL=https://raw.githubusercontent.com/Kcmose/my-agent/refs/tags/v1.0.1/deploy/install.sh",
+			"PROBE_AGENT_INSTALLER_URL=https://raw.githubusercontent.com/Kcmose/my-agent/refs/tags/v1.0.2/deploy/install.sh",
 			"PROBE_AGENT_INSTALL_CA_FILE=",
 			"PROBE_ADMIN_ALLOWLIST_FILE=/etc/probe-panel/admin-allowlist.geo", "PROBE_TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128", "",
 		}, "\n"),

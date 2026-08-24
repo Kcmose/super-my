@@ -115,7 +115,7 @@ Agent 不提交可信 `node_id`；API 从 Token 绑定关系取得节点身份�
 | GET/HEAD | `/downloads/probe-agent/linux-amd64/probe-agent` | 精确路径 | Linux amd64 Agent |
 | GET/HEAD | `/downloads/probe-agent/linux-arm64/probe-agent` | 精确路径 | Linux arm64 Agent |
 
-这些文件不需要 Agent Token，因为它们不含节点身份或秘密；令牌只在管理员接口响应中出现，绝不能进入下载 URL。主命令从 GitHub Raw 当前明确允许的 `refs/tags/v1.0.1` 不可变 Release 取得安装器，再用 `-e/-t` 调用；安装器完整解析前不得产生副作用，短参数令牌可能短暂出现在进程参数和 Shell 历史，界面必须警告。私有 CA 模式只对固定 `ca.pem` 做一次无秘密下载并校验命令内的精确 SHA-256，匹配前不得发送令牌。Nginx 禁止其他文件名、目录列表和写方法，panel/admin Host 对全部 `/downloads/*` 返回 `404`。发布器同时原子切换目录和清单，切换竞争最多导致校验失败并要求重新签发，不能降级放行。
+这些文件不需要 Agent Token，因为它们不含节点身份或秘密；令牌只在管理员接口响应中出现，绝不能进入下载 URL。主命令从 GitHub Raw 当前明确允许的 `refs/tags/v1.0.2` 不可变 Release 取得安装器，再在 root Shell 中用 `bash -s -- -e/-t` 调用，不依赖 `sudo`；安装器完整解析前不得产生副作用，短参数令牌可能短暂出现在进程参数和 Shell 历史，界面必须警告。私有 CA 模式只对固定 `ca.pem` 做一次无秘密下载并校验命令内的精确 SHA-256，匹配前不得发送令牌。Nginx 禁止其他文件名、目录列表和写方法，panel/admin Host 对全部 `/downloads/*` 返回 `404`。发布器同时原子切换目录和清单，切换竞争最多导致校验失败并要求重新签发，不能降级放行。
 
 ### 3.5 可选公共只读路由（仅 api 主机）
 

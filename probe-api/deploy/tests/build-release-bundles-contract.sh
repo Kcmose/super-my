@@ -51,7 +51,7 @@ for contract in \
     'VERSION="v1.1.0"' \
     'SUPER_MY_REF="refs/tags/v1.1.0"' \
     'WEB_REF="refs/tags/v1.0.0"' \
-    'AGENT_REF="refs/tags/v1.0.1"' \
+    'AGENT_REF="refs/tags/v1.0.2"' \
     'SUPER_MY_REMOTE="https://github.com/Kcmose/super-my.git"' \
     'WEB_REMOTE="https://github.com/Kcmose/my.git"' \
     'AGENT_REMOTE="https://github.com/Kcmose/my-agent.git"' \

@@ -12,9 +12,10 @@ PANEL_VERSION="${PROBE_PANEL_RELEASE_VERSION:-v1.1.0}"
 RELEASE_BASE_URL="${PROBE_PANEL_RELEASE_BASE_URL:-https://github.com/Kcmose/super-my/releases/download/${PANEL_VERSION}}"
 SUPER_MY_REF="refs/tags/v1.1.0"
 WEB_REF="refs/tags/v1.0.0"
-AGENT_REF="refs/tags/v1.0.1"
+AGENT_REF="refs/tags/v1.0.2"
 LEGACY_PANEL_VERSION="v1.0.0"
 LEGACY_SUPER_MY_REF="refs/tags/v1.0.0"
+LEGACY_AGENT_REF="refs/tags/v1.0.1"
 
 SETUP_STATE_ROOT="/var/lib/probe-panel/setup"
 SETUP_STATE_FILE="${SETUP_STATE_ROOT}/state.json"
@@ -651,6 +652,30 @@ assert_root_directory() {
         die "legacy bootstrap directory ownership or mode is invalid: $path"
 }
 
+assert_directory_contains_only() {
+    local label="$1" directory="$2"
+    shift 2
+    local entry entry_name allowed_name allowed
+
+    # Keep glob options scoped to a subshell. Explicit hidden-file patterns
+    # avoid both skipping dotfiles and treating an unmatched literal `.*` as
+    # an unexpected entry on otherwise valid, empty layouts.
+    (
+        shopt -s nullglob
+        for entry in "$directory"/* "$directory"/.[!.]* "$directory"/..?*; do
+            entry_name="${entry##*/}"
+            allowed=0
+            for allowed_name in "$@"; do
+                if [[ "$entry_name" == "$allowed_name" ]]; then
+                    allowed=1
+                    break
+                fi
+            done
+            ((allowed == 1)) || die "$label contains an unexpected entry: $entry"
+        done
+    )
+}
+
 validate_legacy_release_bundle() {
     local root="$1" architecture="$2"
     local manifest="$root/RELEASE-MANIFEST" required expected_paths manifest_paths entry
@@ -659,7 +684,10 @@ validate_legacy_release_bundle() {
     [[ "$(stat -c '%U:%G' "$root")" == root:root ]] || die 'the v1.0.0 release is not root-owned'
     assert_root_regular_file "$root/$MANAGED_MARKER" 600
     assert_root_regular_file "$manifest" 644
-    assert_root_regular_file "$root/BUNDLE-SHA256SUMS" 644
+    # The immutable v1.0.0 bootstrap copies its verified checksum manifest
+    # into the installed release under the installer umask, so its exact
+    # deployed mode is 0600 rather than the source archive's 0644.
+    assert_root_regular_file "$root/BUNDLE-SHA256SUMS" 600
 
     [[ "$(wc -l < "$manifest")" -eq 6 ]] || die 'the v1.0.0 release metadata has unexpected fields'
     grep -Fxq 'format=probe-panel-release-v1' "$manifest" || die 'the v1.0.0 release metadata format is invalid'
@@ -667,14 +695,11 @@ validate_legacy_release_bundle() {
     grep -Fxq "architecture=linux-$architecture" "$manifest" || die 'the v1.0.0 release architecture does not match this server'
     grep -Fxq "super_my_ref=$LEGACY_SUPER_MY_REF" "$manifest" || die 'the v1.0.0 server source ref is invalid'
     grep -Fxq "my_ref=$WEB_REF" "$manifest" || die 'the v1.0.0 visitor source ref is invalid'
-    grep -Fxq "my_agent_ref=$AGENT_REF" "$manifest" || die 'the v1.0.0 Agent source ref is invalid'
+    grep -Fxq "my_agent_ref=$LEGACY_AGENT_REF" "$manifest" || die 'the v1.0.0 Agent source ref is invalid'
 
-    for entry in "$root"/* "$root"/.*; do
-        case "${entry##*/}" in
-            .|..|artifacts|setup|source|BUNDLE-SHA256SUMS|RELEASE-MANIFEST|"$MANAGED_MARKER") ;;
-            *) die "the v1.0.0 release has an unexpected root entry: $entry" ;;
-        esac
-    done
+    assert_directory_contains_only \
+        'the v1.0.0 release' "$root" \
+        artifacts setup source BUNDLE-SHA256SUMS RELEASE-MANIFEST "$MANAGED_MARKER"
     [[ -z "$(find "$root" -type l -print -quit)" ]] || die 'the v1.0.0 release contains a symbolic link'
     [[ -z "$(find "$root" ! -type d ! -type f -print -quit)" ]] || die 'the v1.0.0 release contains a special file'
 
@@ -770,7 +795,7 @@ require_dir(state_root, 0o700)
 require_dir(config_root, 0o750)
 require_dir(program_root, 0o755)
 require_dir(ui_root, 0o755)
-require_dir(release_ui, 0o755)
+require_dir(release_ui, 0o700)
 require_file(state_file, 0o600)
 require_file(code_file, 0o600)
 require_file(env_file, 0o600)
@@ -844,7 +869,7 @@ with open(env_file, "r", encoding="utf-8") as handle:
 if environment != expected_environment or environment_order != list(expected_environment):
     fail("legacy setup environment does not match the pinned v1.0.0 layout")
 
-def tree(root, ignored=()):
+def tree(root, directory_mode, ignored=()):
     result = {}
     for current, directories, files in os.walk(root, topdown=True, followlinks=False):
         for name in directories:
@@ -854,7 +879,7 @@ def tree(root, ignored=()):
                 not stat.S_ISDIR(info.st_mode)
                 or info.st_uid != 0
                 or info.st_gid != 0
-                or stat.S_IMODE(info.st_mode) != 0o755
+                or stat.S_IMODE(info.st_mode) != directory_mode
             ):
                 fail(f"unsafe directory in legacy setup UI: {path}")
         for name in files:
@@ -877,37 +902,25 @@ def tree(root, ignored=()):
             result[relative] = digest.hexdigest()
     return result
 
-if tree(ui_root, {marker}) != tree(release_ui):
+if tree(ui_root, 0o755, {marker}) != tree(release_ui, 0o700):
     fail("active setup UI does not exactly match the immutable v1.0.0 release")
 print(status)
 PY
 }
 
 validate_legacy_bootstrap() {
-    local architecture="$1" path release_entry parent_entry
+    local architecture="$1" path
     LEGACY_RELEASE="$RELEASES_ROOT/probe-panel-${LEGACY_PANEL_VERSION}-linux-${architecture}"
 
     assert_root_directory /srv/probe 755
     assert_root_directory "$RELEASES_ROOT" 755
     assert_root_directory /var/lib/probe-panel 700
-    for release_entry in "$RELEASES_ROOT"/* "$RELEASES_ROOT"/.*; do
-        case "${release_entry##*/}" in
-            .|..|"${LEGACY_RELEASE##*/}") ;;
-            *) die "the legacy releases directory contains an unexpected entry: $release_entry" ;;
-        esac
-    done
-    for parent_entry in /srv/probe/* /srv/probe/.*; do
-        case "${parent_entry##*/}" in
-            .|..|releases|setup-ui) ;;
-            *) die "the legacy /srv/probe layout contains an unexpected entry: $parent_entry" ;;
-        esac
-    done
-    for parent_entry in /var/lib/probe-panel/* /var/lib/probe-panel/.*; do
-        case "${parent_entry##*/}" in
-            .|..|setup) ;;
-            *) die "the legacy /var/lib/probe-panel layout contains an unexpected entry: $parent_entry" ;;
-        esac
-    done
+    assert_directory_contains_only \
+        'the legacy releases directory' "$RELEASES_ROOT" "${LEGACY_RELEASE##*/}"
+    assert_directory_contains_only \
+        'the legacy /srv/probe layout' /srv/probe releases setup-ui
+    assert_directory_contains_only \
+        'the legacy /var/lib/probe-panel layout' /var/lib/probe-panel setup
 
     for path in \
         "$SETUP_SOCKET_UNIT" "$SETUP_SOCKET_PATH" \

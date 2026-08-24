@@ -134,7 +134,7 @@ jobs:
                       f"architecture=linux-{architecture}",
                       "super_my_ref=refs/tags/v1.1.0",
                       "my_ref=refs/tags/v1.0.0",
-                      "my_agent_ref=refs/tags/v1.0.1",
+                      "my_agent_ref=refs/tags/v1.0.2",
                   ]
                   if release_manifest != expected_manifest:
                       raise SystemExit(f"{archive.name}: RELEASE-MANIFEST mismatch")

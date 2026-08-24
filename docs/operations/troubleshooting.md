@@ -206,7 +206,7 @@ Agent 入口上的 `/panel/*`、`/auth/*`、`/admin/*` 和根路径都应返回 
 
 一键安装失败时先不要重新粘贴同一条命令。按错误阶段检查：
 
-- `sudo` 或 `bash` 不存在：安装前补齐命令明确要求的基础工具，或进入 root Shell 后按文档手工下载固定 GitHub 安装器；不要把 URL 改成未固定的分支。
+- 提示必须使用 root：先登录 root 或执行 `sudo -i` 进入 root Shell，再重新签发并粘贴命令。生成的命令只依赖 `bash`，不会要求最小 Debian 预装 `sudo`；不要把 URL 改成未固定的分支。
 - 初始 GitHub Raw `curl` 失败：核对目标机 DNS、时间、系统 CA 和外网访问；不能手工加 `-k/--insecure`。网络恢复后重新执行仍未过期的命令，或重新签发。
 - `private CA SHA256 verification failed`：Agent Host 的固定 `ca.pem` 与 API 启动时读取的证书不一致，必须修复发布文件并重新签发；禁止删除 `-c` 或跳过校验。
 - `SHA256 verification failed` 或清单项不唯一：可能正好遇到发布切换或文件不一致；等待发布完成，在管理面板重新签发命令，不要跳过校验。

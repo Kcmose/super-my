@@ -42,15 +42,15 @@ sha256sum /var/tmp/probe-agent
 1. 点击“新建节点”，保持节点为已启用并保存元数据和采集设置；禁用节点不会签发安装命令；
 2. 保存成功后，管理端自动请求一枚默认 900 秒有效、只能消费一次的注册令牌；同节点此前未使用的安装命令会立即失效；
 3. API 只在本次禁止缓存的响应中返回安装命令，前端不写入 `localStorage`、`sessionStorage` 或日志；
-4. 在目标 Linux 主机可使用 `sudo` 的 Shell 中直接粘贴完整单行命令；命令会通过 `sudo bash` 进入 root 安装器；
+4. 先登录 root 或执行 `sudo -i` 进入 root Shell，再直接粘贴完整单行命令；命令通过 `bash` 启动安装器，不依赖目标机预装 `sudo`；
 5. 关闭弹窗会移除当前页面对命令的引用，但不会替你清除 Shell 历史、浏览器开发工具或系统剪贴板；使用后应主动覆盖。若命令过期或丢失，在未注册节点上重新签发即可；
 6. 已注册节点会显示“重新安装命令”并二次确认。新命令本身不影响当前 Agent，但它一旦在任意主机注册成功，原 Agent Token 会立即失效。
 
-目标机至少需要 systemd、`sudo`、`bash`、`curl`、`sha256sum`、`awk`、`install`、`getent`、`useradd/groupadd` 及常用 coreutils。命令以严格 HTTPS 从 `https://raw.githubusercontent.com/Kcmose/my-agent/refs/tags/v1.0.1/deploy/install.sh` 读取安装器；该 GitHub Release 已启用不可变保护，标签锁定后不能移动或复用，执行内容不会随 `main` 漂移。安装器把全部副作用放在最终 `main()` 中，只有 Shell 完整解析下载内容及文件末尾入口后才开始安装；中途截断不会留下半安装或落盘令牌。随后它由 `-e` 自动推导 Agent API 与下载根，自动识别 `amd64`/`arm64`，再下载 `SHA256SUMS`、对应二进制和 systemd 单元，严格校验清单中的唯一 SHA256 项后才落盘。各下载有明确连接与总时限，最坏预算明显短于 15 分钟令牌期限。
+目标机至少需要 systemd、`bash`、`curl`、`sha256sum`、`awk`、`install`、`getent`、`useradd/groupadd` 及常用 coreutils；安装命令必须在 root Shell 中执行，但不要求系统安装 `sudo`。命令以严格 HTTPS 从 `https://raw.githubusercontent.com/Kcmose/my-agent/refs/tags/v1.0.2/deploy/install.sh` 读取安装器；该 GitHub Release 已启用不可变保护，标签锁定后不能移动或复用，执行内容不会随 `main` 漂移。安装器把全部副作用放在最终 `main()` 中，只有 Shell 完整解析下载内容及文件末尾入口后才开始安装；中途截断不会留下半安装或落盘令牌。随后它由 `-e` 自动推导 Agent API 与下载根，自动识别 `amd64`/`arm64`，再下载 `SHA256SUMS`、对应二进制和 systemd 单元，严格校验清单中的唯一 SHA256 项后才落盘。各下载有明确连接与总时限，最坏预算明显短于 15 分钟令牌期限。
 
 安装器会创建或严格验证 `probe-agent` 低权限用户；既有账户必须是非 root、主组唯一、无附加组并使用非登录 Shell。注册成功后，它原子删除环境文件中的 `PROBE_AGENT_ENROLLMENT_TOKEN` 并重启服务，确认没有一次性令牌也能从 `state.json` 恢复。失败时同样删除落盘令牌、停止并禁用服务；若尚未产生 Agent 身份，还会删除本次创建的固定托管文件以允许干净重试。任一固定二进制、配置、CA、systemd 单元、`state.json` 已存在或服务已运行都会拒绝，绝不把首次安装器当升级器。下载目录只包含公开资产，不包含节点令牌。
 
-安装命令本身包含一次性令牌，可能被终端写入 Shell 历史、浏览器开发工具和系统剪贴板。Komari 式短命令通过 `-t` 传入令牌，因此令牌也会短暂出现在 `sudo bash` 的进程参数中；它仍不会进入下载 URL，安装器不会记录其值，注册完成或失败后也会从磁盘环境文件清除。只在可信管理员终端操作，不要发到聊天、工单或共享脚本。15 分钟有效期、一次消费和注册后清理只缩短风险窗口，不能把命令当成非敏感文本。需要避免命令行参数时，可继续手动下载已校验安装器并使用兼容的 `--enrollment-token-stdin`。
+安装命令本身包含一次性令牌，可能被终端写入 Shell 历史、浏览器开发工具和系统剪贴板。Komari 式短命令通过 `-t` 传入令牌，因此令牌也会短暂出现在 `bash` 的进程参数中；它仍不会进入下载 URL，安装器不会记录其值，注册完成或失败后也会从磁盘环境文件清除。只在可信管理员终端操作，不要发到聊天、工单或共享脚本。15 分钟有效期、一次消费和注册后清理只缩短风险窗口，不能把命令当成非敏感文本。需要避免命令行参数时，可继续手动下载已校验安装器并使用兼容的 `--enrollment-token-stdin`。
 
 私有 CA 的 IP+端口模式下，API 通过 `PROBE_AGENT_INSTALL_CA_FILE` 在启动时读取并验证公开 PEM 证书，只把该文件的 64 位 SHA-256 写入命令；同一证书必须作为固定 `/downloads/probe-agent/ca.pem` 发布。安装器第一次获取 `ca.pem` 时不发送令牌，只在精确哈希匹配后才把它设为后续 curl 与 Agent 的 CA；不匹配立即失败，不能继续下载清单或注册。该文件不得包含私钥。三域名模式必须使用系统公信证书且不配置此项。
 

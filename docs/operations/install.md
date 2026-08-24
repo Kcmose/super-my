@@ -6,7 +6,7 @@
 
 一键安装仅支持 Debian 13 的 Linux `amd64`/`arm64`。执行前确认：
 
-- 使用全新或已人工清点的专用主机，并具有 `root` 或 `sudo` 权限。安装器发现既有/残留 Probe Panel 文件或 systemd 单元会拒绝覆盖；发现正在运行的 Nginx 也会拒绝继续。
+- 使用全新或已人工清点的专用主机，并先登录 root 或执行 `sudo -i` 进入 root Shell。后续单行命令直接调用 `bash`，不依赖最小 Debian 预装 `sudo`。安装器发现既有/残留 Probe Panel 文件或 systemd 单元会拒绝覆盖；发现正在运行的 Nginx 也会拒绝继续。
 - 入口二选一：三个域名全部留空，自动使用服务器 IP 的固定 HTTPS 端口；或准备三个不同且互不包含的真实域名。不能只填其中一两个域名。
 - IP 模式默认端口为游客 `18453`、Agent `18454`、管理 `18455`，必须在云安全组、主机防火墙和 NAT 中按需放行；向导会显示自动检测的服务器 IP，也允许在 NAT 场景改成实际对外 IPv4/IPv6。三个端口不能被其他进程占用。
 - 域名模式要求三个 DNS `A`/`AAAA` 都已解析到服务器，公网 TCP `80/443` 可达且未被占用；ACME HTTP-01 期间不要让 CDN 或其他 Web 服务接管请求。
@@ -26,7 +26,7 @@ certbot          iproute2  util-linux
 ```bash
 curl -fsSL --proto '=https' --tlsv1.2 \
   https://raw.githubusercontent.com/Kcmose/super-my/refs/tags/v1.1.0/install.sh \
-  | sudo bash
+  | bash
 ```
 
 脚本会识别架构，下载对应的预编译 GitHub Release 和 `SHA256SUMS`，校验 SHA-256 后安全解包。它不会从 `main` 构建，也不会接收数据库密码、管理员密码或域名参数。安装过程中 Nginx 保持停止，PostgreSQL 只允许本机监听。成功后终端直接显示 SSH 隧道和浏览器地址，不生成、不保存也不要求安装码。
@@ -38,7 +38,7 @@ curl -fsSL --proto '=https' --tlsv1.2 \
 ```bash
 curl -fsSL --proto '=https' --tlsv1.2 \
   https://raw.githubusercontent.com/Kcmose/super-my/refs/tags/v1.1.0/install.sh \
-  | sudo bash -s -- migrate-bootstrap
+  | bash -s -- migrate-bootstrap
 ```
 
 迁移只接受能够逐项证明为官方 `v1.0.0` 脚本创建、状态为 `pending` 或 `configuring`、且从未进入正式部署的 bootstrap。脚本会复验旧 Release 的内部 SHA-256 清单，以及活动 binary、Setup UI、systemd 单元、环境文件、状态和旧安装码记录；只要发现 `finalizing`、`installed`、`recovery_required`、正式 API/Nginx/前端文件、Finalize 请求/结果、未知文件或任何混合版本，就会失败关闭，不会猜测或覆盖。
@@ -258,7 +258,7 @@ editor /srv/probe/config/probe-api.env
 两种模式都要替换：
 
 - `PROBE_DATABASE_URL`：真实 PostgreSQL URL，Host 必须为 loopback；密码中的保留字符必须进行 URL 百分号编码；
-- `PROBE_AGENT_INSTALLER_URL`：当前源码已核验并明确允许的 `Kcmose/my-agent/refs/tags/v1.0.1` Raw URL；完整 40 位小写提交仅保留兼容，不要使用其他未经核验的版本标签、可变的 `main` 或 `refs/heads/*`；
+- `PROBE_AGENT_INSTALLER_URL`：当前源码已核验并明确允许的 `Kcmose/my-agent/refs/tags/v1.0.2` Raw URL；完整 40 位小写提交仅保留兼容，不要使用其他未经核验的版本标签、可变的 `main` 或 `refs/heads/*`；
 - `PROBE_ADMIN_ALLOWLIST_FILE=/etc/probe-panel/admin-allowlist.geo`。
 
 生产固定值：

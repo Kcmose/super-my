@@ -12,13 +12,13 @@ import (
 
 func TestBuildUsesVerifiedHTTPSAndQuotesOneTimeToken(t *testing.T) {
 	token := "enroll.v1.one-time-secret"
-	installerURL := "https://raw.githubusercontent.com/Kcmose/my-agent/refs/tags/v1.0.1/deploy/install.sh"
+	installerURL := "https://raw.githubusercontent.com/Kcmose/my-agent/refs/tags/v1.0.2/deploy/install.sh"
 	command := New("https://agent.example.com:8443", installerURL, nil).Build(token)
 
 	for _, expected := range []string{
 		"curl -q -fsSL", "--proto", "=https", "--proto-redir", "--tlsv1.2",
 		"--connect-timeout", "--max-time",
-		installerURL, "sudo bash -s --", "-e", "https://agent.example.com:8443", "-t", token,
+		installerURL, "bash -s --", "-e", "https://agent.example.com:8443", "-t", token,
 	} {
 		if !strings.Contains(command, expected) {
 			t.Fatalf("command does not contain %q: %s", expected, command)
@@ -53,7 +53,7 @@ func TestBuildUsesConfiguredPublicCAFingerprint(t *testing.T) {
 }
 
 func TestBuildKeepsPrivateCAPreviewCommandCompact(t *testing.T) {
-	installerURL := "https://raw.githubusercontent.com/Kcmose/my-agent/refs/tags/v1.0.1/deploy/install.sh"
+	installerURL := "https://raw.githubusercontent.com/Kcmose/my-agent/refs/tags/v1.0.2/deploy/install.sh"
 	token := "enroll.v1.abcdefghijklmnopqrstuvwxyz01234567890123456"
 	command := New("https://192.168.33.253:18454", installerURL, []byte("PUBLIC CA\n")).Build(token)
 
@@ -78,13 +78,7 @@ func TestBuildRunsDownloadedInstallerWithExpectedArguments(t *testing.T) {
 set -eu
 printf '%s\n' '#!/bin/sh' 'set -eu' 'printf '\''%s\n'\'' "$@" > "$PROBE_BOOTSTRAP_CAPTURE"'
 `
-	fakeSudo := `#!/bin/sh
-set -eu
-[ "$1" = bash ]
-shift
-exec bash "$@"
-`
-	for name, contents := range map[string]string{"curl": fakeCurl, "sudo": fakeSudo} {
+	for name, contents := range map[string]string{"curl": fakeCurl} {
 		path := filepath.Join(temporaryDirectory, name)
 		if err := os.WriteFile(path, []byte(contents), 0o700); err != nil {
 			t.Fatal(err)

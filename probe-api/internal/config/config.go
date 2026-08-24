@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	verifiedAgentInstallerReleaseRevision = "refs/tags/v1.0.1"
+	verifiedAgentInstallerReleaseRevision = "refs/tags/v1.0.2"
 	defaultAgentInstallerURL              = "https://raw.githubusercontent.com/Kcmose/my-agent/" + verifiedAgentInstallerReleaseRevision + "/deploy/install.sh"
 )
 
@@ -299,7 +299,7 @@ func validateAgentInstallerURL(value string) error {
 	isFullCommit := len(revision) == 40 && strings.Trim(revision, "0123456789abcdef") == ""
 	isVerifiedRelease := revision == verifiedAgentInstallerReleaseRevision
 	if !isFullCommit && !isVerifiedRelease {
-		return errors.New("PROBE_AGENT_INSTALLER_URL must pin a full lowercase Git commit or the verified refs/tags/v1.0.1 release")
+		return errors.New("PROBE_AGENT_INSTALLER_URL must pin a full lowercase Git commit or the verified refs/tags/v1.0.2 release")
 	}
 	return nil
 }

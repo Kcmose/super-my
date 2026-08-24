@@ -118,7 +118,7 @@ curl --fail-with-body \
 }
 ```
 
-命令使用严格 HTTPS 从显式配置的 `PROBE_AGENT_INSTALLER_URL` 下载安装器；默认使用 `Kcmose/my-agent/refs/tags/v1.0.1`，对应已核验的 GitHub `immutable=true` Release。部署器只接受当前源码明确允许的这个 Release，并为旧配置兼容完整 40 位小写提交；它拒绝其他未经核验的版本标签、`main`、`refs/heads/*` 和省略 `refs/tags/` 的歧义形式。安装器必须完整解析到最终入口后才产生安装副作用，再从 Agent 入口下载 `SHA256SUMS`、systemd 单元和当前架构二进制并逐项校验。私有 CA IP 模式只在命令中加入 64 位证书 SHA-256；安装器可在不携带秘密的固定 `ca.pem` 请求中暂时跳过常规 PKI 链验证，但必须先校验精确哈希，随后才允许下载清单、发送令牌或注册，并使用该证书严格验证所有连接。生成命令本身不含 `-k/--insecure`。`probe-api serve` 必须显式设置真实 `PROBE_AGENT_PUBLIC_URL`；禁用节点请求该端点返回 `409`。
+命令使用严格 HTTPS 从显式配置的 `PROBE_AGENT_INSTALLER_URL` 下载安装器；默认使用 `Kcmose/my-agent/refs/tags/v1.0.2`，对应已核验的 GitHub `immutable=true` Release。部署器只接受当前源码明确允许的这个 Release，并为旧配置兼容完整 40 位小写提交；它拒绝其他未经核验的版本标签、`main`、`refs/heads/*` 和省略 `refs/tags/` 的歧义形式。命令要求管理员先进入 root Shell，再直接调用 `bash`，不依赖最小 Debian 预装 `sudo`。安装器必须完整解析到最终入口后才产生安装副作用，再从 Agent 入口下载 `SHA256SUMS`、systemd 单元和当前架构二进制并逐项校验。私有 CA IP 模式只在命令中加入 64 位证书 SHA-256；安装器可在不携带秘密的固定 `ca.pem` 请求中暂时跳过常规 PKI 链验证，但必须先校验精确哈希，随后才允许下载清单、发送令牌或注册，并使用该证书严格验证所有连接。生成命令本身不含 `-k/--insecure`。`probe-api serve` 必须显式设置真实 `PROBE_AGENT_PUBLIC_URL`；禁用节点请求该端点返回 `409`。
 
 `GET /api/v1/admin/system/status` 只供管理员读取，返回 API 与数据库的粗粒度就绪状态、V1 契约版本、UTC 检查时间，以及 API 进程能够强制或定义的管理白名单、管理员 Session、管理写请求 CSRF 和远程操作禁用边界。它不声称在运行时验证 Nginx Host/Agent 入口拓扑，也不返回 DSN、环境变量、主机信息、底层错误、凭据或服务控制入口；该 GET 不需要 CSRF Token，但仍要求有效管理员 Session 和来源白名单。
 

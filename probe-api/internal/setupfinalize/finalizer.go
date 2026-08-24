@@ -21,7 +21,7 @@ import (
 	"probe-api/internal/setup"
 )
 
-const verifiedAgentInstallerURL = "https://raw.githubusercontent.com/Kcmose/my-agent/refs/tags/v1.0.1/deploy/install.sh"
+const verifiedAgentInstallerURL = "https://raw.githubusercontent.com/Kcmose/my-agent/refs/tags/v1.0.2/deploy/install.sh"
 
 // Paths is intentionally explicit. Production uses DefaultPaths; tests use an
 // isolated root without weakening any production path checks.

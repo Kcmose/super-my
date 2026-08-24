@@ -11,7 +11,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -19,9 +18,10 @@ import (
 	"probe-api/internal/access"
 )
 
-const defaultAgentInstallerURL = "https://raw.githubusercontent.com/Kcmose/my-agent/refs/tags/v1.0.0/deploy/install.sh"
-
-var agentInstallerVersionPattern = regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
+const (
+	verifiedAgentInstallerReleaseRevision = "refs/tags/v1.0.1"
+	defaultAgentInstallerURL              = "https://raw.githubusercontent.com/Kcmose/my-agent/" + verifiedAgentInstallerReleaseRevision + "/deploy/install.sh"
+)
 
 type Config struct {
 	ListenAddress             string
@@ -297,10 +297,9 @@ func validateAgentInstallerURL(value string) error {
 	}
 	revision := strings.TrimSuffix(strings.TrimPrefix(parsed.Path, pathPrefix), pathSuffix)
 	isFullCommit := len(revision) == 40 && strings.Trim(revision, "0123456789abcdef") == ""
-	version := strings.TrimPrefix(revision, "refs/tags/")
-	isReleaseTag := version != revision && agentInstallerVersionPattern.MatchString(version)
-	if !isFullCommit && !isReleaseTag {
-		return errors.New("PROBE_AGENT_INSTALLER_URL must pin a full lowercase Git commit or refs/tags/vMAJOR.MINOR.PATCH release")
+	isVerifiedRelease := revision == verifiedAgentInstallerReleaseRevision
+	if !isFullCommit && !isVerifiedRelease {
+		return errors.New("PROBE_AGENT_INSTALLER_URL must pin a full lowercase Git commit or the verified refs/tags/v1.0.1 release")
 	}
 	return nil
 }

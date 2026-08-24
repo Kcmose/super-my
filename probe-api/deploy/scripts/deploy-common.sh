@@ -246,8 +246,8 @@ load_probe_env() {
         die "replace the example Agent public origin in $PROBE_ENV_FILE"
     [[ -n "${seen[PROBE_AGENT_INSTALLER_URL]+x}" ]] ||
         die "PROBE_AGENT_INSTALLER_URL must be set explicitly in $PROBE_ENV_FILE"
-    [[ "${PROBE_AGENT_INSTALLER_URL:-}" =~ ^https://raw[.]githubusercontent[.]com/Kcmose/my-agent/([0-9a-f]{40}|refs/tags/v(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*))/deploy/install[.]sh$ ]] ||
-        die "PROBE_AGENT_INSTALLER_URL must use an immutable Kcmose/my-agent GitHub commit or refs/tags/vMAJOR.MINOR.PATCH release"
+    [[ "${PROBE_AGENT_INSTALLER_URL:-}" =~ ^https://raw[.]githubusercontent[.]com/Kcmose/my-agent/([0-9a-f]{40}|refs/tags/v1[.]0[.]1)/deploy/install[.]sh$ ]] ||
+        die "PROBE_AGENT_INSTALLER_URL must use an immutable Kcmose/my-agent GitHub commit or the verified refs/tags/v1.0.1 release"
     [[ -z "${PROBE_AGENT_INSTALL_CA_FILE:-}" ]] ||
         die "production Agent downloads must use publicly trusted TLS; remove PROBE_AGENT_INSTALL_CA_FILE"
     [[ "${PROBE_ADMIN_ALLOWLIST_FILE:-}" == "$PROBE_ALLOWLIST_FILE" ]] ||

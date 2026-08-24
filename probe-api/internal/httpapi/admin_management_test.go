@@ -243,7 +243,7 @@ func TestAdminManagementTokenResponsesAreOneTimeAndNeverCached(t *testing.T) {
 				body := response.Body.String()
 				for _, expected := range []string{
 					"install_command",
-					"https://raw.githubusercontent.com/Kcmose/my-agent/refs/tags/v1.0.0/deploy/install.sh",
+					"https://raw.githubusercontent.com/Kcmose/my-agent/refs/tags/v1.0.1/deploy/install.sh",
 					"sudo bash -s --", "-e", "https://api.example.com", "-t",
 				} {
 					if !strings.Contains(body, expected) {

@@ -12,7 +12,7 @@ import (
 
 func TestBuildUsesVerifiedHTTPSAndQuotesOneTimeToken(t *testing.T) {
 	token := "enroll.v1.one-time-secret"
-	installerURL := "https://raw.githubusercontent.com/Kcmose/my-agent/refs/tags/v1.0.0/deploy/install.sh"
+	installerURL := "https://raw.githubusercontent.com/Kcmose/my-agent/refs/tags/v1.0.1/deploy/install.sh"
 	command := New("https://agent.example.com:8443", installerURL, nil).Build(token)
 
 	for _, expected := range []string{
@@ -53,7 +53,7 @@ func TestBuildUsesConfiguredPublicCAFingerprint(t *testing.T) {
 }
 
 func TestBuildKeepsPrivateCAPreviewCommandCompact(t *testing.T) {
-	installerURL := "https://raw.githubusercontent.com/Kcmose/my-agent/refs/tags/v1.0.0/deploy/install.sh"
+	installerURL := "https://raw.githubusercontent.com/Kcmose/my-agent/refs/tags/v1.0.1/deploy/install.sh"
 	token := "enroll.v1.abcdefghijklmnopqrstuvwxyz01234567890123456"
 	command := New("https://192.168.33.253:18454", installerURL, []byte("PUBLIC CA\n")).Build(token)
 

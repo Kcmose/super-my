@@ -1,0 +1,45 @@
+[Unit]
+Description=Probe Panel isolated preview API
+After=network-online.target probe-stage5-preview-postgresql.service
+Wants=network-online.target
+Requires=probe-stage5-preview-postgresql.service
+
+[Service]
+Type=simple
+User=probe-api
+Group=probe-api
+EnvironmentFile=/srv/probe-stage5-preview/config/api.env
+ExecStart=/srv/probe-stage5-preview/bin/probe-api serve
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=15s
+UMask=0077
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SocketBindAllow=tcp:18090
+SocketBindDeny=any
+
+[Install]
+WantedBy=multi-user.target

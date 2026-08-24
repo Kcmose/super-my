@@ -1,0 +1,38 @@
+[Unit]
+Description=Probe Panel isolated HTTPS preview ingress
+After=network-online.target probe-stage5-preview-api.service
+Wants=network-online.target
+Requires=probe-stage5-preview-api.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/sbin/nginx -t -c /srv/probe-stage5-preview/nginx.conf
+ExecStart=/usr/sbin/nginx -c /srv/probe-stage5-preview/nginx.conf -g "daemon off;"
+ExecReload=/bin/kill -HUP $MAINPID
+KillSignal=SIGQUIT
+TimeoutStopSec=15s
+Restart=on-failure
+RestartSec=3s
+UMask=0027
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProtectSystem=strict
+ReadWritePaths=/srv/probe-stage5-preview/nginx
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

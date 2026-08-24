@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the Probe Panel isolated preview backup every day
+
+[Timer]
+OnCalendar=*-*-* 02:15:00
+RandomizedDelaySec=15m
+AccuracySec=1m
+Persistent=true
+Unit=probe-stage5-preview-backup.service
+
+[Install]
+WantedBy=timers.target

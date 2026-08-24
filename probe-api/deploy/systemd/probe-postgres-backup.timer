@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the Probe Panel PostgreSQL backup every day
+
+[Timer]
+OnCalendar=*-*-* 02:15:00
+RandomizedDelaySec=15m
+AccuracySec=1m
+Persistent=true
+Unit=probe-postgres-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,1945 @@
+openapi: 3.1.0
+info:
+  title: Probe Panel API
+  version: 1.0.0-draft
+  summary: Frozen V1 contract for the panel, administrators, Agents, optional public API, and health checks.
+  description: |
+    The visitor panel and administrator panel are independent static applications and origins.
+    `panel.example.com` serves only probe-web and anonymous read-only `/api/v1/panel/*` routes.
+    `admin.example.com` serves only probe-admin, administrator `/api/v1/auth/*` and `/api/v1/admin/*`
+    routes, plus the same read-only `/api/v1/panel/*` data needed by management views. Both browser
+    origins remain behind the management IP/CIDR allowlist; anonymous does not mean public Internet
+    access. Only administrators have accounts, passwords, and sessions. Agent and optional public
+    routes are exposed only on `api.example.com`. Host/path exposure,
+    management IP/CIDR allowlisting, request size limits, Origin checks, and rate limits are enforced
+    before or together with the authentication described here. Unlisted paths and methods are denied.
+    All timestamps are RFC 3339 instants and all server-generated timestamps use UTC.
+servers:
+  - url: https://panel.example.com
+    description: Allowlisted visitor-panel origin; only anonymous read-only panel routes are exposed.
+  - url: https://admin.example.com
+    description: Allowlisted administrator-panel origin; auth and admin routes plus required read-only panel data are exposed.
+  - url: https://api.example.com
+    description: Agent origin and disabled-by-default public API; management routes are not exposed.
+tags:
+  - name: auth
+  - name: panel
+  - name: admin
+  - name: agent
+  - name: public
+  - name: internal
+security: []
+paths:
+  /api/v1/auth/access:
+    servers:
+      - url: https://admin.example.com
+    get:
+      tags: [auth]
+      operationId: getManagementAccessStatus
+      summary: Return the server-resolved source IP for an allowlisted management request.
+      description: The management allowlist is enforced before this handler. A successful response therefore always has `allowed=true`. The source IP comes from the socket peer or the dedicated ingress header accepted only from a configured trusted proxy; caller-supplied `Forwarded` and `X-Forwarded-For` values are never used. No administrator session is required.
+      x-access-boundary: management-ip
+      security: []
+      responses:
+        '200':
+          description: The current source address passed the management allowlist.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ManagementAccessStatus' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/v1/auth/login:
+    servers:
+      - url: https://admin.example.com
+    post:
+      tags: [auth]
+      operationId: login
+      summary: Log in an administrator and create a server-side session.
+      description: Only administrator credentials are accepted. Requires the management IP allowlist, JSON, and an exact same-origin Origin. It sets a host-only `probe_session` cookie with HttpOnly, Secure, SameSite=Strict, and Path=/. Anonymous visitors never log in and do not receive a session.
+      x-access-boundary: management-ip-and-origin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Administrator authenticated. The CSRF token is kept only in frontend memory.
+          headers:
+            Set-Cookie:
+              schema: { type: string }
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /api/v1/auth/logout:
+    servers:
+      - url: https://admin.example.com
+    post:
+      tags: [auth]
+      operationId: logout
+      summary: Revoke the current administrator session.
+      x-access-boundary: management-ip-session-origin-csrf
+      security:
+        - SessionCookie: []
+          CsrfToken: []
+      responses:
+        '204':
+          description: Session revoked and cookie expired.
+          headers:
+            Set-Cookie:
+              schema: { type: string }
+            Cache-Control:
+              schema: { type: string, const: no-store }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/v1/auth/me:
+    servers:
+      - url: https://admin.example.com
+    get:
+      tags: [auth]
+      operationId: getCurrentUser
+      summary: Return the current administrator and the stable CSRF token bound to this session.
+      description: Revalidates the session and stored CSRF hash without rotating either value, so concurrent tabs for one session receive the same token.
+      x-access-boundary: management-ip-session
+      security:
+        - SessionCookie: []
+      responses:
+        '200':
+          description: Current authenticated administrator.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/v1/panel/nodes:
+    servers:
+      - url: https://panel.example.com
+      - url: https://admin.example.com
+    get:
+      tags: [panel]
+      operationId: listPanelNodes
+      summary: List nodes and their current status.
+      description: Anonymous read-only access on the allowlisted visitor origin and read-only data for the allowlisted administrator UI. No visitor account, password, cookie, or session is required; this route is not exposed on the public API host.
+      x-access-boundary: panel-or-admin-host-management-ip-anonymous-readonly
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [online, offline, unregistered, disabled, skewed]
+      responses:
+        '200':
+          description: Paginated node summaries plus unfiltered global status and live-throughput totals computed at one database as_of instant.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeListResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/v1/panel/nodes/{node_id}:
+    servers:
+      - url: https://panel.example.com
+      - url: https://admin.example.com
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [panel]
+      operationId: getPanelNode
+      summary: Return node metadata and its current metric state.
+      description: Anonymous read-only access on the allowlisted visitor origin and read-only data for the allowlisted administrator UI; no visitor account or session exists.
+      x-access-boundary: panel-or-admin-host-management-ip-anonymous-readonly
+      security: []
+      responses:
+        '200':
+          description: Node detail.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeDetail' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/panel/nodes/{node_id}/metrics:
+    servers:
+      - url: https://panel.example.com
+      - url: https://admin.example.com
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [panel]
+      operationId: getNodeMetrics
+      summary: Return only the visible five-minute basic-metric window.
+      description: Anonymous read-only access on the allowlisted visitor origin and read-only data for the allowlisted administrator UI. The server fixes `as_of` once and returns points in `(as_of-300s, as_of]`, using `effective_at` regardless of an older client `from` value.
+      x-access-boundary: panel-or-admin-host-management-ip-anonymous-readonly
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/OptionalFrom'
+        - $ref: '#/components/parameters/OptionalTo'
+      responses:
+        '200':
+          description: Five-minute metric series.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MetricSeriesResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/panel/nodes/{node_id}/disks:
+    servers:
+      - url: https://panel.example.com
+      - url: https://admin.example.com
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [panel]
+      operationId: getNodeDisks
+      summary: Return current disks and only their visible five-minute history.
+      description: Anonymous read-only access on the allowlisted visitor origin and read-only data for the allowlisted administrator UI; no visitor account or session exists.
+      x-access-boundary: panel-or-admin-host-management-ip-anonymous-readonly
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/OptionalFrom'
+        - $ref: '#/components/parameters/OptionalTo'
+      responses:
+        '200':
+          description: Disk series grouped by mountpoint.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DiskSeriesResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/panel/nodes/{node_id}/probe-targets:
+    servers:
+      - url: https://panel.example.com
+      - url: https://admin.example.com
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [panel]
+      operationId: listPanelNodeProbeTargets
+      summary: List the node's probe targets available for panel trend selection.
+      description: Anonymous read-only access on the allowlisted visitor origin and read-only data for the allowlisted administrator UI. Returns only TCP and HTTP(S) targets. ICMP is intentionally unavailable in the current Stage 4 implementation.
+      x-access-boundary: panel-or-admin-host-management-ip-anonymous-readonly
+      security: []
+      responses:
+        '200':
+          description: Stable target summaries for this node.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PanelProbeTargetListResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/panel/nodes/{node_id}/probes:
+    servers:
+      - url: https://panel.example.com
+      - url: https://admin.example.com
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [panel]
+      operationId: getNodeProbeSeries
+      summary: Return a target's status and latency/loss trend.
+      description: Anonymous read-only access on the allowlisted visitor origin and read-only data for the allowlisted administrator UI. Intervals are half-open `[from,to)`. `auto` selects one raw, 5m, or 1h layer and never mixes unlabelled resolutions. Aggregate layers are eligible only when their transactionally read watermark covers the requested closed buckets; otherwise auto tries a coarser layer and an explicit resolution returns 422. At most 2200 points are returned.
+      x-access-boundary: panel-or-admin-host-management-ip-anonymous-readonly
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/TargetIdQuery'
+        - $ref: '#/components/parameters/RequiredFrom'
+        - $ref: '#/components/parameters/RequiredTo'
+        - $ref: '#/components/parameters/Resolution'
+      responses:
+        '200':
+          description: Probe target and trend.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProbeSeriesResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+  /api/v1/admin/system/status:
+    servers:
+      - url: https://admin.example.com
+    get:
+      tags: [admin]
+      operationId: getSystemStatus
+      summary: Return a safe, read-only administrator view of API and database readiness.
+      description: Returns only coarse readiness, the V1 API contract version, server UTC check time, and security facts enforced or defined by this API process. It never claims to verify Nginx host separation and never returns credentials, connection strings, environment variables, host details, controls, or readiness error text. Administrator session authentication is database-backed and runs before this handler, so a database outage during authentication can produce the generic authentication/internal failure instead of this response. `degraded` describes only the readiness check performed after successful session authentication.
+      x-access-boundary: management-ip-session
+      x-required-role: admin
+      security:
+        - SessionCookie: []
+      responses:
+        '200':
+          description: Current coarse system status after successful database-backed administrator session authentication. A failure in the subsequent readiness check is represented as a degraded body without leaking its error.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SystemStatus' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500':
+          description: Database-backed administrator session authentication failed before the status handler could return its coarse readiness body. The response is the generic internal error and does not expose the underlying database or authentication failure.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+  /api/v1/admin/nodes:
+    servers:
+      - url: https://admin.example.com
+    post:
+      tags: [admin]
+      operationId: createNode
+      summary: Create an unregistered node record.
+      x-required-role: admin
+      x-audit-event: node.create
+      security:
+        - SessionCookie: []
+          CsrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateNodeRequest' }
+      responses:
+        '201':
+          description: Node created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeDetail' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /api/v1/admin/nodes/{node_id}:
+    servers:
+      - url: https://admin.example.com
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    patch:
+      tags: [admin]
+      operationId: updateNode
+      summary: Update server-side node metadata or enabled state.
+      x-required-role: admin
+      x-audit-event: node.update
+      security:
+        - SessionCookie: []
+          CsrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateNodeRequest' }
+      responses:
+        '200':
+          description: Node updated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeDetail' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [admin]
+      operationId: deleteNode
+      summary: Delete the server-side node and immediately revoke its Agent credentials.
+      description: This never sends a deletion action or any command to the Agent.
+      x-required-role: admin
+      x-audit-event: node.delete
+      security:
+        - SessionCookie: []
+          CsrfToken: []
+      responses:
+        '204': { description: Node deleted and credentials revoked. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/admin/nodes/{node_id}/enrollment-token:
+    servers:
+      - url: https://admin.example.com
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    post:
+      tags: [admin]
+      operationId: createEnrollmentToken
+      summary: Create a short-lived, one-use enrollment token and bootstrap command.
+      x-required-role: admin
+      x-audit-event: enrollment_token.create
+      security:
+        - SessionCookie: []
+          CsrfToken: []
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateEnrollmentTokenRequest' }
+      responses:
+        '201':
+          description: Token plaintext for manual compatibility and the root-shell installation command containing it are shown once; issuing this response invalidates older unused commands for the node.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EnrollmentTokenResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /api/v1/admin/nodes/{node_id}/rotate-token:
+    servers:
+      - url: https://admin.example.com
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    post:
+      tags: [admin]
+      operationId: rotateAgentToken
+      summary: Revoke old Agent tokens and issue a replacement shown once.
+      x-required-role: admin
+      x-audit-event: agent_token.rotate
+      security:
+        - SessionCookie: []
+          CsrfToken: []
+      responses:
+        '200':
+          description: New token plaintext is shown once.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AgentTokenResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/admin/nodes/{node_id}/revoke-token:
+    servers:
+      - url: https://admin.example.com
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    post:
+      tags: [admin]
+      operationId: revokeAgentToken
+      summary: Revoke all active Agent tokens for this node.
+      x-required-role: admin
+      x-audit-event: agent_token.revoke
+      security:
+        - SessionCookie: []
+          CsrfToken: []
+      responses:
+        '204': { description: Active Agent tokens revoked. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/admin/probe-targets:
+    servers:
+      - url: https://admin.example.com
+    get:
+      tags: [admin]
+      operationId: listProbeTargets
+      summary: List configured TCP and HTTP(S) probe targets.
+      description: ICMP is reserved for a later implementation and is not returned or accepted by this API version.
+      x-required-role: admin
+      security:
+        - SessionCookie: []
+      parameters:
+        - name: node_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+            pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Probe target page.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProbeTargetListResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [admin]
+      operationId: createProbeTarget
+      summary: Create a structured TCP or HTTP(S) probe target.
+      description: ICMP is intentionally rejected. Each node is limited to 32 targets, and HTTP(S) null paths are normalized to `/`.
+      x-required-role: admin
+      x-audit-event: probe_target.create
+      security:
+        - SessionCookie: []
+          CsrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateProbeTargetRequest' }
+      responses:
+        '201':
+          description: Target created and node config version advanced.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProbeTarget' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+  /api/v1/admin/probe-targets/{target_id}:
+    servers:
+      - url: https://admin.example.com
+    parameters:
+      - $ref: '#/components/parameters/TargetId'
+    patch:
+      tags: [admin]
+      operationId: updateProbeTarget
+      summary: Update a TCP or HTTP(S) target, including its independent retention period.
+      description: "ICMP is intentionally rejected. `retention_seconds` must remain within 1..7776000. Shortening takes effect in queries immediately; extending cannot restore deleted data."
+      x-required-role: admin
+      x-audit-event: probe_target.update
+      security:
+        - SessionCookie: []
+          CsrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateProbeTargetRequest' }
+      responses:
+        '200':
+          description: Target updated and config versions advanced.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProbeTarget' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+    delete:
+      tags: [admin]
+      operationId: deleteProbeTarget
+      summary: Irreversibly hard-delete a probe target without issuing any Agent command.
+      description: The audit snapshot is written before deletion in the same transaction; target raw, 5m, and 1h history is removed by database cascades.
+      x-required-role: admin
+      x-audit-event: probe_target.delete
+      security:
+        - SessionCookie: []
+          CsrfToken: []
+      responses:
+        '204': { description: Target deleted. }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /api/v1/admin/users:
+    servers:
+      - url: https://admin.example.com
+    get:
+      tags: [admin]
+      operationId: listUsers
+      summary: List administrator accounts without password or session hashes.
+      description: Visitors are anonymous and therefore never appear in this collection.
+      x-required-role: admin
+      security:
+        - SessionCookie: []
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Administrator account page.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserListResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [admin]
+      operationId: createUser
+      summary: Create an administrator account.
+      description: Only the `admin` role is accepted. Visitors are anonymous and have no account, password, role, or session.
+      x-required-role: admin
+      x-audit-event: user.create
+      security:
+        - SessionCookie: []
+          CsrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateUserRequest' }
+      responses:
+        '201':
+          description: Administrator account created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /api/v1/admin/users/{user_id}:
+    servers:
+      - url: https://admin.example.com
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    patch:
+      tags: [admin]
+      operationId: updateUser
+      summary: Update an administrator account.
+      description: The role, when present, can only remain `admin`. The API prevents disabling or removing the last usable administrator and revokes affected sessions after sensitive changes.
+      x-required-role: admin
+      x-audit-event: user.update
+      security:
+        - SessionCookie: []
+          CsrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateUserRequest' }
+      responses:
+        '200':
+          description: Administrator account updated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      tags: [admin]
+      operationId: deleteUser
+      summary: Delete an administrator account and revoke all of its sessions.
+      x-required-role: admin
+      x-audit-event: user.delete
+      security:
+        - SessionCookie: []
+          CsrfToken: []
+      responses:
+        '204': { description: Administrator account and sessions deleted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /api/v1/admin/audit-logs:
+    servers:
+      - url: https://admin.example.com
+    get:
+      tags: [admin]
+      operationId: listAuditLogs
+      summary: List immutable audit entries.
+      x-required-role: admin
+      security:
+        - SessionCookie: []
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: action
+          in: query
+          schema: { type: string, maxLength: 128 }
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Audit page.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuditLogListResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/v1/agent/enroll:
+    servers:
+      - url: https://api.example.com
+    post:
+      tags: [agent]
+      operationId: enrollAgent
+      summary: Atomically consume a one-time enrollment token and issue an Agent token.
+      description: This non-idempotent endpoint is exposed only on the Agent host. The returned device token is shown exactly once and never logged.
+      x-access-boundary: one-time-enrollment-token-no-management-ip-filter
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AgentEnrollRequest' }
+      responses:
+        '201':
+          description: Agent enrolled.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AgentEnrollResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /api/v1/agent/config:
+    servers:
+      - url: https://api.example.com
+    get:
+      tags: [agent]
+      operationId: getAgentConfig
+      summary: Return a complete structured configuration or 304.
+      description: A version ahead of the server returns `409 config_version_ahead`; no partial patch or executable action is ever returned.
+      security:
+        - AgentBearer: []
+      parameters:
+        - name: version
+          in: query
+          required: true
+          description: Last fully applied config version; use 0 before the first fetch.
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 9223372036854775807
+      responses:
+        '200':
+          description: Complete current configuration.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AgentConfig' }
+        '304': { description: The supplied version equals the current version; no body. }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /api/v1/agent/report:
+    servers:
+      - url: https://api.example.com
+    post:
+      tags: [agent]
+      operationId: reportAgentBatch
+      summary: Atomically accept one idempotent Agent batch.
+      description: |
+        The request may use `Content-Encoding: gzip`; the decompressed limit is 256 KiB. The Token determines
+        `node_id`; the body cannot supply it. `(node_id,batch_id)` is the idempotency key. The three arrays cannot
+        all be empty. Unknown fields, duplicate JSON keys, non-finite values, trailing JSON, and partial acceptance
+        are rejected. `sampled_at` remains the Agent value while the server derives `effective_at` from the frozen
+        clock-skew algorithm for storage, queries, retention, and aggregation. New batches must have a sequence
+        above the node's transactionally locked persistent high-water mark. A matching idempotency key with a
+        different canonical payload checksum, or a stale sequence after ledger cleanup, returns 409.
+      security:
+        - AgentBearer: []
+      parameters:
+        - name: Content-Encoding
+          in: header
+          required: false
+          schema:
+            type: string
+            enum: [gzip]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AgentReportRequest' }
+      responses:
+        '200':
+          description: Exact idempotent duplicate; no data was written again.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AgentReportDuplicateResponse' }
+        '202':
+          description: Batch accepted atomically.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AgentReportAcceptedResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: "`idempotency_key_reused` for the same batch ID with a different body, or `stale_sequence` when the node sequence does not advance."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /api/v1/public/nodes:
+    servers:
+      - url: https://api.example.com
+    get:
+      tags: [public]
+      operationId: listPublicNodes
+      summary: List explicitly public, redacted node summaries.
+      description: The entire public API is disabled by default and returns 404 until enabled outside the web UI.
+      security:
+        - PublicApiKey: []
+      responses:
+        '200':
+          description: Public node summaries.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublicNodeListResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    head:
+      tags: [public]
+      operationId: headPublicNodes
+      summary: Check the public node collection without a response body.
+      security:
+        - PublicApiKey: []
+      responses:
+        '200': { description: Public API enabled and authorized. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/public/nodes/{node_id}:
+    servers:
+      - url: https://api.example.com
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [public]
+      operationId: getPublicNode
+      summary: Get one explicitly public, redacted node summary.
+      security:
+        - PublicApiKey: []
+      responses:
+        '200':
+          description: Public node summary.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublicNode' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    head:
+      tags: [public]
+      operationId: headPublicNode
+      summary: Check one public node without a response body.
+      security:
+        - PublicApiKey: []
+      responses:
+        '200': { description: Public node exists and is visible. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/public/nodes/{node_id}/metrics:
+    servers:
+      - url: https://api.example.com
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [public]
+      operationId: getPublicNodeMetrics
+      summary: Get a public node's redacted five-minute metrics.
+      security:
+        - PublicApiKey: []
+      responses:
+        '200':
+          description: Redacted metric series.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MetricSeriesResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    head:
+      tags: [public]
+      operationId: headPublicNodeMetrics
+      summary: Check availability of public metrics without a body.
+      security:
+        - PublicApiKey: []
+      responses:
+        '200': { description: Public metric series is available. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/public/nodes/{node_id}/probes:
+    servers:
+      - url: https://api.example.com
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+      - $ref: '#/components/parameters/TargetIdQuery'
+      - $ref: '#/components/parameters/RequiredFrom'
+      - $ref: '#/components/parameters/RequiredTo'
+      - $ref: '#/components/parameters/Resolution'
+    get:
+      tags: [public]
+      operationId: getPublicNodeProbes
+      summary: Get an explicitly public target's read-only trend.
+      security:
+        - PublicApiKey: []
+      responses:
+        '200':
+          description: Public probe trend.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublicProbeSeriesResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+    head:
+      tags: [public]
+      operationId: headPublicNodeProbes
+      summary: Check availability of a public probe trend without a body.
+      security:
+        - PublicApiKey: []
+      responses:
+        '200': { description: Public probe trend is available. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /internal/health/live:
+    servers:
+      - url: http://127.0.0.1:8080
+    get:
+      tags: [internal]
+      operationId: healthLive
+      summary: Report process liveness without checking dependencies.
+      description: V1 exposes this route only on loopback and therefore uses no HTTP credential. Any future cross-host exposure requires a separately frozen internal authentication policy.
+      x-access-boundary: loopback-only
+      security: []
+      responses:
+        '200':
+          description: Process is alive.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LivenessResponse' }
+  /internal/health/ready:
+    servers:
+      - url: http://127.0.0.1:8080
+    get:
+      tags: [internal]
+      operationId: healthReady
+      summary: Report readiness, database connectivity, and migration state.
+      description: V1 exposes this route only on loopback without an HTTP credential. The response never includes DSNs, credentials, full configuration, stack traces, or environment variables.
+      x-access-boundary: loopback-only
+      security: []
+      responses:
+        '200':
+          description: Service is ready.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReadinessResponse' }
+        '503':
+          description: Service is not ready.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+components:
+  securitySchemes:
+    SessionCookie:
+      type: apiKey
+      in: cookie
+      name: probe_session
+      description: Host-only HttpOnly Secure SameSite=Strict administrator session token. V1 defaults to a 12-hour absolute lifetime and five concurrent sessions per administrator.
+    CsrfToken:
+      type: apiKey
+      in: header
+      name: X-CSRF-Token
+      description: Stable per-session token derived with domain-separated HMAC-SHA256 and returned by login and auth/me; required with exact Origin on cookie-authenticated writes. Repeated auth/me calls do not rotate it.
+    AgentBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque-agent-token
+    PublicApiKey:
+      type: apiKey
+      in: header
+      name: X-Probe-API-Key
+      description: Independent key for the disabled-by-default public read-only API.
+    InternalBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque-internal-token
+      description: Required only when an internal endpoint is deliberately exposed beyond loopback.
+  parameters:
+    NodeId:
+      name: node_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+        pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    TargetId:
+      name: target_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+        pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    UserId:
+      name: user_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    TargetIdQuery:
+      name: target_id
+      in: query
+      required: true
+      schema:
+        type: string
+        format: uuid
+        pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+    Cursor:
+      name: cursor
+      in: query
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 512
+    OptionalFrom:
+      name: from
+      in: query
+      schema: { type: string, format: date-time }
+    OptionalTo:
+      name: to
+      in: query
+      schema: { type: string, format: date-time }
+    RequiredFrom:
+      name: from
+      in: query
+      required: true
+      schema: { type: string, format: date-time }
+    RequiredTo:
+      name: to
+      in: query
+      required: true
+      schema: { type: string, format: date-time }
+    Resolution:
+      name: resolution
+      in: query
+      schema:
+        type: string
+        enum: [auto, raw, 5m, 1h]
+        default: auto
+  responses:
+    BadRequest:
+      description: Malformed JSON, parameter, or request.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    Unauthorized:
+      description: Missing, invalid, expired, revoked, or already-used credentials.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    Forbidden:
+      description: Management allowlist, role, Origin, or CSRF validation failed.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    NotFound:
+      description: Resource or host-scoped route is unavailable.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    Conflict:
+      description: Current state conflicts with the requested operation.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    PayloadTooLarge:
+      description: Compressed or decompressed request limit exceeded.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    UnprocessableEntity:
+      description: Structurally valid input violates field, time-window, or resolution rules.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    TooManyRequests:
+      description: Request rate limit exceeded.
+      headers:
+        Retry-After:
+          schema: { type: integer, minimum: 1 }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+  schemas:
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [error, message, request_id]
+      properties:
+        error: { type: string, minLength: 1, maxLength: 128 }
+        message: { type: string, minLength: 1, maxLength: 512 }
+        request_id: { type: string, minLength: 1, maxLength: 128 }
+        details:
+          type: object
+          additionalProperties: true
+    PageCursor:
+      type: object
+      additionalProperties: false
+      required: [next_cursor]
+      properties:
+        next_cursor:
+          type: [string, 'null']
+          maxLength: 512
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [username, password]
+      properties:
+        username: { type: string, minLength: 1, maxLength: 128 }
+        password: { type: string, minLength: 1, maxLength: 1024, writeOnly: true }
+    ManagementAccessStatus:
+      type: object
+      additionalProperties: false
+      required: [source_ip, allowed]
+      properties:
+        source_ip:
+          type: string
+          minLength: 2
+          maxLength: 45
+          description: Canonical IPv4 or IPv6 address resolved by the server ingress policy.
+        allowed:
+          type: boolean
+          const: true
+    SystemStatus:
+      type: object
+      additionalProperties: false
+      required: [status, checked_at, api, database, security_boundary]
+      properties:
+        status:
+          type: string
+          enum: [ready, degraded]
+        checked_at: { type: string, format: date-time }
+        api:
+          type: object
+          additionalProperties: false
+          required: [status, version]
+          properties:
+            status: { type: string, const: ready }
+            version: { type: string, const: v1 }
+        database:
+          type: object
+          additionalProperties: false
+          required: [status]
+          properties:
+            status: { type: string, enum: [ready, unavailable] }
+        security_boundary:
+          type: object
+          additionalProperties: false
+          required:
+            - management_ip_allowlist_enforced
+            - administrator_session_required
+            - admin_write_csrf_required
+            - remote_operations_enabled
+          properties:
+            management_ip_allowlist_enforced: { type: boolean, const: true }
+            administrator_session_required: { type: boolean, const: true }
+            admin_write_csrf_required: { type: boolean, const: true }
+            remote_operations_enabled: { type: boolean, const: false }
+    UserRole:
+      type: string
+      enum: [admin]
+      description: Only administrators are accounts and have an API role. Visitors are anonymous and are not represented by this schema.
+      x-display-labels:
+        admin: 管理员
+    User:
+      type: object
+      additionalProperties: false
+      required: [user_id, username, role, enabled, created_at, updated_at]
+      properties:
+        user_id: { type: string, format: uuid }
+        username: { type: string, minLength: 1, maxLength: 128 }
+        role: { $ref: '#/components/schemas/UserRole' }
+        enabled: { type: boolean }
+        last_login_at: { type: [string, 'null'], format: date-time }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    AuthResponse:
+      type: object
+      additionalProperties: false
+      required: [user, csrf_token]
+      properties:
+        user: { $ref: '#/components/schemas/User' }
+        csrf_token:
+          type: string
+          minLength: 32
+          readOnly: true
+          description: Stable only for the current session; store in memory and send in X-CSRF-Token on cookie-authenticated writes.
+    UserListResponse:
+      type: object
+      additionalProperties: false
+      required: [users, next_cursor]
+      properties:
+        users:
+          type: array
+          items: { $ref: '#/components/schemas/User' }
+        next_cursor: { type: [string, 'null'], maxLength: 512 }
+    CreateUserRequest:
+      type: object
+      additionalProperties: false
+      required: [username, password, role, enabled]
+      properties:
+        username: { type: string, minLength: 1, maxLength: 128 }
+        password:
+          type: string
+          writeOnly: true
+          description: Must be valid UTF-8 whose encoded value is 12 to 1024 bytes; byte bounds are enforced by the API.
+          x-min-utf8-bytes: 12
+          x-max-utf8-bytes: 1024
+        role: { $ref: '#/components/schemas/UserRole' }
+        enabled: { type: boolean }
+    UpdateUserRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        username: { type: string, minLength: 1, maxLength: 128 }
+        password:
+          type: string
+          writeOnly: true
+          description: When present, must be valid UTF-8 whose encoded value is 12 to 1024 bytes; byte bounds are enforced by the API.
+          x-min-utf8-bytes: 12
+          x-max-utf8-bytes: 1024
+        role: { $ref: '#/components/schemas/UserRole' }
+        enabled: { type: boolean }
+    MetricPoint:
+      type: object
+      additionalProperties: false
+      required:
+        - sampled_at
+        - effective_at
+        - received_at
+        - cpu_percent
+        - load_1
+        - load_5
+        - load_15
+        - uptime_seconds
+        - memory_total_bytes
+        - memory_used_bytes
+        - memory_available_bytes
+        - swap_total_bytes
+        - swap_used_bytes
+        - network_rx_bps
+        - network_tx_bps
+        - network_rx_bytes
+        - network_tx_bytes
+      properties:
+        sampled_at: { type: string, format: date-time }
+        effective_at: { type: string, format: date-time }
+        received_at: { type: string, format: date-time }
+        cpu_percent: { type: number, minimum: 0, maximum: 100 }
+        load_1: { type: number, minimum: 0 }
+        load_5: { type: number, minimum: 0 }
+        load_15: { type: number, minimum: 0 }
+        uptime_seconds: { type: number, minimum: 0 }
+        memory_total_bytes: { type: integer, minimum: 0, maximum: 9223372036854775807 }
+        memory_used_bytes: { type: integer, minimum: 0, maximum: 9223372036854775807 }
+        memory_available_bytes: { type: integer, minimum: 0, maximum: 9223372036854775807 }
+        swap_total_bytes: { type: integer, minimum: 0, maximum: 9223372036854775807 }
+        swap_used_bytes: { type: integer, minimum: 0, maximum: 9223372036854775807 }
+        network_rx_bps: { type: number, minimum: 0 }
+        network_tx_bps: { type: number, minimum: 0 }
+        network_rx_bytes: { type: integer, minimum: 0, maximum: 9223372036854775807 }
+        network_tx_bytes: { type: integer, minimum: 0, maximum: 9223372036854775807 }
+        total_traffic_bytes:
+          type: integer
+          minimum: 0
+          readOnly: true
+          description: Derived sum of the cumulative receive and transmit counters; never a mock fallback.
+    NodeSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - node_id
+        - display_name
+        - enabled
+        - status
+        - config_version
+        - agent_settings
+        - clock_status
+        - root_disk
+        - created_at
+        - updated_at
+      properties:
+        node_id:
+          type: string
+          format: uuid
+          pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        display_name: { type: string, minLength: 1, maxLength: 128 }
+        hostname: { type: [string, 'null'], maxLength: 253 }
+        enabled: { type: boolean }
+        status:
+          type: string
+          enum: [online, offline, unregistered, disabled, skewed]
+          description: Precedence is disabled, unregistered, offline by server received_at threshold, skewed, then online.
+        config_version: { type: integer, minimum: 1, maximum: 9223372036854775807 }
+        agent_settings: { $ref: '#/components/schemas/NodeAgentSettings' }
+        agent_version: { type: [string, 'null'], maxLength: 64 }
+        operating_system: { type: [string, 'null'], maxLength: 64 }
+        architecture: { type: [string, 'null'], maxLength: 64 }
+        country_code:
+          type: [string, 'null']
+          pattern: '^[A-Z]{2}$'
+          description: Optional administrator-managed display metadata; no automatic geolocation is implied.
+        region_key: { type: [string, 'null'], maxLength: 64 }
+        location: { type: [string, 'null'], maxLength: 128 }
+        enrolled_at: { type: [string, 'null'], format: date-time }
+        last_received_at: { type: [string, 'null'], format: date-time }
+        clock_status: { type: string, enum: [unknown, ok, skewed] }
+        clock_skew_seconds: { type: [integer, 'null'] }
+        current_metrics:
+          oneOf:
+            - $ref: '#/components/schemas/MetricPoint'
+            - type: 'null'
+        root_disk:
+          description: Last accepted current sample for mountpoint `/`; status and last_received_at determine freshness.
+          oneOf:
+            - $ref: '#/components/schemas/DiskPoint'
+            - type: 'null'
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    NodeDetail:
+      $ref: '#/components/schemas/NodeSummary'
+    NodeOverviewSummary:
+      type: object
+      additionalProperties: false
+      required: [total, online, offline, unregistered, disabled, skewed, network_rx_bps, network_tx_bps]
+      properties:
+        total: { type: integer, minimum: 0 }
+        online: { type: integer, minimum: 0 }
+        offline: { type: integer, minimum: 0 }
+        unregistered: { type: integer, minimum: 0 }
+        disabled: { type: integer, minimum: 0 }
+        skewed: { type: integer, minimum: 0 }
+        network_rx_bps:
+          type: number
+          minimum: 0
+          description: Sum of current receive rates for online and skewed nodes only.
+        network_tx_bps:
+          type: number
+          minimum: 0
+          description: Sum of current transmit rates for online and skewed nodes only.
+    NodeListResponse:
+      type: object
+      additionalProperties: false
+      required: [nodes, next_cursor, summary]
+      properties:
+        nodes:
+          type: array
+          items: { $ref: '#/components/schemas/NodeSummary' }
+        next_cursor: { type: [string, 'null'], maxLength: 512 }
+        summary: { $ref: '#/components/schemas/NodeOverviewSummary' }
+    CreateNodeRequest:
+      type: object
+      additionalProperties: false
+      description: If agent_settings is omitted, the frozen defaults are stored transactionally with the node.
+      required: [display_name]
+      properties:
+        display_name: { type: string, minLength: 1, maxLength: 128 }
+        enabled: { type: boolean, default: true }
+        country_code: { type: [string, 'null'], pattern: '^[A-Z]{2}$' }
+        region_key: { type: [string, 'null'], maxLength: 64 }
+        location: { type: [string, 'null'], maxLength: 128 }
+        agent_settings: { $ref: '#/components/schemas/NodeAgentSettings' }
+    UpdateNodeRequest:
+      type: object
+      additionalProperties: false
+      description: agent_settings is an optional complete replacement. A changed Agent setting increments nodes.config_version and creates an audit event in the same transaction.
+      minProperties: 1
+      properties:
+        display_name: { type: string, minLength: 1, maxLength: 128 }
+        enabled: { type: boolean }
+        country_code: { type: [string, 'null'], pattern: '^[A-Z]{2}$' }
+        region_key: { type: [string, 'null'], maxLength: 64 }
+        location: { type: [string, 'null'], maxLength: 128 }
+        agent_settings: { $ref: '#/components/schemas/NodeAgentSettings' }
+    MetricSeriesResponse:
+      type: object
+      additionalProperties: false
+      required: [node_id, as_of, from, to, points]
+      properties:
+        node_id: { type: string, format: uuid }
+        as_of: { type: string, format: date-time }
+        from: { type: string, format: date-time }
+        to: { type: string, format: date-time }
+        points:
+          type: array
+          maxItems: 60
+          items: { $ref: '#/components/schemas/MetricPoint' }
+    DiskPoint:
+      type: object
+      additionalProperties: false
+      required: [sampled_at, effective_at, received_at, mountpoint, total_bytes, used_bytes, available_bytes]
+      properties:
+        sampled_at: { type: string, format: date-time }
+        effective_at: { type: string, format: date-time }
+        received_at: { type: string, format: date-time }
+        mountpoint: { type: string, minLength: 1, maxLength: 4096, pattern: '^/' }
+        total_bytes: { type: integer, minimum: 0, maximum: 9223372036854775807 }
+        used_bytes: { type: integer, minimum: 0, maximum: 9223372036854775807 }
+        available_bytes: { type: integer, minimum: 0, maximum: 9223372036854775807 }
+    DiskSeries:
+      type: object
+      additionalProperties: false
+      required: [mountpoint, current, points]
+      properties:
+        mountpoint: { type: string, minLength: 1, maxLength: 4096, pattern: '^/' }
+        current:
+          oneOf:
+            - $ref: '#/components/schemas/DiskPoint'
+            - type: 'null'
+        points:
+          type: array
+          maxItems: 60
+          items: { $ref: '#/components/schemas/DiskPoint' }
+    DiskSeriesResponse:
+      type: object
+      additionalProperties: false
+      required: [node_id, as_of, from, to, disks]
+      properties:
+        node_id: { type: string, format: uuid }
+        as_of: { type: string, format: date-time }
+        from: { type: string, format: date-time }
+        to: { type: string, format: date-time }
+        disks:
+          type: array
+          items: { $ref: '#/components/schemas/DiskSeries' }
+    ProbeTargetTypeRules:
+      type: object
+      description: Stage 4 enables only TCP and HTTP(S); ICMP is rejected. HTTP(S) null path is normalized to `/`. Update requests are merged with the stored target and the resulting object must satisfy these rules.
+      allOf:
+        - if:
+            required: [type]
+            properties:
+              type: { const: tcp }
+          then:
+            required: [port]
+            properties:
+              port: { type: integer, minimum: 1, maximum: 65535 }
+              path: { type: 'null' }
+        - if:
+            required: [type]
+            properties:
+              type: { enum: [http, https] }
+          then:
+            properties:
+              port: { type: [integer, 'null'], minimum: 1, maximum: 65535 }
+              path: { type: [string, 'null'], maxLength: 2048, pattern: '^/[^?#]*$' }
+    ProbeTarget:
+      type: object
+      additionalProperties: false
+      allOf:
+        - $ref: '#/components/schemas/ProbeTargetTypeRules'
+      required:
+        - target_id
+        - node_id
+        - name
+        - type
+        - host
+        - port
+        - path
+        - interval_seconds
+        - timeout_seconds
+        - retention_seconds
+        - enabled
+        - config_version
+        - created_at
+        - updated_at
+      properties:
+        target_id:
+          type: string
+          format: uuid
+          pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        node_id:
+          type: string
+          format: uuid
+          pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        name: { type: string, minLength: 1, maxLength: 128 }
+        type: { type: string, enum: [tcp, http, https] }
+        host: { type: string, minLength: 1, maxLength: 253 }
+        port: { type: [integer, 'null'], minimum: 1, maximum: 65535 }
+        path: { type: [string, 'null'], maxLength: 2048, pattern: '^/[^?#]*$', description: HTTP(S) null is normalized to `/`; query and fragment characters are rejected; TCP requires null. }
+        interval_seconds: { type: integer, minimum: 10, maximum: 86400 }
+        timeout_seconds: { type: integer, minimum: 1, maximum: 60 }
+        retention_seconds: { type: integer, minimum: 1, maximum: 7776000 }
+        enabled: { type: boolean }
+        config_version: { type: integer, minimum: 1, maximum: 9223372036854775807 }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    ProbeTargetListResponse:
+      type: object
+      additionalProperties: false
+      required: [targets, next_cursor]
+      properties:
+        targets:
+          type: array
+          items: { $ref: '#/components/schemas/ProbeTarget' }
+        next_cursor: { type: [string, 'null'], maxLength: 512 }
+    PanelProbeTargetSummary:
+      type: object
+      additionalProperties: false
+      required: [target_id, name, type, enabled, retention_seconds]
+      properties:
+        target_id:
+          type: string
+          format: uuid
+          pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        name: { type: string, minLength: 1, maxLength: 128 }
+        type: { type: string, enum: [tcp, http, https] }
+        enabled: { type: boolean }
+        retention_seconds: { type: integer, minimum: 1, maximum: 7776000 }
+    PanelProbeTargetListResponse:
+      type: object
+      additionalProperties: false
+      required: [node_id, targets]
+      properties:
+        node_id:
+          type: string
+          format: uuid
+          pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        targets:
+          type: array
+          maxItems: 32
+          items: { $ref: '#/components/schemas/PanelProbeTargetSummary' }
+    CreateProbeTargetRequest:
+      type: object
+      additionalProperties: false
+      allOf:
+        - $ref: '#/components/schemas/ProbeTargetTypeRules'
+      required: [node_id, name, type, host, port, path, interval_seconds, timeout_seconds, retention_seconds, enabled]
+      properties:
+        node_id:
+          type: string
+          format: uuid
+          pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        name: { type: string, minLength: 1, maxLength: 128 }
+        type: { type: string, enum: [tcp, http, https] }
+        host: { type: string, minLength: 1, maxLength: 253 }
+        port: { type: [integer, 'null'], minimum: 1, maximum: 65535 }
+        path: { type: [string, 'null'], maxLength: 2048, pattern: '^/[^?#]*$', description: HTTP(S) null is normalized to `/`; query and fragment characters are rejected; TCP requires null. }
+        interval_seconds: { type: integer, minimum: 10, maximum: 86400, default: 30 }
+        timeout_seconds: { type: integer, minimum: 1, maximum: 60, default: 3 }
+        retention_seconds: { type: integer, minimum: 1, maximum: 7776000 }
+        enabled: { type: boolean, default: true }
+    UpdateProbeTargetRequest:
+      type: object
+      additionalProperties: false
+      description: Partial fields are merged with the stored target, then the complete result is validated against ProbeTargetTypeRules and timeout <= interval.
+      minProperties: 1
+      properties:
+        name: { type: string, minLength: 1, maxLength: 128 }
+        type: { type: string, enum: [tcp, http, https] }
+        host: { type: string, minLength: 1, maxLength: 253 }
+        port: { type: [integer, 'null'], minimum: 1, maximum: 65535 }
+        path: { type: [string, 'null'], maxLength: 2048, pattern: '^/[^?#]*$', description: HTTP(S) null is normalized to `/`; query and fragment characters are rejected; TCP requires null after merge. }
+        interval_seconds: { type: integer, minimum: 10, maximum: 86400 }
+        timeout_seconds: { type: integer, minimum: 1, maximum: 60 }
+        retention_seconds: { type: integer, minimum: 1, maximum: 7776000 }
+        enabled: { type: boolean }
+    ProbeSeriesPoint:
+      type: object
+      additionalProperties: false
+      description: >-
+        `loss_rate` is transport loss only. `failure_rate` is
+        `(sent_count - received_count + http_error_count) / sent_count`.
+        HTTP statuses below 200 or at least 400 are application errors. Raw
+        points expose the exact HTTP status; 5m and 1h points always return null
+        because mixed statuses are not fabricated.
+      required:
+        - time
+        - result_count
+        - sent_count
+        - received_count
+        - http_status_code
+        - http_error_count
+        - latency_sum_us
+        - latency_min_us
+        - latency_max_us
+        - loss_rate
+        - failure_rate
+        - average_latency_us
+      properties:
+        time: { type: string, format: date-time }
+        result_count: { type: integer, minimum: 1 }
+        sent_count: { type: integer, minimum: 1 }
+        received_count: { type: integer, minimum: 0 }
+        http_status_code: { type: [integer, 'null'], minimum: 100, maximum: 599, description: Exact status for a raw HTTP(S) point; always null for 5m and 1h points. }
+        http_error_count: { type: integer, minimum: 0, description: Received HTTP responses whose status is below 200 or at least 400; never exceeds received_count. }
+        latency_sum_us: { type: integer, minimum: 0 }
+        latency_min_us: { type: [integer, 'null'], minimum: 0 }
+        latency_max_us: { type: [integer, 'null'], minimum: 0 }
+        loss_rate: { type: number, minimum: 0, maximum: 1 }
+        failure_rate: { type: number, minimum: 0, maximum: 1 }
+        average_latency_us: { type: [number, 'null'], minimum: 0 }
+    ProbeSeriesResponse:
+      type: object
+      additionalProperties: false
+      required: [target, resolution, from, to, as_of, points]
+      properties:
+        target: { $ref: '#/components/schemas/ProbeTarget' }
+        resolution: { type: string, enum: [raw, 5m, 1h] }
+        from: { type: string, format: date-time }
+        to: { type: string, format: date-time }
+        as_of: { type: string, format: date-time }
+        points:
+          type: array
+          maxItems: 2200
+          items: { $ref: '#/components/schemas/ProbeSeriesPoint' }
+    CreateEnrollmentTokenRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        expires_in_seconds:
+          type: integer
+          minimum: 60
+          maximum: 86400
+          default: 900
+    EnrollmentTokenResponse:
+      type: object
+      additionalProperties: false
+      required: [node_id, enrollment_token, expires_at, install_command]
+      properties:
+        node_id: { type: string, format: uuid }
+        enrollment_token: { type: string, minLength: 32, readOnly: true }
+        expires_at: { type: string, format: date-time }
+        install_command:
+          type: string
+          minLength: 1
+          readOnly: true
+          description: One-time shell command for a user-initiated first installation. It contains the enrollment token and must be handled as a secret.
+    AgentTokenResponse:
+      type: object
+      additionalProperties: false
+      required: [node_id, agent_token, created_at]
+      properties:
+        node_id: { type: string, format: uuid }
+        agent_token: { type: string, minLength: 32, readOnly: true }
+        created_at: { type: string, format: date-time }
+    AgentEnrollRequest:
+      type: object
+      additionalProperties: false
+      required: [enrollment_token, hostname, agent_version, os, arch]
+      properties:
+        enrollment_token: { type: string, minLength: 32, maxLength: 1024, writeOnly: true }
+        hostname: { type: string, minLength: 1, maxLength: 253 }
+        agent_version: { type: string, minLength: 1, maxLength: 64 }
+        os: { type: string, const: linux }
+        arch: { type: string, enum: [amd64, arm64] }
+    AgentEnrollResponse:
+      type: object
+      additionalProperties: false
+      required: [node_id, agent_token, config_version]
+      properties:
+        node_id: { type: string, format: uuid }
+        agent_token: { type: string, minLength: 32, readOnly: true }
+        config_version: { type: integer, minimum: 1, maximum: 9223372036854775807 }
+    AgentMetricsConfig:
+      type: object
+      additionalProperties: false
+      description: The frozen relation is `5 <= collect_interval_seconds <= report_interval_seconds <= 300`.
+      required: [collect_interval_seconds, report_interval_seconds, mountpoints, include_virtual_interfaces]
+      properties:
+        collect_interval_seconds: { type: integer, minimum: 5, maximum: 300 }
+        report_interval_seconds: { type: integer, minimum: 5, maximum: 300 }
+        mountpoints:
+          type: array
+          minItems: 1
+          maxItems: 32
+          uniqueItems: true
+          contains: { const: / }
+          items: { type: string, minLength: 1, maxLength: 4096, pattern: '^/' }
+        include_virtual_interfaces: { type: boolean }
+    AgentRuntimeConfig:
+      type: object
+      additionalProperties: false
+      description: '`max_memory_queue_seconds` must be greater than or equal to `metrics.report_interval_seconds` in the enclosing configuration.'
+      required: [config_refresh_interval_seconds, max_memory_queue_seconds]
+      properties:
+        config_refresh_interval_seconds: { type: integer, minimum: 10, maximum: 86400 }
+        max_memory_queue_seconds: { type: integer, minimum: 1, maximum: 300 }
+    AgentLimitsConfig:
+      type: object
+      additionalProperties: false
+      required: [max_batch_samples]
+      properties:
+        max_batch_samples: { type: integer, minimum: 1, maximum: 120 }
+    NodeAgentSettings:
+      type: object
+      additionalProperties: false
+      required: [metrics, agent, limits]
+      description: Strongly typed persistent settings used to build AgentConfig; no free-form JSON or operation field is accepted.
+      properties:
+        metrics: { $ref: '#/components/schemas/AgentMetricsConfig' }
+        agent: { $ref: '#/components/schemas/AgentRuntimeConfig' }
+        limits: { $ref: '#/components/schemas/AgentLimitsConfig' }
+    AgentProbeTarget:
+      type: object
+      additionalProperties: false
+      allOf:
+        - $ref: '#/components/schemas/ProbeTargetTypeRules'
+      required:
+        - id
+        - name
+        - type
+        - host
+        - port
+        - path
+        - interval_seconds
+        - timeout_seconds
+        - retention_seconds
+        - enabled
+        - config_version
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string, minLength: 1, maxLength: 128 }
+        type: { type: string, enum: [tcp, http, https] }
+        host: { type: string, minLength: 1, maxLength: 253 }
+        port: { type: [integer, 'null'], minimum: 1, maximum: 65535 }
+        path: { type: [string, 'null'], maxLength: 2048, pattern: '^/[^?#]*$', description: HTTP(S) null is normalized to `/`; query and fragment characters are rejected; TCP requires null. }
+        interval_seconds: { type: integer, minimum: 10, maximum: 86400 }
+        timeout_seconds: { type: integer, minimum: 1, maximum: 60 }
+        retention_seconds: { type: integer, minimum: 1, maximum: 7776000 }
+        enabled: { type: boolean }
+        config_version: { type: integer, minimum: 1, maximum: 9223372036854775807 }
+    AgentConfig:
+      type: object
+      additionalProperties: false
+      description: Complete declarative configuration. The serialized response is bounded to 2 MiB; Agent report requests remain bounded to 256 KiB.
+      required: [config_version, issued_at, metrics, agent, limits, probe_targets]
+      properties:
+        config_version: { type: integer, minimum: 1, maximum: 9223372036854775807 }
+        issued_at: { type: string, format: date-time }
+        metrics: { $ref: '#/components/schemas/AgentMetricsConfig' }
+        agent: { $ref: '#/components/schemas/AgentRuntimeConfig' }
+        limits: { $ref: '#/components/schemas/AgentLimitsConfig' }
+        probe_targets:
+          type: array
+          maxItems: 32
+          items: { $ref: '#/components/schemas/AgentProbeTarget' }
+    AgentMetricSample:
+      type: object
+      additionalProperties: false
+      required:
+        - sampled_at
+        - cpu_percent
+        - load_1
+        - load_5
+        - load_15
+        - uptime_seconds
+        - memory_total_bytes
+        - memory_used_bytes
+        - memory_available_bytes
+        - swap_total_bytes
+        - swap_used_bytes
+        - network_rx_bps
+        - network_tx_bps
+        - network_rx_bytes
+        - network_tx_bytes
+      properties:
+        sampled_at: { type: string, format: date-time }
+        cpu_percent: { type: number, minimum: 0, maximum: 100 }
+        load_1: { type: number, minimum: 0 }
+        load_5: { type: number, minimum: 0 }
+        load_15: { type: number, minimum: 0 }
+        uptime_seconds: { type: number, minimum: 0 }
+        memory_total_bytes: { type: integer, minimum: 0, maximum: 9223372036854775807 }
+        memory_used_bytes: { type: integer, minimum: 0, maximum: 9223372036854775807 }
+        memory_available_bytes: { type: integer, minimum: 0, maximum: 9223372036854775807 }
+        swap_total_bytes: { type: integer, minimum: 0, maximum: 9223372036854775807 }
+        swap_used_bytes: { type: integer, minimum: 0, maximum: 9223372036854775807 }
+        network_rx_bps: { type: number, minimum: 0 }
+        network_tx_bps: { type: number, minimum: 0 }
+        network_rx_bytes: { type: integer, minimum: 0, maximum: 9223372036854775807 }
+        network_tx_bytes: { type: integer, minimum: 0, maximum: 9223372036854775807 }
+    AgentDiskSample:
+      type: object
+      additionalProperties: false
+      required: [sampled_at, mountpoint, total_bytes, used_bytes, available_bytes]
+      properties:
+        sampled_at: { type: string, format: date-time }
+        mountpoint: { type: string, minLength: 1, maxLength: 4096, pattern: '^/' }
+        total_bytes: { type: integer, minimum: 0, maximum: 9223372036854775807 }
+        used_bytes: { type: integer, minimum: 0, maximum: 9223372036854775807 }
+        available_bytes: { type: integer, minimum: 0, maximum: 9223372036854775807 }
+    AgentProbeResult:
+      type: object
+      additionalProperties: false
+      description: Each row is one TCP or HTTP(S) attempt. `sent_count` is exactly 1. A received HTTP(S) response requires its status and a null error code; a transport failure requires a null status and a stable error code. TCP status is always null. HTTP statuses below 200 or at least 400 are application failures, not transport error codes.
+      required:
+        - target_id
+        - sampled_at
+        - sent_count
+        - received_count
+        - latency_sum_us
+        - latency_min_us
+        - latency_max_us
+        - http_status_code
+        - error_code
+      properties:
+        target_id: { type: string, format: uuid }
+        sampled_at: { type: string, format: date-time }
+        sent_count: { type: integer, const: 1 }
+        received_count: { type: integer, minimum: 0, maximum: 1 }
+        latency_sum_us: { type: integer, minimum: 0, maximum: 9223372036854775807 }
+        latency_min_us: { type: [integer, 'null'], minimum: 0, maximum: 9223372036854775807 }
+        latency_max_us: { type: [integer, 'null'], minimum: 0, maximum: 9223372036854775807 }
+        http_status_code: { type: [integer, 'null'], minimum: 100, maximum: 599 }
+        error_code: { type: [string, 'null'], minLength: 1, maxLength: 128, pattern: '^\S(?:.*\S)?$' }
+    AgentReportRequest:
+      type: object
+      additionalProperties: false
+      required: [batch_id, sequence, agent_time, agent_version, config_version, metrics, disks, probe_results]
+      properties:
+        batch_id: { type: string, format: uuid }
+        sequence: { type: integer, minimum: 1, maximum: 9223372036854775807, description: Node-scoped strictly increasing sequence; exact retries reuse the same value and body. }
+        agent_time: { type: string, format: date-time }
+        agent_version: { type: string, minLength: 1, maxLength: 64 }
+        config_version: { type: integer, minimum: 1, maximum: 9223372036854775807 }
+        metrics:
+          type: array
+          maxItems: 120
+          items: { $ref: '#/components/schemas/AgentMetricSample' }
+        disks:
+          type: array
+          maxItems: 120
+          items: { $ref: '#/components/schemas/AgentDiskSample' }
+        probe_results:
+          type: array
+          maxItems: 120
+          items: { $ref: '#/components/schemas/AgentProbeResult' }
+      anyOf:
+        - properties: { metrics: { minItems: 1 } }
+        - properties: { disks: { minItems: 1 } }
+        - properties: { probe_results: { minItems: 1 } }
+    AgentReportResponse:
+      type: object
+      additionalProperties: false
+      description: Duplicate responses reuse the original received_at and clock_status; current_config_version is freshly read so an Agent can notice configuration changes while retrying.
+      required: [batch_id, status, received_at, clock_status, current_config_version]
+      properties:
+        batch_id: { type: string, format: uuid }
+        status: { type: string, enum: [accepted, duplicate] }
+        received_at: { type: string, format: date-time }
+        clock_status: { type: string, enum: [ok, skewed] }
+        current_config_version: { type: integer, minimum: 1, maximum: 9223372036854775807 }
+    AgentReportAcceptedResponse:
+      allOf:
+        - $ref: '#/components/schemas/AgentReportResponse'
+        - type: object
+          properties: { status: { const: accepted } }
+    AgentReportDuplicateResponse:
+      allOf:
+        - $ref: '#/components/schemas/AgentReportResponse'
+        - type: object
+          properties: { status: { const: duplicate } }
+    AuditLog:
+      type: object
+      additionalProperties: false
+      required: [audit_id, actor_user_id, actor_username, action, target_type, target_id, source_ip, request_id, result, error_code, occurred_at]
+      properties:
+        audit_id: { type: integer, minimum: 1 }
+        actor_user_id: { type: [string, 'null'], format: uuid }
+        actor_username: { type: [string, 'null'], maxLength: 128 }
+        action: { type: string, minLength: 1, maxLength: 128 }
+        target_type: { type: [string, 'null'], maxLength: 128 }
+        target_id: { type: [string, 'null'], maxLength: 256 }
+        source_ip: { type: [string, 'null'] }
+        request_id: { type: string, minLength: 1, maxLength: 128 }
+        before_summary: { type: [object, 'null'], additionalProperties: true }
+        after_summary: { type: [object, 'null'], additionalProperties: true }
+        result: { type: string, enum: [success, failure] }
+        error_code: { type: [string, 'null'], maxLength: 128 }
+        occurred_at: { type: string, format: date-time }
+    AuditLogListResponse:
+      type: object
+      additionalProperties: false
+      required: [logs, next_cursor]
+      properties:
+        logs:
+          type: array
+          items: { $ref: '#/components/schemas/AuditLog' }
+        next_cursor: { type: [string, 'null'], maxLength: 512 }
+    PublicNode:
+      type: object
+      additionalProperties: false
+      required: [node_id, display_name, status, last_received_at, current_metrics]
+      properties:
+        node_id: { type: string, format: uuid }
+        display_name: { type: string, minLength: 1, maxLength: 128 }
+        status: { type: string, enum: [online, offline] }
+        location: { type: [string, 'null'], maxLength: 128 }
+        last_received_at: { type: [string, 'null'], format: date-time }
+        current_metrics:
+          oneOf:
+            - $ref: '#/components/schemas/MetricPoint'
+            - type: 'null'
+    PublicNodeListResponse:
+      type: object
+      additionalProperties: false
+      required: [nodes, next_cursor]
+      properties:
+        nodes:
+          type: array
+          items: { $ref: '#/components/schemas/PublicNode' }
+        next_cursor: { type: [string, 'null'], maxLength: 512 }
+    PublicProbeTarget:
+      type: object
+      additionalProperties: false
+      required: [target_id, name, type]
+      properties:
+        target_id: { type: string, format: uuid }
+        name: { type: string, minLength: 1, maxLength: 128 }
+        type: { type: string, enum: [tcp, http, https] }
+    PublicProbeSeriesResponse:
+      type: object
+      additionalProperties: false
+      required: [target, resolution, from, to, as_of, points]
+      properties:
+        target: { $ref: '#/components/schemas/PublicProbeTarget' }
+        resolution: { type: string, enum: [raw, 5m, 1h] }
+        from: { type: string, format: date-time }
+        to: { type: string, format: date-time }
+        as_of: { type: string, format: date-time }
+        points:
+          type: array
+          maxItems: 2200
+          items: { $ref: '#/components/schemas/ProbeSeriesPoint' }
+    LivenessResponse:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status: { type: string, const: ok }
+    ReadinessResponse:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status: { type: string, const: ready }

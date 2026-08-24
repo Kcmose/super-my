@@ -1,0 +1,48 @@
+[Unit]
+Description=Probe Panel Go API
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=probe-api
+Group=probe-api
+EnvironmentFile=/srv/probe/config/probe-api.env
+ExecStart=/srv/probe/api/probe-api serve
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+UMask=0077
+RuntimeDirectory=probe-api
+RuntimeDirectoryMode=0700
+StateDirectory=probe-api
+StateDirectoryMode=0700
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProtectSystem=strict
+ProtectHome=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SocketBindAllow=tcp:8080
+SocketBindDeny=any
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,44 @@
+[Unit]
+Description=Probe Panel PostgreSQL verified backup
+After=network-online.target postgresql.service
+Wants=network-online.target
+RequiresMountsFor=/var/backups/probe-panel/postgres
+
+[Service]
+Type=oneshot
+User=probe-api
+Group=probe-api
+EnvironmentFile=/srv/probe/config/probe-postgres-backup.env
+ExecStart=/srv/probe/api/scripts/backup-postgres.sh
+UMask=0077
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=2h
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProtectSystem=strict
+ReadOnlyPaths=/srv/probe/config
+ReadWritePaths=/var/backups/probe-panel/postgres
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM

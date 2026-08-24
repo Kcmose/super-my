@@ -1,0 +1,42 @@
+[Unit]
+Description=Probe Panel isolated preview PostgreSQL
+After=local-fs.target
+Before=probe-stage5-preview-api.service
+RequiresMountsFor=/srv/probe-stage5-preview/pgdata /srv/probe-stage5-preview/pgsocket
+
+[Service]
+Type=notify
+User=postgres
+Group=postgres
+ExecStart=/usr/lib/postgresql/17/bin/postgres -D /srv/probe-stage5-preview/pgdata -k /srv/probe-stage5-preview/pgsocket -p 55433 -c listen_addresses= -c fsync=on -c synchronous_commit=on
+ExecReload=/bin/kill -HUP $MAINPID
+KillSignal=SIGINT
+KillMode=mixed
+TimeoutStartSec=120
+TimeoutStopSec=120
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProtectSystem=strict
+ReadWritePaths=/srv/probe-stage5-preview/pgdata /srv/probe-stage5-preview/pgsocket
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

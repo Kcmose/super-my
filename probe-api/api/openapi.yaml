@@ -14,6 +14,11 @@ info:
     management IP/CIDR allowlisting, request size limits, Origin checks, and rate limits are enforced
     before or together with the authentication described here. Unlisted paths and methods are denied.
     All timestamps are RFC 3339 instants and all server-generated timestamps use UTC.
+    This document also describes the short-lived first-run Setup API. Every Setup path overrides the
+    production servers with `http://127.0.0.1:18080`; it is reachable only through an SSH local
+    forward while the machine is uninitialized. It is never published by the production Nginx
+    virtual hosts, where `/install`, `/install/*`, `/api/v1/setup`, and `/api/v1/setup/*`
+    permanently return 404.
 servers:
   - url: https://panel.example.com
     description: Allowlisted visitor-panel origin; only anonymous read-only panel routes are exposed.
@@ -22,6 +27,8 @@ servers:
   - url: https://api.example.com
     description: Agent origin and disabled-by-default public API; management routes are not exposed.
 tags:
+  - name: setup
+    description: Temporary loopback-only first-run API; absent from the normal Probe API server and production Nginx.
   - name: auth
   - name: panel
   - name: admin
@@ -30,6 +37,125 @@ tags:
   - name: internal
 security: []
 paths:
+  /api/v1/setup/status:
+    servers:
+      - url: http://127.0.0.1:18080
+        description: Temporary first-run service reached through `ssh -L 18080:127.0.0.1:18080 ...` only.
+    get:
+      tags: [setup]
+      operationId: getSetupStatus
+      summary: Read the current first-run installation state.
+      description: |
+        This route exists only on the independent `probe-setup` loopback listener while first-run
+        setup is active. The TCP peer must be loopback and `Host` must be exactly
+        `127.0.0.1:18080` or `localhost:18080`. `Origin` may be omitted by a non-browser GET; when
+        present it must be exactly `http://127.0.0.1:18080` or `http://localhost:18080`.
+        An `installed` response includes the administrator login URL briefly before the temporary
+        service shuts down. Production Nginx does not proxy this route and permanently returns 404.
+      x-access-boundary: temporary-loopback-ssh-forward-only
+      security: []
+      responses:
+        '200':
+          description: Current setup state; `admin_url` is present when the state is `installed`.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SetupStatusResponse' }
+        '403': { $ref: '#/components/responses/SetupForbidden' }
+        '503': { $ref: '#/components/responses/SetupUnavailable' }
+  /api/v1/setup/session:
+    servers:
+      - url: http://127.0.0.1:18080
+        description: Temporary first-run service reached through `ssh -L 18080:127.0.0.1:18080 ...` only.
+    post:
+      tags: [setup]
+      operationId: createSetupSession
+      summary: Exchange the one-time setup code for one short-lived in-memory session.
+      description: |
+        Accepts the 256-bit lowercase hexadecimal code printed once by the installer. Only its
+        SHA-256 digest and expiry metadata are stored on disk. A valid code is consumed exactly
+        once, expires 30 minutes after creation, and is exchanged for a 15-minute session and CSRF
+        token held only in memory. The body is limited to 64 KiB and unknown, duplicate, missing,
+        or trailing JSON fields are rejected. The TCP peer and `Host` restrictions are the same as
+        the status route; a POST also requires the exact allowed `Origin` header.
+      x-access-boundary: temporary-loopback-ssh-forward-origin
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/SetupOrigin'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetupSessionRequest' }
+      responses:
+        '200':
+          description: The code was consumed and a single short-lived setup session was created.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SetupSessionResponse' }
+        '400': { $ref: '#/components/responses/SetupBadRequest' }
+        '401': { $ref: '#/components/responses/SetupUnauthorized' }
+        '403': { $ref: '#/components/responses/SetupForbidden' }
+        '409': { $ref: '#/components/responses/SetupConflict' }
+        '413': { $ref: '#/components/responses/SetupPayloadTooLarge' }
+        '415': { $ref: '#/components/responses/SetupUnsupportedMediaType' }
+        '429':
+          description: More than five setup-code attempts were made in the current one-minute window.
+          headers:
+            Retry-After:
+              schema: { type: integer, minimum: 1 }
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SetupErrorResponse' }
+  /api/v1/setup/complete:
+    servers:
+      - url: http://127.0.0.1:18080
+        description: Temporary first-run service reached through `ssh -L 18080:127.0.0.1:18080 ...` only.
+    post:
+      tags: [setup]
+      operationId: completeSetup
+      summary: Validate the first-run configuration and start privileged finalization asynchronously.
+      description: |
+        Requires the exact `X-Probe-Setup-Session` and `X-CSRF-Token` values returned by the session
+        exchange; `Authorization: Bearer` is not accepted. It also requires an allowed `Origin`, an
+        allowed loopback `Host`, a loopback TCP peer, and an `application/json` body no larger than
+        64 KiB. The JSON object is strict: unknown, duplicate, missing, and trailing fields are
+        rejected. Password confirmations are compared in constant time. Accepted secrets are copied
+        only for the asynchronous finalizer and are cleared when it returns. Production Nginx never
+        exposes this path.
+      x-access-boundary: temporary-loopback-ssh-forward-session-origin-csrf
+      security:
+        - SetupSession: []
+          SetupCsrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/SetupOrigin'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetupCompleteRequest' }
+      responses:
+        '202':
+          description: Configuration validation passed and finalization started; poll the status route.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SetupFinalizingResponse' }
+        '400': { $ref: '#/components/responses/SetupBadRequest' }
+        '401': { $ref: '#/components/responses/SetupUnauthorized' }
+        '403': { $ref: '#/components/responses/SetupForbidden' }
+        '409': { $ref: '#/components/responses/SetupConflict' }
+        '413': { $ref: '#/components/responses/SetupPayloadTooLarge' }
+        '415': { $ref: '#/components/responses/SetupUnsupportedMediaType' }
   /api/v1/auth/access:
     servers:
       - url: https://admin.example.com
@@ -950,6 +1076,16 @@ paths:
               schema: { $ref: '#/components/schemas/ErrorResponse' }
 components:
   securitySchemes:
+    SetupSession:
+      type: apiKey
+      in: header
+      name: X-Probe-Setup-Session
+      description: One 64-character lowercase hexadecimal token returned by the one-time setup-code exchange. `Authorization` is not accepted.
+    SetupCsrfToken:
+      type: apiKey
+      in: header
+      name: X-CSRF-Token
+      description: One 64-character lowercase hexadecimal token bound to the in-memory setup session; unrelated to administrator-session CSRF tokens.
     SessionCookie:
       type: apiKey
       in: cookie
@@ -975,6 +1111,16 @@ components:
       bearerFormat: opaque-internal-token
       description: Required only when an internal endpoint is deliberately exposed beyond loopback.
   parameters:
+    SetupOrigin:
+      name: Origin
+      in: header
+      required: true
+      description: Exact browser origin accepted by the temporary loopback setup service.
+      schema:
+        type: string
+        enum:
+          - http://127.0.0.1:18080
+          - http://localhost:18080
     NodeId:
       name: node_id
       in: path
@@ -1045,6 +1191,62 @@ components:
         enum: [auto, raw, 5m, 1h]
         default: auto
   responses:
+    SetupBadRequest:
+      description: The strict setup JSON document is malformed or fails field validation.
+      headers:
+        Cache-Control:
+          schema: { type: string, const: no-store }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/SetupErrorResponse' }
+    SetupUnauthorized:
+      description: The setup code or setup-session token is missing, invalid, expired, consumed, or unavailable.
+      headers:
+        Cache-Control:
+          schema: { type: string, const: no-store }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/SetupErrorResponse' }
+    SetupForbidden:
+      description: The loopback peer, exact Host, exact Origin, or setup CSRF check failed.
+      headers:
+        Cache-Control:
+          schema: { type: string, const: no-store }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/SetupErrorResponse' }
+    SetupConflict:
+      description: The persistent setup state does not allow the requested transition or finalization is already active.
+      headers:
+        Cache-Control:
+          schema: { type: string, const: no-store }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/SetupErrorResponse' }
+    SetupPayloadTooLarge:
+      description: The setup JSON request body exceeds 64 KiB.
+      headers:
+        Cache-Control:
+          schema: { type: string, const: no-store }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/SetupErrorResponse' }
+    SetupUnsupportedMediaType:
+      description: The request Content-Type is not application/json.
+      headers:
+        Cache-Control:
+          schema: { type: string, const: no-store }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/SetupErrorResponse' }
+    SetupUnavailable:
+      description: Root-owned setup state could not be read safely.
+      headers:
+        Cache-Control:
+          schema: { type: string, const: no-store }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/SetupErrorResponse' }
     BadRequest:
       description: Malformed JSON, parameter, or request.
       content:
@@ -1089,6 +1291,211 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorResponse' }
   schemas:
+    SetupStatusResponse:
+      description: |
+        `pending` waits for the one-time code; `configuring` has consumed it and holds one in-memory
+        session; `finalizing` means the privileged asynchronous finalizer is running; `installed`
+        is terminal success; `recovery_required` is fail-closed terminal failure requiring operator
+        recovery rather than reopening first-run setup.
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [status]
+          properties:
+            status:
+              type: string
+              enum: [pending, configuring, finalizing, recovery_required]
+        - type: object
+          additionalProperties: false
+          required: [status, admin_url]
+          properties:
+            status: { type: string, const: installed }
+            admin_url:
+              type: string
+              format: uri
+              pattern: '^https://[^/]+/login$'
+              description: Administrator login URL constructed from the validated bare administrator FQDN.
+      example:
+        status: installed
+        admin_url: https://admin.monitor.example.net/login
+    SetupSessionRequest:
+      type: object
+      additionalProperties: false
+      required: [setup_code]
+      properties:
+        setup_code:
+          type: string
+          minLength: 64
+          maxLength: 64
+          pattern: '^[0-9a-f]{64}$'
+          writeOnly: true
+          description: 256-bit one-time lowercase hexadecimal code printed once by the installer; valid for 30 minutes.
+    SetupSessionResponse:
+      type: object
+      additionalProperties: false
+      required: [session_token, csrf_token, expires_at]
+      properties:
+        session_token:
+          type: string
+          minLength: 64
+          maxLength: 64
+          pattern: '^[0-9a-f]{64}$'
+          readOnly: true
+        csrf_token:
+          type: string
+          minLength: 64
+          maxLength: 64
+          pattern: '^[0-9a-f]{64}$'
+          readOnly: true
+        expires_at:
+          type: string
+          format: date-time
+          readOnly: true
+          description: RFC 3339 expiry of this single in-memory session, normally 15 minutes after exchange.
+    SetupCompleteRequest:
+      type: object
+      additionalProperties: false
+      required: [database, domains, tls, allowlist, administrator]
+      properties:
+        database: { $ref: '#/components/schemas/SetupDatabaseInput' }
+        domains: { $ref: '#/components/schemas/SetupDomainsInput' }
+        tls: { $ref: '#/components/schemas/SetupTLSInput' }
+        allowlist:
+          type: array
+          minItems: 1
+          maxItems: 128
+          uniqueItems: true
+          description: |
+            Shared visitor/admin management allowlist. Each item is one canonical non-default IPv4
+            or IPv6 CIDR, or one bare IP that the server normalizes to `/32` or `/128`. `0.0.0.0/0`,
+            `::/0`, host bits in a CIDR, scoped addresses, IPv4-mapped IPv6, and duplicates are rejected.
+          items:
+            type: string
+            minLength: 2
+            maxLength: 49
+        administrator: { $ref: '#/components/schemas/SetupAdministratorInput' }
+      example:
+        database:
+          mode: local
+          name: probe
+          username: probe
+          password: change-this-database-password
+          password_confirmation: change-this-database-password
+        domains:
+          panel: panel.monitor.example.net
+          admin: admin.monitor.example.net
+          agent: agent.monitor.example.net
+        tls:
+          mode: acme
+          email: operations@example.net
+        allowlist:
+          - 203.0.113.25
+          - 2001:db8:1234::/48
+        administrator:
+          username: admin
+          password: change-this-administrator-password
+          password_confirmation: change-this-administrator-password
+    SetupDatabaseInput:
+      type: object
+      additionalProperties: false
+      required: [mode, name, username, password, password_confirmation]
+      properties:
+        mode:
+          type: string
+          const: local
+          description: V1 provisions only PostgreSQL on the same Debian host.
+        name:
+          type: string
+          minLength: 1
+          maxLength: 63
+          pattern: '^[a-z_][a-z0-9_]{0,62}$'
+          description: Canonical non-reserved PostgreSQL database identifier; `postgres`, `template0`, and `template1` are rejected.
+        username:
+          type: string
+          minLength: 1
+          maxLength: 63
+          pattern: '^[a-z_][a-z0-9_]{0,62}$'
+          description: Canonical PostgreSQL role identifier; the `postgres` role is rejected.
+        password:
+          type: string
+          format: password
+          writeOnly: true
+          description: Must contain 12 to 1024 valid UTF-8 bytes and no NUL, CR/LF, or other control character.
+          x-min-utf8-bytes: 12
+          x-max-utf8-bytes: 1024
+        password_confirmation:
+          type: string
+          format: password
+          writeOnly: true
+          description: Must byte-for-byte match `password`; the server compares digests in constant time.
+          x-min-utf8-bytes: 12
+          x-max-utf8-bytes: 1024
+    SetupDomainsInput:
+      type: object
+      additionalProperties: false
+      required: [panel, admin, agent]
+      description: Three distinct lowercase bare FQDNs; no value may contain another, and schemes, ports, paths, IP literals, trailing dots, and reserved example.com names are rejected.
+      properties:
+        panel: { $ref: '#/components/schemas/SetupBareFQDN' }
+        admin: { $ref: '#/components/schemas/SetupBareFQDN' }
+        agent: { $ref: '#/components/schemas/SetupBareFQDN' }
+    SetupBareFQDN:
+      type: string
+      minLength: 3
+      maxLength: 253
+      pattern: '^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$'
+      description: Lowercase bare fully-qualified DNS name. HTTPS origins are constructed by the server.
+    SetupTLSInput:
+      type: object
+      additionalProperties: false
+      required: [mode, email]
+      properties:
+        mode:
+          type: string
+          const: acme
+        email:
+          type: string
+          format: email
+          minLength: 3
+          description: ACME account and expiry-notification address.
+          x-max-utf8-bytes: 254
+    SetupAdministratorInput:
+      type: object
+      additionalProperties: false
+      required: [username, password, password_confirmation]
+      properties:
+        username:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Must be valid UTF-8 without leading/trailing whitespace or control characters.
+        password:
+          type: string
+          format: password
+          writeOnly: true
+          description: Must contain 12 to 1024 valid UTF-8 bytes and no NUL.
+          x-min-utf8-bytes: 12
+          x-max-utf8-bytes: 1024
+        password_confirmation:
+          type: string
+          format: password
+          writeOnly: true
+          description: Must byte-for-byte match `password`; the server compares digests in constant time.
+          x-min-utf8-bytes: 12
+          x-max-utf8-bytes: 1024
+    SetupFinalizingResponse:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status: { type: string, const: finalizing }
+    SetupErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [error, message]
+      properties:
+        error: { type: string, minLength: 1, maxLength: 128 }
+        message: { type: string, minLength: 1, maxLength: 512 }
     ErrorResponse:
       type: object
       additionalProperties: false

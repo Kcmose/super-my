@@ -21,7 +21,7 @@ test('admin project contains no public monitoring views', async () => {
   const rootViews = viewEntries.filter((entry) => entry.isFile()).map((entry) => entry.name).sort()
   const adminViews = (await readdir(path.join(sourceRoot, 'views', 'admin'))).sort()
 
-  assert.deepEqual(rootViews, ['Login.vue'])
+  assert.deepEqual(rootViews, ['Install.vue', 'Login.vue'])
   assert.deepEqual(adminViews, ['AuditLogs.vue', 'NodeTokens.vue', 'ProbeTargets.vue', 'SystemStatus.vue', 'Users.vue'])
 
   const removedViews = ['Overview.vue', 'NodeDetail.vue', 'ProbeAnalysis.vue']
@@ -34,7 +34,13 @@ test('admin source has no public route, public audience copy, or cross-project i
   const disallowedAudienceLabel = String.fromCharCode(28216, 23458)
 
   for (const { file, text } of sources) {
-    assert.equal(text.includes(disallowedAudienceLabel), false, `${file} contains public-audience copy`)
+    const setupOnlySource = (
+      file.endsWith(`${path.sep}views${path.sep}Install.vue`)
+      || file.endsWith(`${path.sep}utils${path.sep}setup.js`)
+    )
+    if (!setupOnlySource) {
+      assert.equal(text.includes(disallowedAudienceLabel), false, `${file} contains public-audience copy`)
+    }
     assert.doesNotMatch(text, /(?:from\s*|import\s*\()['"][^'"]*probe-web/i, `${file} imports probe-web`)
     assert.doesNotMatch(text, /['"]\/overview['"]/, `${file} exposes overview`)
     assert.doesNotMatch(text, /path:\s*['"]\/(?:probes|nodes\/[^'"]*)['"]/, `${file} exposes a public route`)
@@ -61,10 +67,12 @@ test('package, lockfile and deployment target are independently named', async ()
 })
 
 test('management API clients stay on the frozen same-origin namespaces', async () => {
-  const [authSource, adminSource, panelSource] = await Promise.all([
+  const [authSource, adminSource, panelSource, normalClientSource, setupSource] = await Promise.all([
     readFile(path.join(sourceRoot, 'api', 'auth.js'), 'utf8'),
     readFile(path.join(sourceRoot, 'api', 'admin.js'), 'utf8'),
     readFile(path.join(sourceRoot, 'api', 'panel.js'), 'utf8'),
+    readFile(path.join(sourceRoot, 'api', 'client.js'), 'utf8'),
+    readFile(path.join(sourceRoot, 'api', 'setup.js'), 'utf8'),
   ])
 
   assert.match(authSource, /\/api\/v1\/auth\/login/)
@@ -80,6 +88,11 @@ test('management API clients stay on the frozen same-origin namespaces', async (
     assert.doesNotMatch(source, /https?:\/\//)
     assert.doesNotMatch(source, /probe-web/i)
   }
+  assert.doesNotMatch(normalClientSource, /api\/v1\/setup/)
+  assert.match(setupSource, /\/api\/v1\/setup\/status/)
+  assert.match(setupSource, /\/api\/v1\/setup\/session/)
+  assert.match(setupSource, /\/api\/v1\/setup\/complete/)
+  assert.doesNotMatch(setupSource, /from\s+['"]\.\/client/)
 })
 
 test('development proxy exposes only management-panel namespaces', async () => {
@@ -87,5 +100,6 @@ test('development proxy exposes only management-panel namespaces', async () => {
   assert.match(viteConfig, /['"]\/api\/v1\/auth['"]:\s*\{/)
   assert.match(viteConfig, /['"]\/api\/v1\/admin['"]:\s*\{/)
   assert.match(viteConfig, /['"]\/api\/v1\/panel['"]:\s*\{/)
+  assert.match(viteConfig, /['"]\/api\/v1\/setup['"]:\s*\{/)
   assert.doesNotMatch(viteConfig, /['"]\/api['"]:\s*\{/)
 })

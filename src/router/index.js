@@ -1,9 +1,17 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
+import { setupApi } from '../api/setup'
 import { requiresResolvedAuth } from '../utils/access'
+import { isSetupInstallStatus, setupStatusValue } from '../utils/setup'
 
 const routes = [
   { path: '/', redirect: '/admin/nodes' },
+  {
+    path: '/install',
+    name: 'Install',
+    component: () => import('../views/Install.vue'),
+    meta: { setupOnly: true },
+  },
   {
     path: '/login',
     name: 'Login',
@@ -48,7 +56,36 @@ const router = createRouter({
   scrollBehavior: () => ({ top: 0 }),
 })
 
+let installedSetupState = false
+let setupStatusPromise = null
+
+async function resolveSetupStatus() {
+  if (installedSetupState) return 'installed'
+  if (setupStatusPromise) return setupStatusPromise
+
+  setupStatusPromise = (async () => {
+    try {
+      const status = setupStatusValue(await setupApi.getStatus())
+      if (status === 'installed') installedSetupState = true
+      return status
+    } catch (error) {
+      if (error?.status === 404) {
+        installedSetupState = true
+        return 'installed'
+      }
+      return ''
+    } finally {
+      setupStatusPromise = null
+    }
+  })()
+  return setupStatusPromise
+}
+
 router.beforeEach(async (to) => {
+  const setupStatus = await resolveSetupStatus()
+  if (isSetupInstallStatus(setupStatus) && to.name !== 'Install') return { name: 'Install' }
+  if (setupStatus === 'installed' && to.name === 'Install') return { name: 'Login' }
+
   const authStore = useAuthStore()
   if (to.matched.length === 0) {
     if (!authStore.initialized) await authStore.checkAuth()

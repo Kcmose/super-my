@@ -65,6 +65,24 @@ func TestReadinessFailsClosed(t *testing.T) {
 	}
 }
 
+func TestNormalServerDoesNotRegisterSetupRoutes(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("config.Load() error = %v", err)
+	}
+	server := NewServer(cfg, logger, fakeDatabase{})
+	for _, path := range []string{"/install", "/api/v1/setup/status", "/api/v1/setup/session", "/api/v1/setup/complete"} {
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		request.RemoteAddr = "127.0.0.1:12345"
+		response := httptest.NewRecorder()
+		server.httpServer.Handler.ServeHTTP(response, request)
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("%s status = %d, want 404", path, response.Code)
+		}
+	}
+}
+
 func TestHealthRejectsUnlistedMethodsAsJSON(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	cfg, err := config.Load()

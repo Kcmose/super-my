@@ -1,0 +1,11 @@
+[Unit]
+Description=Watch for a validated Probe Panel finalization request
+Requires=probe-panel-setup.service
+After=probe-panel-setup.service
+
+[Path]
+PathExists=/run/probe-panel-setup/finalize.json
+Unit=probe-panel-finalizer.service
+
+[Install]
+WantedBy=multi-user.target

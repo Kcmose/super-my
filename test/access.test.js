@@ -26,11 +26,12 @@ test('login and protected routes wait for administrator session discovery', () =
   assert.equal(requiresResolvedAuth({ guestOnly: true }), true)
 })
 
-test('router exposes only login and administrator pages', async () => {
+test('router exposes only setup, login and administrator pages', async () => {
   const source = await readFile(new URL('../src/router/index.js', import.meta.url), 'utf8')
   const paths = [...source.matchAll(/\bpath:\s*'([^']+)'/g)].map((match) => match[1])
   assert.deepEqual(paths, [
     '/',
+    '/install',
     '/login',
     '/admin/nodes',
     '/admin/probes',
@@ -52,7 +53,7 @@ test('router exposes only login and administrator pages', async () => {
   assert.match(source, /name:\s*'Login',\s*query:\s*\{ redirect:\s*to\.fullPath \}/)
 })
 
-test('management chrome is shown only for a signed-in administrator', async () => {
+test('management chrome is shown only for setup, login or a signed-in administrator', async () => {
   const [app, header, nav, login, authStore] = await Promise.all([
     readFile(new URL('../src/App.vue', import.meta.url), 'utf8'),
     readFile(new URL('../src/components/PanelHeader.vue', import.meta.url), 'utf8'),
@@ -62,7 +63,7 @@ test('management chrome is shown only for a signed-in administrator', async () =
   ])
   const disallowedAudienceLabel = String.fromCharCode(28216, 23458)
 
-  assert.match(app, /route\.name === 'Login' \|\| authStore\.isAdmin/)
+  assert.match(app, /route\.name === 'Login' \|\| route\.name === 'Install' \|\| authStore\.isAdmin/)
   assert.match(header, /<header v-if="authStore\.isAdmin"/)
   assert.match(header, /PROBE ADMIN/)
   assert.match(header, /\{\{ authStore\.currentUsername \}\}/)

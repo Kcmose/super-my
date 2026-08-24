@@ -243,6 +243,10 @@ check_status "visitor entry hides Agent API" 404 \
     "$PANEL_URL/api/v1/agent/config?version=0" || true
 check_status "visitor entry hides Agent downloads" 404 \
     "$PANEL_URL/downloads/probe-agent/install.sh" || true
+check_status "visitor entry never exposes first-run setup API" 404 \
+    "$PANEL_URL/api/v1/setup/status" || true
+check_status "visitor entry never exposes first-run install UI" 404 \
+    "$PANEL_URL/install" || true
 if ((EXPECT_PRIVATE_CA == 1)); then
     check_status "visitor entry hides the private Agent CA" 404 \
         "$PANEL_URL/downloads/probe-agent/ca.pem" || true
@@ -261,6 +265,10 @@ check_status "administrator entry hides Agent API" 404 \
     "$ADMIN_URL/api/v1/agent/config?version=0" || true
 check_status "administrator entry hides Agent downloads" 404 \
     "$ADMIN_URL/downloads/probe-agent/install.sh" || true
+check_status "installed administrator entry closes setup API" 404 \
+    "$ADMIN_URL/api/v1/setup/status" || true
+check_status "installed administrator entry closes install UI" 404 \
+    "$ADMIN_URL/install" || true
 if ((EXPECT_PRIVATE_CA == 1)); then
     check_status "administrator entry hides the private Agent CA" 404 \
         "$ADMIN_URL/downloads/probe-agent/ca.pem" || true
@@ -279,6 +287,8 @@ check_status "Agent entry hides administrator authentication" 404 \
     "$AGENT_URL/api/v1/auth/me" || true
 check_status "Agent entry hides administrator API" 404 \
     "$AGENT_URL/api/v1/admin/users" || true
+check_status "Agent entry never exposes first-run setup API" 404 \
+    "$AGENT_URL/api/v1/setup/status" || true
 check_status "Agent entry serves the reviewed bootstrap installer" 200 \
     "$AGENT_URL/downloads/probe-agent/install.sh" || true
 check_header_absent "Agent download does not create a session" "Set-Cookie" || true

@@ -28,6 +28,11 @@ readonly PROBE_BACKUP_TIMER_UNIT="/etc/systemd/system/probe-postgres-backup.time
 readonly PROBE_DEPLOY_LOCK="/run/lock/probe-panel-deploy.lock"
 
 PROBE_DEPLOY_WORK_ROOT=""
+PROBE_VALIDATED_PGHOST=""
+PROBE_VALIDATED_PGPORT=""
+PROBE_VALIDATED_PGDATABASE=""
+PROBE_VALIDATED_PGUSER=""
+PROBE_VALIDATED_PGPASSFILE=""
 
 cleanup_deploy_work_root() {
     local status=$?
@@ -35,7 +40,7 @@ cleanup_deploy_work_root() {
     if [[ -n "$PROBE_DEPLOY_WORK_ROOT" && -d "$PROBE_DEPLOY_WORK_ROOT" &&
           ! -L "$PROBE_DEPLOY_WORK_ROOT" ]]; then
         case "$PROBE_DEPLOY_WORK_ROOT" in
-            /var/tmp/probe-build.*) rm -rf -- "$PROBE_DEPLOY_WORK_ROOT" ;;
+            /var/tmp/probe-build.*|/var/tmp/probe-prebuilt-verify.*) rm -rf -- "$PROBE_DEPLOY_WORK_ROOT" ;;
             *) warn "refusing to remove unexpected temporary path: $PROBE_DEPLOY_WORK_ROOT" ;;
         esac
     fi
@@ -107,7 +112,9 @@ validate_source_root() {
         probe-api/config/probe-postgres-backup.env.example \
         probe-api/deploy/nginx/nginx.conf \
         probe-api/deploy/scripts/deploy-common.sh \
+        probe-api/deploy/scripts/build-release-bundles.sh \
         probe-api/deploy/scripts/install.sh \
+        probe-api/deploy/scripts/install-release.sh \
         probe-api/deploy/scripts/upgrade.sh \
         probe-api/deploy/scripts/validate-production.sh \
         probe-api/deploy/scripts/backup-postgres.sh \
@@ -158,7 +165,7 @@ validate_source_root() {
 validate_deployment_script_sources() {
     local source_root="$1" script
     for script in \
-        deploy-common.sh install.sh upgrade.sh validate-production.sh \
+        deploy-common.sh build-release-bundles.sh install.sh install-release.sh upgrade.sh validate-production.sh \
         backup-postgres.sh restore-postgres.sh security-smoke.sh load-smoke.sh; do
         bash -n -- "${source_root}/probe-api/deploy/scripts/${script}" ||
             die "deployment script syntax is invalid: $script"
@@ -273,6 +280,8 @@ validate_nginx_template_contract() {
 location ~ ^/api/v1/panel(?:/|$) {
 location = /api {
 location /api/ {
+location = /api/v1/setup {
+location ^~ /api/v1/setup/ {
 location = /internal {
 location /internal/ {
 location ~ (^|/)\. {
@@ -286,12 +295,16 @@ location / {
 location = /api/v1/auth/login {
 location ~ ^/api/v1/(?:auth|admin)(?:/|$) {
 location ~ ^/api/v1/panel(?:/|$) {
+location = /api/v1/setup {
+location ^~ /api/v1/setup/ {
 location = /api {
 location /api/ {
 location = /internal {
 location /internal/ {
 location @probe_admin_rate_limited {
 location ~ (^|/)\. {
+location = /install {
+location ^~ /install/ {
 location = /overview {
 location ^~ /overview/ {
 location = /probes {
@@ -501,7 +514,9 @@ validate_allowlist_with_binary() {
     local api_binary="$1"
     [[ -x "$api_binary" && ! -L "$api_binary" ]] || die "invalid staged API binary: $api_binary"
     assert_secure_file "$PROBE_ALLOWLIST_FILE" root
-    runuser -u probe-api -- test -r "$PROBE_ALLOWLIST_FILE" ||
+    setpriv --reuid=probe-api --regid=probe-api --init-groups --reset-env -- \
+        /usr/bin/setpriv --inh-caps=-all --ambient-caps=-all -- \
+        /usr/bin/test -r "$PROBE_ALLOWLIST_FILE" ||
         die "probe-api cannot read $PROBE_ALLOWLIST_FILE"
     "$api_binary" config validate-admin-allowlist "$PROBE_ALLOWLIST_FILE"
 }
@@ -615,6 +630,59 @@ build_release_artifacts() {
 
     cp -a -- "${build_root}/probe-api/migrations/." "${artifact_root}/migrations/"
     validate_release_artifacts "$artifact_root"
+}
+
+validate_prebuilt_bundle() {
+    local bundle_root="$1"
+    [[ -d "$bundle_root" && ! -L "$bundle_root" ]] ||
+        die "prebuilt bundle root is missing or unsafe: $bundle_root"
+
+    local required
+    for required in \
+        BUNDLE-SHA256SUMS \
+        artifacts/api/probe-api \
+        setup/probe-setup \
+        artifacts/agent/downloads/probe-agent/install.sh \
+        artifacts/agent/downloads/probe-agent/SHA256SUMS \
+        artifacts/web/index.html \
+        artifacts/admin/index.html \
+        source/probe-api/config/probe-api.env.example \
+        source/probe-api/config/probe-postgres-backup.env.example \
+        source/probe-api/deploy/nginx/nginx.conf \
+        source/probe-api/deploy/scripts/deploy-common.sh \
+        source/probe-api/deploy/scripts/build-release-bundles.sh \
+        source/probe-api/deploy/scripts/install-release.sh \
+        source/probe-api/deploy/scripts/backup-postgres.sh \
+        source/probe-api/deploy/scripts/restore-postgres.sh \
+        source/probe-api/deploy/systemd/probe-api.service \
+        source/probe-api/deploy/systemd/probe-postgres-backup.service \
+        source/probe-api/deploy/systemd/probe-postgres-backup.timer; do
+        [[ -f "$bundle_root/$required" && ! -L "$bundle_root/$required" ]] ||
+            die "prebuilt bundle is missing a required regular file: $required"
+    done
+
+    if find "$bundle_root" -type l -print -quit | grep -q .; then
+        die "prebuilt bundle contains a symbolic link"
+    fi
+    (
+        cd "$bundle_root"
+        sha256sum --check --strict BUNDLE-SHA256SUMS
+    ) || die "prebuilt bundle checksum verification failed"
+
+    local expected_paths manifest_paths
+    expected_paths="$(
+        cd "$bundle_root"
+        find artifacts setup source -type f -print | LC_ALL=C sort
+    )"
+    manifest_paths="$(awk '{ print $2 }' "$bundle_root/BUNDLE-SHA256SUMS" | LC_ALL=C sort)"
+    [[ -n "$expected_paths" && "$manifest_paths" == "$expected_paths" ]] ||
+        die "BUNDLE-SHA256SUMS must cover every artifacts, setup, and source file exactly once"
+
+    validate_release_artifacts "$bundle_root/artifacts"
+    validate_systemd_unit_source "$bundle_root/source/probe-api/deploy/systemd/probe-api.service"
+    validate_backup_unit_source \
+        "$bundle_root/source/probe-api/deploy/systemd/probe-postgres-backup.service" \
+        "$bundle_root/source/probe-api/deploy/systemd/probe-postgres-backup.timer"
 }
 
 install_example_file() {
@@ -769,7 +837,9 @@ validate_backup_service_assets() {
 validate_backup_credentials() {
     assert_private_file "$PROBE_PGPASS_FILE" probe-api
     [[ -s "$PROBE_PGPASS_FILE" ]] || die "$PROBE_PGPASS_FILE must not be empty"
-    runuser -u probe-api -- test -r "$PROBE_PGPASS_FILE" ||
+    setpriv --reuid=probe-api --regid=probe-api --init-groups --reset-env -- \
+        /usr/bin/setpriv --inh-caps=-all --ambient-caps=-all -- \
+        /usr/bin/test -r "$PROBE_PGPASS_FILE" ||
         die "probe-api cannot read $PROBE_PGPASS_FILE"
     assert_private_file "$PROBE_BACKUP_ENV_FILE" root
     [[ -s "$PROBE_BACKUP_ENV_FILE" ]] || die "$PROBE_BACKUP_ENV_FILE must not be empty"
@@ -812,6 +882,12 @@ validate_backup_credentials() {
     require_integer_between PROBE_POSTGRES_DAILY_KEEP "${values[PROBE_POSTGRES_DAILY_KEEP]}" 1 365
     require_integer_between PROBE_POSTGRES_WEEKLY_KEEP "${values[PROBE_POSTGRES_WEEKLY_KEEP]}" 1 260
     require_integer_between PROBE_POSTGRES_WEEKLY_DAY "${values[PROBE_POSTGRES_WEEKLY_DAY]}" 1 7
+
+    PROBE_VALIDATED_PGHOST="${values[PGHOST]}"
+    PROBE_VALIDATED_PGPORT="${values[PGPORT]}"
+    PROBE_VALIDATED_PGDATABASE="${values[PGDATABASE]}"
+    PROBE_VALIDATED_PGUSER="${values[PGUSER]}"
+    PROBE_VALIDATED_PGPASSFILE="${values[PGPASSFILE]}"
 }
 
 acquire_database_maintenance_lock() {
@@ -924,18 +1000,70 @@ restore_release_links() {
     done
 }
 
-create_database_backup() {
+create_database_backup() (
     local release_id="$1"
     local temporary="${PROBE_BACKUPS_DIR}/.pre-upgrade-${release_id}.dump"
     local final="${PROBE_BACKUPS_DIR}/pre-upgrade-${release_id}.dump"
+    # Invoked indirectly by the EXIT trap below.
+    # shellcheck disable=SC2317
+    cleanup_failed_database_backup() {
+        local status=$?
+        trap - EXIT HUP INT TERM
+        if (( status != 0 )); then
+            rm -f -- "$temporary" || true
+        fi
+        exit "$status"
+    }
+    trap cleanup_failed_database_backup EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
     [[ ! -e "$temporary" && ! -e "$final" ]] || die "database backup already exists: $final"
+    [[ -n "$PROBE_VALIDATED_PGHOST" && -n "$PROBE_VALIDATED_PGPORT" &&
+       -n "$PROBE_VALIDATED_PGDATABASE" && -n "$PROBE_VALIDATED_PGUSER" &&
+       -n "$PROBE_VALIDATED_PGPASSFILE" ]] ||
+        die "validated PostgreSQL backup connection is unavailable"
 
     log "creating a PostgreSQL backup before migrations"
-    PGDATABASE="$PROBE_DATABASE_URL" pg_dump --format=custom --file="$temporary"
-    chmod 0600 "$temporary"
-    pg_restore --list "$temporary" >/dev/null
-    mv -T -- "$temporary" "$final"
+    if ! /usr/bin/env -i \
+        PGHOST="$PROBE_VALIDATED_PGHOST" \
+        PGPORT="$PROBE_VALIDATED_PGPORT" \
+        PGDATABASE="$PROBE_VALIDATED_PGDATABASE" \
+        PGUSER="$PROBE_VALIDATED_PGUSER" \
+        PGPASSFILE="$PROBE_VALIDATED_PGPASSFILE" \
+        /usr/bin/pg_dump --no-password --format=custom --file="$temporary"; then
+        die "PostgreSQL pre-migration backup failed"
+    fi
+    if [[ ! -s "$temporary" ]]; then
+        die "PostgreSQL pre-migration backup is empty"
+    fi
+    chmod 0600 "$temporary" || {
+        die "secure the PostgreSQL pre-migration backup"
+    }
+    if ! pg_restore --list "$temporary" >/dev/null; then
+        die "PostgreSQL pre-migration backup verification failed"
+    fi
+    mv -T -- "$temporary" "$final" || {
+        die "retain the PostgreSQL pre-migration backup"
+    }
+    trap - EXIT HUP INT TERM
     printf '%s\n' "$final"
+)
+
+persist_native_nginx_service() {
+    local fragment wants_link
+    fragment="$(systemctl show --property=FragmentPath --value nginx.service)"
+    case "$fragment" in
+        /usr/lib/systemd/system/nginx.service|/lib/systemd/system/nginx.service) ;;
+        *) die "nginx.service is not the expected Debian native systemd unit" ;;
+    esac
+
+    systemctl add-wants multi-user.target nginx.service >/dev/null ||
+        die "persist nginx.service in multi-user.target"
+    wants_link="/etc/systemd/system/multi-user.target.wants/nginx.service"
+    [[ -L "$wants_link" && "$(readlink -f -- "$wants_link")" == "$(readlink -f -- "$fragment")" ]] ||
+        die "nginx.service multi-user.target link is missing or unsafe"
 }
 
 run_migrations() {
@@ -972,9 +1100,88 @@ verify_running_services() {
     validate_runtime_listeners
 }
 
+deploy_prebuilt_release() {
+    local bundle_root="$1" release_id="$2"
+    require_commands bash cp env find install sha256sum sort xargs pg_dump pg_restore nginx systemctl systemd-analyze setpriv curl ss flock awk grep sed stat readlink
+
+    bundle_root="$(canonical_directory "$bundle_root")"
+    [[ "$release_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$ ]] ||
+        die "prebuilt release identifier is invalid"
+
+    validate_prebuilt_bundle "$bundle_root"
+
+    local source_root="$bundle_root/source"
+    local artifact_root="$bundle_root/artifacts"
+    local nginx_template="$source_root/probe-api/deploy/nginx/nginx.conf"
+    prepare_system_layout "$source_root"
+    acquire_database_maintenance_lock
+    validate_active_nginx_config "$nginx_template"
+    validate_backup_credentials
+    validate_switchable_release_paths
+
+    local verify_root
+    verify_root="$(mktemp -d /var/tmp/probe-prebuilt-verify.XXXXXX)"
+    PROBE_DEPLOY_WORK_ROOT="$verify_root"
+    verify_source_systemd_units "$source_root" "$verify_root"
+
+    clear_exported_probe_environment
+    load_probe_env
+    validate_allowlist_with_binary "$artifact_root/api/probe-api"
+    install_service_assets "$source_root"
+    validate_nginx_runtime_config "$nginx_template"
+
+    local unique_release_id release_dir backup_path
+    unique_release_id="${release_id}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    release_dir="$(stage_release "$artifact_root" "$unique_release_id")"
+    validate_release_artifacts "$release_dir"
+    (
+        cd "$release_dir"
+        sha256sum --check --strict SHA256SUMS
+    )
+
+    systemctl start postgresql.service
+    backup_path="$(create_database_backup "$unique_release_id")"
+    log "database backup retained at $backup_path"
+    run_migrations "$release_dir/api/probe-api"
+
+    local old_api old_agent old_web old_admin old_migrations
+    old_api="$(current_release_target "${PROBE_API_DIR}/probe-api")"
+    old_agent="$(current_release_target "${PROBE_ROOT}/agent")"
+    old_web="$(current_release_target "${PROBE_ROOT}/web")"
+    old_admin="$(current_release_target "${PROBE_ROOT}/admin")"
+    old_migrations="$(current_release_target "${PROBE_ROOT}/migrations")"
+
+    if ! activate_release "$release_dir"; then
+        restore_release_links "$old_api" "$old_agent" "$old_web" "$old_admin" "$old_migrations"
+        die "release link activation failed; the forward database migration remains applied and backup is $backup_path"
+    fi
+
+    if ! systemctl daemon-reload ||
+       ! systemd-analyze verify "$PROBE_SYSTEMD_UNIT" "$PROBE_BACKUP_SERVICE_UNIT" "$PROBE_BACKUP_TIMER_UNIT" ||
+       ! validate_backup_service_assets ||
+       ! systemctl enable probe-api.service probe-postgres-backup.timer >/dev/null ||
+       ! persist_native_nginx_service ||
+       ! systemctl start postgresql.service ||
+       ! systemctl restart probe-api.service ||
+       ! systemctl start probe-postgres-backup.timer ||
+       ! systemctl reload-or-restart nginx.service ||
+       ! ( verify_running_services ); then
+        warn "new prebuilt release failed runtime verification; restoring prior application links"
+        restore_release_links "$old_api" "$old_agent" "$old_web" "$old_admin" "$old_migrations"
+        systemctl restart probe-api.service || true
+        systemctl reload-or-restart nginx.service || true
+        die "release activation failed; the forward database migration remains applied and backup is $backup_path"
+    fi
+
+    rm -rf -- "$verify_root"
+    PROBE_DEPLOY_WORK_ROOT=""
+    log "prebuilt release ${unique_release_id} is active"
+    log "previous release directories and $backup_path were retained"
+}
+
 deploy_release() {
     local source_root="$1" run_tests="$2" validate_only="$3"
-    require_commands bash go npm node cp find install sha256sum sort xargs pg_dump pg_restore nginx systemctl systemd-analyze runuser curl ss flock awk grep sed stat
+    require_commands bash go npm node cp env find install sha256sum sort xargs pg_dump pg_restore nginx systemctl systemd-analyze setpriv curl ss flock awk grep sed stat readlink
 
     acquire_database_maintenance_lock
     validate_deployment_script_sources "$source_root"
@@ -1037,7 +1244,8 @@ deploy_release() {
     if ! systemctl daemon-reload ||
        ! systemd-analyze verify "$PROBE_SYSTEMD_UNIT" "$PROBE_BACKUP_SERVICE_UNIT" "$PROBE_BACKUP_TIMER_UNIT" ||
        ! validate_backup_service_assets ||
-       ! systemctl enable probe-api.service nginx.service probe-postgres-backup.timer >/dev/null ||
+       ! systemctl enable probe-api.service probe-postgres-backup.timer >/dev/null ||
+       ! persist_native_nginx_service ||
        ! systemctl start postgresql.service ||
        ! systemctl restart probe-api.service ||
        ! systemctl start probe-postgres-backup.timer ||

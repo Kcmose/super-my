@@ -276,6 +276,12 @@ html[data-theme="light"] textarea {
   caret-color: #047857;
 }
 
+html[data-theme="light"] .form-control {
+  border-color: #cbd5e1;
+  background-color: #ffffff;
+  color: #1e293b;
+}
+
 html[data-theme="light"] input:-webkit-autofill,
 html[data-theme="light"] input:-webkit-autofill:hover,
 html[data-theme="light"] input:-webkit-autofill:focus {

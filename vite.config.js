@@ -23,6 +23,10 @@ export default defineConfig({
       '/api/v1/panel': {
         target: 'http://127.0.0.1:8080',
         changeOrigin: true
+      },
+      '/api/v1/setup': {
+        target: 'http://127.0.0.1:8080',
+        changeOrigin: true
       }
     }
   },

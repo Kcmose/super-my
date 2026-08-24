@@ -1,0 +1,164 @@
+name: Verify immutable Probe Panel release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Immutable release tag to verify
+        required: true
+        type: choice
+        default: v1.0.0
+        options:
+          - v1.0.0
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify published v1.0.0 assets
+    runs-on: ubuntu-24.04
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Require the reviewed immutable release
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ "$RELEASE_TAG" == v1.0.0 ]]
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
+          [[ "$(jq -r '.tag_name' <<<"$release_json")" == "$RELEASE_TAG" ]]
+          [[ "$(jq -r '.draft' <<<"$release_json")" == false ]]
+          [[ "$(jq -r '.prerelease' <<<"$release_json")" == false ]]
+          [[ "$(jq -r '.immutable' <<<"$release_json")" == true ]]
+
+          expected_assets="$(printf '%s\n' \
+            SHA256SUMS \
+            probe-panel-v1.0.0-linux-amd64.tar.gz \
+            probe-panel-v1.0.0-linux-arm64.tar.gz | LC_ALL=C sort)"
+          actual_assets="$(jq -r '.assets[].name' <<<"$release_json" | LC_ALL=C sort)"
+          [[ "$actual_assets" == "$expected_assets" ]]
+          jq -e '[.assets[] | select(.size <= 0)] | length == 0' <<<"$release_json" >/dev/null
+
+      - name: Download the published assets
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          install -d "$RUNNER_TEMP/release-assets"
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$RUNNER_TEMP/release-assets" \
+            --pattern SHA256SUMS \
+            --pattern 'probe-panel-v1.0.0-linux-*.tar.gz'
+
+      - name: Verify outer and inner checksums without extracting
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "$RUNNER_TEMP/release-assets"
+          [[ "$(wc -l < SHA256SUMS)" -eq 2 ]]
+          expected_names="$(printf '%s\n' \
+            probe-panel-v1.0.0-linux-amd64.tar.gz \
+            probe-panel-v1.0.0-linux-arm64.tar.gz | LC_ALL=C sort)"
+          actual_names="$(awk '
+            $1 !~ /^[0-9a-f]{64}$/ { exit 2 }
+            NF != 2 { exit 3 }
+            { print $2 }
+          ' SHA256SUMS | LC_ALL=C sort)"
+          [[ "$actual_names" == "$expected_names" ]]
+          sha256sum --check --strict SHA256SUMS
+
+          python3 - <<'PY'
+          import hashlib
+          import re
+          import tarfile
+          from pathlib import Path, PurePosixPath
+
+          release_dir = Path.cwd()
+          for architecture in ("amd64", "arm64"):
+              root = f"probe-panel-v1.0.0-linux-{architecture}"
+              archive = release_dir / f"{root}.tar.gz"
+              with tarfile.open(archive, mode="r:gz") as bundle:
+                  members = bundle.getmembers()
+                  if not members or len(members) > 20000:
+                      raise SystemExit(f"{archive.name}: empty or excessive member count")
+                  by_name = {}
+                  for member in members:
+                      path = PurePosixPath(member.name)
+                      if path.is_absolute() or not path.parts or ".." in path.parts:
+                          raise SystemExit(f"{archive.name}: unsafe path {member.name!r}")
+                      if any(part in ("", ".") for part in path.parts):
+                          raise SystemExit(f"{archive.name}: non-canonical path {member.name!r}")
+                      if path.parts[0] != root:
+                          raise SystemExit(f"{archive.name}: unexpected archive root")
+                      if member.name in by_name:
+                          raise SystemExit(f"{archive.name}: duplicate path {member.name!r}")
+                      if member.issym() or member.islnk():
+                          raise SystemExit(f"{archive.name}: links are forbidden")
+                      if not (member.isfile() or member.isdir()):
+                          raise SystemExit(f"{archive.name}: special files are forbidden")
+                      if member.isfile() and member.name.endswith(".map"):
+                          raise SystemExit(f"{archive.name}: source maps are forbidden")
+                      by_name[member.name] = member
+
+                  required = (
+                      "RELEASE-MANIFEST",
+                      "BUNDLE-SHA256SUMS",
+                      "artifacts/api/probe-api",
+                      "setup/probe-setup",
+                      "artifacts/admin/index.html",
+                      "artifacts/web/index.html",
+                      "artifacts/agent/downloads/probe-agent/SHA256SUMS",
+                      "artifacts/agent/downloads/probe-agent/linux-amd64/probe-agent",
+                      "artifacts/agent/downloads/probe-agent/linux-arm64/probe-agent",
+                      "source/probe-api/deploy/setup/probe-panel-setup.service",
+                      "source/probe-api/deploy/setup/probe-panel-finalizer.service",
+                      "source/probe-api/deploy/setup/probe-panel-finalizer.path",
+                  )
+                  for relative in required:
+                      member = by_name.get(f"{root}/{relative}")
+                      if member is None or not member.isfile():
+                          raise SystemExit(f"{archive.name}: missing {relative}")
+
+                  manifest_file = bundle.extractfile(by_name[f"{root}/RELEASE-MANIFEST"])
+                  assert manifest_file is not None
+                  release_manifest = manifest_file.read().decode("utf-8").splitlines()
+                  expected_manifest = [
+                      "format=probe-panel-release-v1",
+                      "version=v1.0.0",
+                      f"architecture=linux-{architecture}",
+                      "super_my_ref=refs/tags/v1.0.0",
+                      "my_ref=refs/tags/v1.0.0",
+                      "my_agent_ref=refs/tags/v1.0.1",
+                  ]
+                  if release_manifest != expected_manifest:
+                      raise SystemExit(f"{archive.name}: RELEASE-MANIFEST mismatch")
+
+                  checksum_file = bundle.extractfile(by_name[f"{root}/BUNDLE-SHA256SUMS"])
+                  assert checksum_file is not None
+                  checksum_lines = checksum_file.read().decode("utf-8").splitlines()
+                  recorded = {}
+                  for line in checksum_lines:
+                      match = re.fullmatch(r"([0-9a-f]{64})  ([^\s\\]+)", line)
+                      if match is None or match.group(2) in recorded:
+                          raise SystemExit(f"{archive.name}: malformed BUNDLE-SHA256SUMS")
+                      recorded[match.group(2)] = match.group(1)
+
+                  expected_paths = sorted(
+                      name[len(root) + 1:]
+                      for name, member in by_name.items()
+                      if member.isfile()
+                      and name.startswith((f"{root}/artifacts/", f"{root}/setup/", f"{root}/source/"))
+                  )
+                  if sorted(recorded) != expected_paths:
+                      raise SystemExit(f"{archive.name}: bundle checksum coverage mismatch")
+                  for relative, expected_hash in recorded.items():
+                      payload = bundle.extractfile(by_name[f"{root}/{relative}"])
+                      assert payload is not None
+                      actual_hash = hashlib.sha256(payload.read()).hexdigest()
+                      if actual_hash != expected_hash:
+                          raise SystemExit(f"{archive.name}: checksum mismatch for {relative}")
+          PY

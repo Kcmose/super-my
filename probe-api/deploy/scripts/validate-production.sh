@@ -59,7 +59,7 @@ validate_source() {
 
 validate_host() {
     require_root
-    require_commands bash sha256sum systemd-analyze nginx runuser awk grep sed stat
+    require_commands bash sha256sum systemd-analyze nginx setpriv awk grep sed stat
     local resolved_source
     resolved_source="$(validate_source_root "$SOURCE_ROOT")"
     load_probe_env

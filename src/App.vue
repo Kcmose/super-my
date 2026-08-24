@@ -1,5 +1,5 @@
 <template>
-  <router-view v-if="route.name === 'Login' || authStore.isAdmin" />
+  <router-view v-if="route.name === 'Login' || route.name === 'Install' || authStore.isAdmin" />
 </template>
 
 <script setup>

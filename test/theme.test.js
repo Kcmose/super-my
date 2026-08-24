@@ -128,11 +128,12 @@ test('the CSP-compatible head bootstrap applies storage before the application e
   assert.match(bootstrap, new RegExp(THEME_STORAGE_KEY))
 })
 
-test('login and authenticated header both expose the same accessible toggle', async () => {
-  const [main, header, login, toggle] = await Promise.all([
+test('setup, login and authenticated header expose the same accessible toggle', async () => {
+  const [main, header, login, install, toggle] = await Promise.all([
     readFile(path.join(sourceRoot, 'main.js'), 'utf8'),
     readFile(path.join(sourceRoot, 'components', 'PanelHeader.vue'), 'utf8'),
     readFile(path.join(sourceRoot, 'views', 'Login.vue'), 'utf8'),
+    readFile(path.join(sourceRoot, 'views', 'Install.vue'), 'utf8'),
     readFile(path.join(sourceRoot, 'components', 'ThemeToggle.vue'), 'utf8'),
   ])
 
@@ -142,6 +143,8 @@ test('login and authenticated header both expose the same accessible toggle', as
   assert.match(header, /<ThemeToggle\s*\/>/)
   assert.match(login, /import ThemeToggle from '\.\.\/components\/ThemeToggle\.vue'/)
   assert.match(login, /<ThemeToggle class="absolute right-4 top-4"\s*\/>/)
+  assert.match(install, /import ThemeToggle from '\.\.\/components\/ThemeToggle\.vue'/)
+  assert.match(install, /<ThemeToggle class="absolute right-4 top-4"\s*\/>/)
   assert.match(toggle, /<button[\s\S]+type="button"/)
   assert.match(toggle, /:aria-label="actionLabel"/)
   assert.match(toggle, /:title="actionLabel"/)

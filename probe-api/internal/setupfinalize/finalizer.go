@@ -46,7 +46,14 @@ type Paths struct {
 	NginxLink             string
 	NginxConfD            string
 	NginxSitesEnabled     string
+	NginxWantsLink        string
+	NginxNativeUnit       string
 	TLSRoot               string
+	PrivateTLSRoot        string
+	PrivateCACertificate  string
+	PrivateCAKey          string
+	PrivateCertificate    string
+	PrivateKey            string
 	LetsEncryptLive       string
 	LetsEncryptDeployHook string
 	APIUnit               string
@@ -76,7 +83,14 @@ func DefaultPaths() Paths {
 		NginxLink:             "/etc/nginx/conf.d/probe-panel.conf",
 		NginxConfD:            "/etc/nginx/conf.d",
 		NginxSitesEnabled:     "/etc/nginx/sites-enabled",
+		NginxWantsLink:        "/etc/systemd/system/multi-user.target.wants/nginx.service",
+		NginxNativeUnit:       "/usr/lib/systemd/system/nginx.service",
 		TLSRoot:               "/etc/probe-panel/tls",
+		PrivateTLSRoot:        "/etc/probe-panel/tls/private-ca",
+		PrivateCACertificate:  "/etc/probe-panel/tls/private-ca/ca.pem",
+		PrivateCAKey:          "/etc/probe-panel/tls/private-ca/ca-key.pem",
+		PrivateCertificate:    "/etc/probe-panel/tls/private-ca/fullchain.pem",
+		PrivateKey:            "/etc/probe-panel/tls/private-ca/privkey.pem",
 		LetsEncryptLive:       "/etc/letsencrypt/live/probe-panel",
 		LetsEncryptDeployHook: "/etc/letsencrypt/renewal-hooks/deploy/probe-panel",
 		APIUnit:               "/etc/systemd/system/probe-api.service",
@@ -92,6 +106,8 @@ type Identity struct {
 
 type IdentityLookup func(string) (Identity, error)
 
+type InstalledCommit func(time.Time) error
+
 type Config struct {
 	BundleRoot      string
 	ReleaseID       string
@@ -103,6 +119,7 @@ type Config struct {
 	RequireRoot     bool
 	Now             func() time.Time
 	ResolveHostname func(context.Context, string) error
+	CommitInstalled InstalledCommit
 }
 
 type Finalizer struct {
@@ -134,6 +151,9 @@ func New(config Config) (*Finalizer, error) {
 	if config.ReleaseID == "" || len(config.ReleaseID) > 96 || !safeReleaseID(config.ReleaseID) {
 		return nil, errors.New("setup release identifier is invalid")
 	}
+	if config.CommitInstalled == nil {
+		return nil, errors.New("setup installed-state commit is required")
+	}
 	if err := validatePaths(config.Paths); err != nil {
 		return nil, err
 	}
@@ -154,6 +174,10 @@ func (finalizer *Finalizer) Finalize(ctx context.Context, request setup.Complete
 	if err := request.Validate(); err != nil {
 		return fmt.Errorf("validate setup request: %w", err)
 	}
+	access, err := request.AccessConfiguration()
+	if err != nil {
+		return fmt.Errorf("resolve setup access configuration: %w", err)
+	}
 	if err := validateProductionRequest(request); err != nil {
 		return err
 	}
@@ -163,9 +187,21 @@ func (finalizer *Finalizer) Finalize(ctx context.Context, request setup.Complete
 	if err := finalizer.validateFreshIngress(); err != nil {
 		return err
 	}
-	for _, hostname := range []string{request.Domains.Panel, request.Domains.Admin, request.Domains.Agent} {
-		if err := finalizer.config.ResolveHostname(ctx, hostname); err != nil {
-			return fmt.Errorf("resolve configured hostname %s: %w", hostname, err)
+	if access.Mode == setup.IngressModeIP {
+		if err := finalizer.validateAvailableIPPorts(ctx); err != nil {
+			return err
+		}
+	} else {
+		// ACME port ownership is a first-install prerequisite, not a late
+		// certificate error. Check before service-account creation, layout,
+		// PostgreSQL startup, or any other persistent mutation.
+		if err := finalizer.validateAvailableACMEPorts(ctx); err != nil {
+			return err
+		}
+		for _, hostname := range []string{request.Domains.Panel, request.Domains.Admin, request.Domains.Agent} {
+			if err := finalizer.config.ResolveHostname(ctx, hostname); err != nil {
+				return fmt.Errorf("resolve configured hostname %s: %w", hostname, err)
+			}
 		}
 	}
 	if err := finalizer.requireIdentityCapabilities("preflight"); err != nil {
@@ -178,7 +214,9 @@ func (finalizer *Finalizer) Finalize(ctx context.Context, request setup.Complete
 	ownedTarget := true
 	defer func() {
 		if err != nil && ownedTarget {
-			finalizer.stopProduction()
+			if rollbackErr := finalizer.stopProduction(); rollbackErr != nil {
+				err = errors.Join(err, fmt.Errorf("roll back production services: %w", rollbackErr))
+			}
 		}
 	}()
 
@@ -189,7 +227,7 @@ func (finalizer *Finalizer) Finalize(ctx context.Context, request setup.Complete
 	if err := finalizer.requireIdentityCapabilities("service identity lookup"); err != nil {
 		return err
 	}
-	if err := finalizer.prepareLayout(identity); err != nil {
+	if err := finalizer.prepareLayout(identity, access.Mode); err != nil {
 		return err
 	}
 	if err := finalizer.requireIdentityCapabilities("filesystem preparation"); err != nil {
@@ -205,10 +243,16 @@ func (finalizer *Finalizer) Finalize(ctx context.Context, request setup.Complete
 		return err
 	}
 	databaseURL := postgresURL(request)
-	if err := finalizer.writeConfiguration(request, databaseURL, identity); err != nil {
+	if err := finalizer.writeConfiguration(request, access, databaseURL, identity); err != nil {
 		return err
 	}
-	if err := finalizer.issueCertificate(ctx, request); err != nil {
+	if err := finalizer.issueCertificate(ctx, request, access); err != nil {
+		return err
+	}
+	if err := finalizer.configureCertificateTimer(ctx, access.Mode); err != nil {
+		return err
+	}
+	if err := finalizer.validateIngressTLSWithStagedAPI(ctx, request, access); err != nil {
 		return err
 	}
 
@@ -236,16 +280,49 @@ func (finalizer *Finalizer) Finalize(ctx context.Context, request setup.Complete
 	); err != nil {
 		return fmt.Errorf("activate verified release: %w", err)
 	}
-	if err := finalizer.config.Runner.Run(ctx, "/usr/bin/systemctl", "enable", "--now", "certbot.timer"); err != nil {
-		return fmt.Errorf("enable certificate renewal timer: %w", err)
-	}
-	if err := finalizer.config.Runner.Run(ctx, "/usr/bin/systemctl", "disable", "probe-panel-setup.service", "probe-panel-finalizer.path"); err != nil {
+	if err := finalizer.config.Runner.Run(ctx, "/usr/bin/systemctl", "disable", "probe-panel-setup.service", "probe-panel-setup.socket", "probe-panel-finalizer.path"); err != nil {
 		return fmt.Errorf("disable first-run services: %w", err)
 	}
 	if err := finalizer.config.Runner.Run(ctx, "/usr/bin/systemctl", "stop", "probe-panel-finalizer.path"); err != nil {
 		return fmt.Errorf("stop first-run finalizer trigger: %w", err)
 	}
+	// This root-owned persistent transition is the final fallible operation.
+	// If it fails, the deferred rollback stops and disables every production
+	// ingress so recovery_required can never coexist with a live formal panel.
+	if err := finalizer.config.CommitInstalled(finalizer.config.Now().UTC()); err != nil {
+		return fmt.Errorf("commit installed setup state: %w", err)
+	}
 	ownedTarget = false
+	return nil
+}
+
+func (finalizer *Finalizer) configureCertificateTimer(ctx context.Context, mode setup.IngressMode) error {
+	if mode == setup.IngressModeDomain {
+		if err := finalizer.config.Runner.Run(ctx, "/usr/bin/systemctl", "enable", "--now", "certbot.timer"); err != nil {
+			return fmt.Errorf("enable certificate renewal timer: %w", err)
+		}
+		return nil
+	}
+	if err := finalizer.config.Runner.Run(ctx, "/usr/bin/systemctl", "disable", "--now", "certbot.timer"); err != nil {
+		return fmt.Errorf("disable unused certificate renewal timer: %w", err)
+	}
+	return nil
+}
+
+func (finalizer *Finalizer) validateIngressTLSWithStagedAPI(ctx context.Context, request setup.CompleteRequest, access setup.AccessConfiguration) error {
+	binary := filepath.Join(finalizer.config.BundleRoot, "artifacts", "api", "probe-api")
+	arguments := []string{"config", "validate-ingress-tls"}
+	switch access.Mode {
+	case setup.IngressModeDomain:
+		arguments = append(arguments, "domain", request.Domains.Panel, request.Domains.Admin, request.Domains.Agent)
+	case setup.IngressModeIP:
+		arguments = append(arguments, "ip", access.Address.String())
+	default:
+		return errors.New("validate provisioned ingress TLS: unsupported ingress mode")
+	}
+	if err := finalizer.config.Runner.Run(ctx, binary, arguments...); err != nil {
+		return fmt.Errorf("validate provisioned ingress TLS with staged API: %w", err)
+	}
 	return nil
 }
 
@@ -260,6 +337,7 @@ func (finalizer *Finalizer) validateBundle() error {
 		"source/probe-api/config/probe-api.env.example",
 		"source/probe-api/config/probe-postgres-backup.env.example",
 		"source/probe-api/deploy/nginx/nginx.conf",
+		"source/probe-api/deploy/nginx/nginx-ip.conf",
 		"source/probe-api/deploy/scripts/install-release.sh",
 	}
 	for _, relative := range required {
@@ -278,7 +356,9 @@ func (finalizer *Finalizer) validateFreshIngress() error {
 		paths.APIPath, paths.AgentPath, paths.WebPath, paths.AdminPath, paths.MigrationsPath,
 		paths.APIEnvironment, paths.BackupEnvironment, paths.PGPass, paths.Allowlist,
 		paths.ActiveNginxConfig, paths.NginxLink, paths.LetsEncryptLive,
-		paths.APIUnit, paths.BackupUnit, paths.BackupTimerUnit,
+		paths.PrivateTLSRoot, paths.PrivateCACertificate, paths.PrivateCAKey,
+		paths.PrivateCertificate, paths.PrivateKey,
+		paths.APIUnit, paths.BackupUnit, paths.BackupTimerUnit, paths.NginxWantsLink,
 	} {
 		if _, err := os.Lstat(path); err == nil {
 			return fmt.Errorf("existing production asset prevents first installation: %s", path)
@@ -313,13 +393,17 @@ func (finalizer *Finalizer) ensureServiceIdentity(ctx context.Context) (Identity
 	return identity, nil
 }
 
-func (finalizer *Finalizer) prepareLayout(identity Identity) error {
+func (finalizer *Finalizer) prepareLayout(identity Identity, mode setup.IngressMode) error {
 	root := finalizer.config.RootIdentity
 	paths := finalizer.config.Paths
 	directories := []directorySpec{
 		{paths.ProbeRoot, 0o755, root},
 		{filepath.Dir(paths.PostgresBackupDir), 0o755, root},
-		{filepath.Dir(paths.Allowlist), 0o750, Identity{UID: 0, GID: identity.GID}},
+		// Nginx serves the public private-CA certificate through an alias below
+		// /etc/probe-panel. Keep this parent traversable by its unprivileged
+		// worker; the allowlist file and all private material retain their
+		// narrower ownership and modes.
+		{filepath.Dir(paths.Allowlist), 0o755, root},
 		{paths.ConfigDir, 0o750, Identity{UID: 0, GID: identity.GID}},
 		{paths.NginxConfigDir, 0o755, root},
 		{filepath.Dir(paths.APIPath), 0o755, root},
@@ -331,9 +415,18 @@ func (finalizer *Finalizer) prepareLayout(identity Identity) error {
 		{filepath.Join(paths.TLSRoot, "panel"), 0o755, root},
 		{filepath.Join(paths.TLSRoot, "admin"), 0o755, root},
 		{filepath.Join(paths.TLSRoot, "api"), 0o755, root},
-		{filepath.Dir(filepath.Dir(filepath.Dir(paths.LetsEncryptDeployHook))), 0o755, root},
-		{filepath.Dir(filepath.Dir(paths.LetsEncryptDeployHook)), 0o755, root},
-		{filepath.Dir(paths.LetsEncryptDeployHook), 0o755, root},
+	}
+	if mode == setup.IngressModeIP {
+		// Nginx workers must be able to serve ca.pem and the probe-api service
+		// must be able to read it when generating Agent install commands. The
+		// private keys inside this directory remain root-only (0600).
+		directories = append(directories, directorySpec{paths.PrivateTLSRoot, 0o755, root})
+	} else {
+		directories = append(directories,
+			directorySpec{filepath.Dir(filepath.Dir(filepath.Dir(paths.LetsEncryptDeployHook))), 0o755, root},
+			directorySpec{filepath.Dir(filepath.Dir(paths.LetsEncryptDeployHook)), 0o755, root},
+			directorySpec{filepath.Dir(paths.LetsEncryptDeployHook), 0o755, root},
+		)
 	}
 	for _, directory := range directories {
 		if err := ensureDirectory(directory); err != nil {
@@ -344,8 +437,14 @@ func (finalizer *Finalizer) prepareLayout(identity Identity) error {
 }
 
 func (finalizer *Finalizer) startLocalPostgres(ctx context.Context) error {
-	if err := finalizer.config.Runner.Run(ctx, "/usr/bin/systemctl", "enable", "--now", "postgresql.service"); err != nil {
+	// Bootstrap owns persistent enablement. Running enable here can delegate to
+	// Debian's SysV compatibility helper, which is intentionally outside this
+	// tightly sandboxed finalizer's writable paths.
+	if err := finalizer.config.Runner.Run(ctx, "/usr/bin/systemctl", "start", "postgresql.service"); err != nil {
 		return fmt.Errorf("start local PostgreSQL: %w", err)
+	}
+	if err := finalizer.config.Runner.RunQuiet(ctx, "/usr/bin/systemctl", "is-active", "--quiet", "postgresql.service"); err != nil {
+		return fmt.Errorf("verify local PostgreSQL service: %w", err)
 	}
 	var ready bool
 	for attempt := 0; attempt < 20; attempt++ {
@@ -366,8 +465,12 @@ func (finalizer *Finalizer) startLocalPostgres(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("inspect PostgreSQL listener: %w", err)
 	}
-	if wildcardListener(listeners, "5432") {
-		return errors.New("PostgreSQL port 5432 is exposed beyond loopback")
+	loopbackOnly, err := tcpPortRestrictedToLoopback(listeners, "5432")
+	if err != nil {
+		return fmt.Errorf("parse PostgreSQL listener inspection: %w", err)
+	}
+	if !loopbackOnly {
+		return errors.New("PostgreSQL port 5432 is not restricted to 127.0.0.1 and ::1")
 	}
 	return nil
 }
@@ -450,7 +553,7 @@ func (finalizer *Finalizer) requireIdentityCapabilities(stage string) error {
 	return fmt.Errorf("inspect setup finalizer capabilities at %s", stage)
 }
 
-func (finalizer *Finalizer) writeConfiguration(request setup.CompleteRequest, databaseURL string, identity Identity) error {
+func (finalizer *Finalizer) writeConfiguration(request setup.CompleteRequest, access setup.AccessConfiguration, databaseURL string, identity Identity) error {
 	root := finalizer.config.RootIdentity
 	apiExample, err := readSmallRegular(filepath.Join(finalizer.config.BundleRoot, "source/probe-api/config/probe-api.env.example"), 128*1024)
 	if err != nil {
@@ -458,12 +561,16 @@ func (finalizer *Finalizer) writeConfiguration(request setup.CompleteRequest, da
 	}
 	apiValues := map[string]string{
 		"PROBE_DATABASE_URL":         databaseURL,
-		"PROBE_ADMIN_ORIGIN":         "https://" + request.Domains.Admin,
-		"PROBE_AGENT_PUBLIC_URL":     "https://" + request.Domains.Agent,
+		"PROBE_INGRESS_MODE":         string(access.Mode),
+		"PROBE_ADMIN_ORIGIN":         access.AdminOrigin,
+		"PROBE_AGENT_PUBLIC_URL":     access.AgentOrigin,
 		"PROBE_AGENT_INSTALLER_URL":  verifiedAgentInstallerURL,
 		"PROBE_ADMIN_ALLOWLIST_FILE": finalizer.config.Paths.Allowlist,
 		"PROBE_TRUSTED_PROXY_CIDRS":  "127.0.0.1/32,::1/128",
 		"PROBE_API_LISTEN_ADDR":      "127.0.0.1:8080",
+	}
+	if access.Mode == setup.IngressModeIP {
+		apiValues["PROBE_AGENT_INSTALL_CA_FILE"] = finalizer.config.Paths.PrivateCACertificate
 	}
 	apiEnvironment, err := replaceEnvironment(apiExample, apiValues)
 	clear(apiExample)
@@ -494,11 +601,20 @@ func (finalizer *Finalizer) writeConfiguration(request setup.CompleteRequest, da
 	if err != nil {
 		return err
 	}
-	nginxTemplate, err := readSmallRegular(filepath.Join(finalizer.config.BundleRoot, "source/probe-api/deploy/nginx/nginx.conf"), 1024*1024)
+	nginxTemplateName := "nginx.conf"
+	if access.Mode == setup.IngressModeIP {
+		nginxTemplateName = "nginx-ip.conf"
+	}
+	nginxTemplate, err := readSmallRegular(filepath.Join(finalizer.config.BundleRoot, "source/probe-api/deploy/nginx", nginxTemplateName), 1024*1024)
 	if err != nil {
 		return err
 	}
-	nginxConfig, err := renderNginx(nginxTemplate, request.Domains)
+	var nginxConfig []byte
+	if access.Mode == setup.IngressModeIP {
+		nginxConfig, err = renderIPNginx(nginxTemplate, access)
+	} else {
+		nginxConfig, err = renderNginx(nginxTemplate, request.Domains)
+	}
 	clear(nginxTemplate)
 	if err != nil {
 		return err
@@ -519,16 +635,15 @@ func (finalizer *Finalizer) writeConfiguration(request setup.CompleteRequest, da
 	return nil
 }
 
-func (finalizer *Finalizer) issueCertificate(ctx context.Context, request setup.CompleteRequest) error {
+func (finalizer *Finalizer) issueCertificate(ctx context.Context, request setup.CompleteRequest, access setup.AccessConfiguration) error {
+	if access.Mode == setup.IngressModeIP {
+		return finalizer.issuePrivateCertificate(access)
+	}
 	if err := finalizer.config.Runner.Run(ctx, "/usr/bin/systemctl", "stop", "nginx.service"); err != nil {
 		return fmt.Errorf("stop Nginx before ACME challenge: %w", err)
 	}
-	listeners, err := finalizer.config.Runner.Output(ctx, "/usr/bin/ss", "-H", "-lnt")
-	if err != nil {
-		return fmt.Errorf("inspect ACME ports: %w", err)
-	}
-	if anyPortListener(listeners, "80") || anyPortListener(listeners, "443") {
-		return errors.New("TCP port 80 or 443 is already in use; refusing to interrupt an unrelated service")
+	if err := finalizer.validateAvailableACMEPorts(ctx); err != nil {
+		return err
 	}
 	if err := finalizer.config.Runner.Run(ctx, "/usr/bin/certbot",
 		"certonly", "--standalone", "--non-interactive", "--agree-tos",
@@ -560,26 +675,139 @@ func (finalizer *Finalizer) issueCertificate(ctx context.Context, request setup.
 	return nil
 }
 
-func (finalizer *Finalizer) stopProduction() {
+func (finalizer *Finalizer) stopProduction() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	_ = finalizer.config.Runner.RunQuiet(ctx, "/usr/bin/systemctl", "stop", "probe-api.service", "probe-postgres-backup.timer", "nginx.service")
+
+	var failures []error
+	record := func(operation string, err error) {
+		if err != nil {
+			failures = append(failures, fmt.Errorf("%s: %w", operation, err))
+		}
+	}
+	runtimeUnits := []string{
+		"probe-api.service",
+		"probe-postgres-backup.timer",
+		"nginx.service",
+		"certbot.timer",
+	}
+	// Attempt every stop independently. A failure involving one unit must not
+	// prevent Nginx or the formal API from receiving their own stop request.
+	for _, unit := range runtimeUnits {
+		record("stop "+unit, finalizer.config.Runner.RunQuiet(ctx, "/usr/bin/systemctl", "stop", unit))
+	}
+	for _, unit := range []string{"probe-api.service", "probe-postgres-backup.timer", "certbot.timer"} {
+		record("disable "+unit, finalizer.config.Runner.RunQuiet(ctx, "/usr/bin/systemctl", "disable", unit))
+	}
+	// Debian's nginx unit can invoke systemd-sysv-install when disabled. Probe
+	// activation deliberately creates one reviewed add-wants symlink, so remove
+	// only that exact relationship without crossing into /etc/rc*.d.
+	record("remove nginx boot dependency", finalizer.removeNginxBootDependency(ctx))
+
+	for _, unit := range runtimeUnits {
+		activeState, err := finalizer.systemdProperty(ctx, unit, "ActiveState")
+		if err != nil {
+			record("verify "+unit+" runtime state", err)
+			continue
+		}
+		if activeState != "inactive" && activeState != "failed" {
+			failures = append(failures, fmt.Errorf("%s remains %s", unit, activeState))
+		}
+	}
+	nginxUnitState, err := finalizer.systemdProperty(ctx, "nginx.service", "UnitFileState")
+	if err != nil {
+		record("verify nginx.service enablement", err)
+	} else {
+		switch nginxUnitState {
+		case "disabled", "static", "masked", "masked-runtime":
+		default:
+			failures = append(failures, fmt.Errorf("nginx.service remains enabled with unit state %s", nginxUnitState))
+		}
+	}
+	return errors.Join(failures...)
+}
+
+func (finalizer *Finalizer) removeNginxBootDependency(ctx context.Context) error {
+	paths := finalizer.config.Paths
+	linkInfo, err := os.Lstat(paths.NginxWantsLink)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("inspect nginx multi-user wants link: %w", err)
+		}
+		// Reload even when the relationship is already absent. This keeps a
+		// repeated rollback idempotent while making systemd forget stale unit
+		// enablement state before stopProduction verifies UnitFileState.
+		if err := finalizer.config.Runner.RunQuiet(ctx, "/usr/bin/systemctl", "daemon-reload"); err != nil {
+			return fmt.Errorf("reload systemd after confirming nginx boot dependency is absent: %w", err)
+		}
+		return nil
+	}
+	if linkInfo.Mode()&os.ModeSymlink == 0 {
+		return errors.New("refuse to remove nginx multi-user wants path because it is not a symlink")
+	}
+	nativeInfo, err := os.Stat(paths.NginxNativeUnit)
+	if err != nil || !nativeInfo.Mode().IsRegular() {
+		return errors.New("expected Debian native nginx systemd unit is unavailable")
+	}
+	resolvedLink, err := filepath.EvalSymlinks(paths.NginxWantsLink)
+	if err != nil {
+		return fmt.Errorf("resolve nginx multi-user wants link: %w", err)
+	}
+	resolvedNativeUnit, err := filepath.EvalSymlinks(paths.NginxNativeUnit)
+	if err != nil {
+		return fmt.Errorf("resolve Debian native nginx systemd unit: %w", err)
+	}
+	if filepath.Clean(resolvedLink) != filepath.Clean(resolvedNativeUnit) {
+		return errors.New("refuse to remove nginx multi-user wants link with an unexpected target")
+	}
+	if err := os.Remove(paths.NginxWantsLink); err != nil {
+		return fmt.Errorf("remove reviewed nginx multi-user wants link: %w", err)
+	}
+	if _, err := os.Lstat(paths.NginxWantsLink); !errors.Is(err, os.ErrNotExist) {
+		if err == nil {
+			return errors.New("nginx multi-user wants link still exists after removal")
+		}
+		return fmt.Errorf("verify nginx multi-user wants link removal: %w", err)
+	}
+	if err := finalizer.config.Runner.RunQuiet(ctx, "/usr/bin/systemctl", "daemon-reload"); err != nil {
+		return fmt.Errorf("reload systemd after removing nginx boot dependency: %w", err)
+	}
+	return nil
+}
+
+func (finalizer *Finalizer) systemdProperty(ctx context.Context, unit, property string) (string, error) {
+	output, err := finalizer.config.Runner.Output(ctx, "/usr/bin/systemctl", "show", "--property="+property, "--value", unit)
+	if err != nil {
+		return "", err
+	}
+	defer clear(output)
+	value := strings.TrimSpace(string(output))
+	if value == "" || strings.ContainsAny(value, "\r\n") {
+		return "", errors.New("systemd returned an invalid property value")
+	}
+	return value, nil
 }
 
 func validateProductionRequest(request setup.CompleteRequest) error {
 	if request.Database.Name == "postgres" || request.Database.Name == "template0" || request.Database.Name == "template1" || request.Database.Username == "postgres" {
 		return errors.New("reserved PostgreSQL role or database name is not allowed")
 	}
-	domains := []string{request.Domains.Panel, request.Domains.Admin, request.Domains.Agent}
-	for _, domain := range domains {
-		if domain == "example.com" || strings.HasSuffix(domain, ".example.com") {
-			return errors.New("example.com hostnames cannot be used for production installation")
-		}
+	access, err := request.AccessConfiguration()
+	if err != nil {
+		return err
 	}
-	for index := range domains {
-		for other := range domains {
-			if index != other && strings.Contains(domains[index], domains[other]) {
-				return errors.New("one production hostname must not contain another hostname")
+	if access.Mode == setup.IngressModeDomain {
+		domains := []string{request.Domains.Panel, request.Domains.Admin, request.Domains.Agent}
+		for _, domain := range domains {
+			if domain == "example.com" || strings.HasSuffix(domain, ".example.com") {
+				return errors.New("example.com hostnames cannot be used for production installation")
+			}
+		}
+		for index := range domains {
+			for other := range domains {
+				if index != other && strings.Contains(domains[index], domains[other]) {
+					return errors.New("one production hostname must not contain another hostname")
+				}
 			}
 		}
 	}
@@ -663,6 +891,29 @@ func renderNginx(template []byte, domains setup.DomainInput) ([]byte, error) {
 	return []byte(contents), nil
 }
 
+func renderIPNginx(template []byte, access setup.AccessConfiguration) ([]byte, error) {
+	if access.Mode != setup.IngressModeIP || !access.Address.IsValid() {
+		return nil, errors.New("IP Nginx rendering requires canonical IP access configuration")
+	}
+	contents := string(template)
+	const placeholder = "PROBE_SETUP_SERVER_IP"
+	for _, port := range []int{setup.PanelHTTPSPort, setup.AgentHTTPSPort, setup.AdminHTTPSPort} {
+		required := placeholder + ":" + strconv.Itoa(port)
+		if !strings.Contains(contents, required) {
+			return nil, fmt.Errorf("IP Nginx template is missing %s", required)
+		}
+	}
+	address := access.Address.String()
+	if access.Address.Is6() {
+		address = "[" + address + "]"
+	}
+	contents = strings.ReplaceAll(contents, placeholder, address)
+	if strings.Contains(contents, placeholder) {
+		return nil, errors.New("IP Nginx template still contains its placeholder address")
+	}
+	return []byte(contents), nil
+}
+
 func replaceEnvironment(example []byte, replacements map[string]string) ([]byte, error) {
 	for key, value := range replacements {
 		if value == "" || strings.ContainsAny(value, " \t\r\n") {
@@ -727,13 +978,23 @@ func validatePaths(paths Paths) error {
 		paths.MigrationsPath, paths.ConfigDir, paths.NginxConfigDir, paths.BackupScriptDir,
 		paths.ReleaseDir, paths.BackupDir, paths.PostgresBackupDir, paths.APIEnvironment,
 		paths.BackupEnvironment, paths.PGPass, paths.Allowlist, paths.ActiveNginxConfig,
-		paths.NginxLink, paths.NginxConfD, paths.NginxSitesEnabled, paths.TLSRoot,
+		paths.NginxLink, paths.NginxConfD, paths.NginxSitesEnabled, paths.NginxWantsLink,
+		paths.NginxNativeUnit, paths.TLSRoot,
+		paths.PrivateTLSRoot, paths.PrivateCACertificate, paths.PrivateCAKey,
+		paths.PrivateCertificate, paths.PrivateKey,
 		paths.LetsEncryptLive, paths.LetsEncryptDeployHook, paths.APIUnit,
 		paths.BackupUnit, paths.BackupTimerUnit,
 	} {
 		if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
 			return errors.New("setup finalizer paths must be absolute and canonical")
 		}
+	}
+	if filepath.Base(paths.NginxWantsLink) != "nginx.service" ||
+		filepath.Base(filepath.Dir(paths.NginxWantsLink)) != "multi-user.target.wants" ||
+		filepath.Base(paths.NginxNativeUnit) != "nginx.service" ||
+		filepath.Base(filepath.Dir(paths.NginxNativeUnit)) != "system" ||
+		filepath.Base(filepath.Dir(filepath.Dir(paths.NginxNativeUnit))) != "systemd" {
+		return errors.New("setup finalizer nginx systemd paths are outside the reviewed unit relationship")
 	}
 	return nil
 }

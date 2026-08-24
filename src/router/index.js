@@ -82,9 +82,11 @@ async function resolveSetupStatus() {
 }
 
 router.beforeEach(async (to) => {
+  // The install page must receive the first terminal status response itself:
+  // in IP mode that short-lived response carries the in-memory public CA.
+  if (to.name === 'Install') return true
   const setupStatus = await resolveSetupStatus()
   if (isSetupInstallStatus(setupStatus) && to.name !== 'Install') return { name: 'Install' }
-  if (setupStatus === 'installed' && to.name === 'Install') return { name: 'Login' }
 
   const authStore = useAuthStore()
   if (to.matched.length === 0) {

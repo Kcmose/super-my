@@ -24,7 +24,9 @@ Options:
   -h, --help           Show this help.
 
 Active configuration, TLS material, the allowlist, and PostgreSQL data are not
-replaced. A verified custom-format database backup is created before migration.
+replaced. The explicit domain/IP ingress mode is validated and preserved; an
+upgrade never issues certificates or switches modes. A verified custom-format
+database backup is created before migration.
 EOF
 }
 

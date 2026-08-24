@@ -1,9 +1,8 @@
 [Unit]
-Description=Probe Panel first-run setup (loopback only)
-After=network-online.target
-Wants=network-online.target
+Description=Probe Panel first-run setup (root-only Unix socket)
+Wants=probe-panel-setup.socket
+After=probe-panel-setup.socket
 ConditionPathExists=/var/lib/probe-panel/setup/state.json
-ConditionPathExists=/var/lib/probe-panel/setup/setup-code.json
 ConditionPathExists=/srv/probe/setup-ui/index.html
 
 [Service]
@@ -12,19 +11,18 @@ User=root
 Group=root
 EnvironmentFile=/etc/probe-panel/setup.env
 ExecStart=/usr/local/lib/probe-panel/probe-setup serve
+Sockets=probe-panel-setup.socket
 Restart=on-failure
 RestartSec=3s
 TimeoutStopSec=10s
 UMask=0077
-RuntimeDirectory=probe-panel-setup
-RuntimeDirectoryMode=0700
-RuntimeDirectoryPreserve=restart
 
 NoNewPrivileges=true
 CapabilityBoundingSet=
 AmbientCapabilities=
 PrivateDevices=true
 PrivateTmp=true
+PrivateNetwork=true
 ProtectClock=true
 ProtectControlGroups=true
 ProtectHostname=true
@@ -37,7 +35,7 @@ ProtectHome=true
 ReadOnlyPaths=/srv/probe/setup-ui
 ReadWritePaths=/var/lib/probe-panel/setup
 ReadWritePaths=/run/probe-panel-setup
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictAddressFamilies=AF_UNIX
 RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
@@ -46,7 +44,6 @@ MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
-SocketBindAllow=tcp:18080
 SocketBindDeny=any
 
 [Install]

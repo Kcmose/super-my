@@ -9,16 +9,16 @@ on:
         description: Immutable release tag to verify
         required: true
         type: choice
-        default: v1.0.0
+        default: v1.1.0
         options:
-          - v1.0.0
+          - v1.1.0
 
 permissions:
   contents: read
 
 jobs:
   verify:
-    name: Verify published v1.0.0 assets
+    name: Verify published v1.1.0 assets
     runs-on: ubuntu-24.04
     env:
       RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.version }}
@@ -28,7 +28,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          [[ "$RELEASE_TAG" == v1.0.0 ]]
+          [[ "$RELEASE_TAG" == v1.1.0 ]]
           release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
           [[ "$(jq -r '.tag_name' <<<"$release_json")" == "$RELEASE_TAG" ]]
           [[ "$(jq -r '.draft' <<<"$release_json")" == false ]]
@@ -37,8 +37,8 @@ jobs:
 
           expected_assets="$(printf '%s\n' \
             SHA256SUMS \
-            probe-panel-v1.0.0-linux-amd64.tar.gz \
-            probe-panel-v1.0.0-linux-arm64.tar.gz | LC_ALL=C sort)"
+            probe-panel-v1.1.0-linux-amd64.tar.gz \
+            probe-panel-v1.1.0-linux-arm64.tar.gz | LC_ALL=C sort)"
           actual_assets="$(jq -r '.assets[].name' <<<"$release_json" | LC_ALL=C sort)"
           [[ "$actual_assets" == "$expected_assets" ]]
           jq -e '[.assets[] | select(.size <= 0)] | length == 0' <<<"$release_json" >/dev/null
@@ -52,7 +52,7 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --dir "$RUNNER_TEMP/release-assets" \
             --pattern SHA256SUMS \
-            --pattern 'probe-panel-v1.0.0-linux-*.tar.gz'
+            --pattern 'probe-panel-v1.1.0-linux-*.tar.gz'
 
       - name: Verify outer and inner checksums without extracting
         shell: bash
@@ -61,8 +61,8 @@ jobs:
           cd "$RUNNER_TEMP/release-assets"
           [[ "$(wc -l < SHA256SUMS)" -eq 2 ]]
           expected_names="$(printf '%s\n' \
-            probe-panel-v1.0.0-linux-amd64.tar.gz \
-            probe-panel-v1.0.0-linux-arm64.tar.gz | LC_ALL=C sort)"
+            probe-panel-v1.1.0-linux-amd64.tar.gz \
+            probe-panel-v1.1.0-linux-arm64.tar.gz | LC_ALL=C sort)"
           actual_names="$(awk '
             $1 !~ /^[0-9a-f]{64}$/ { exit 2 }
             NF != 2 { exit 3 }
@@ -79,7 +79,7 @@ jobs:
 
           release_dir = Path.cwd()
           for architecture in ("amd64", "arm64"):
-              root = f"probe-panel-v1.0.0-linux-{architecture}"
+              root = f"probe-panel-v1.1.0-linux-{architecture}"
               archive = release_dir / f"{root}.tar.gz"
               with tarfile.open(archive, mode="r:gz") as bundle:
                   members = bundle.getmembers()
@@ -114,7 +114,9 @@ jobs:
                       "artifacts/agent/downloads/probe-agent/SHA256SUMS",
                       "artifacts/agent/downloads/probe-agent/linux-amd64/probe-agent",
                       "artifacts/agent/downloads/probe-agent/linux-arm64/probe-agent",
+                      "source/probe-api/deploy/nginx/nginx-ip.conf",
                       "source/probe-api/deploy/setup/probe-panel-setup.service",
+                      "source/probe-api/deploy/setup/probe-panel-setup.socket",
                       "source/probe-api/deploy/setup/probe-panel-finalizer.service",
                       "source/probe-api/deploy/setup/probe-panel-finalizer.path",
                   )
@@ -128,9 +130,9 @@ jobs:
                   release_manifest = manifest_file.read().decode("utf-8").splitlines()
                   expected_manifest = [
                       "format=probe-panel-release-v1",
-                      "version=v1.0.0",
+                      "version=v1.1.0",
                       f"architecture=linux-{architecture}",
-                      "super_my_ref=refs/tags/v1.0.0",
+                      "super_my_ref=refs/tags/v1.1.0",
                       "my_ref=refs/tags/v1.0.0",
                       "my_agent_ref=refs/tags/v1.0.1",
                   ]

@@ -5,8 +5,11 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
+	"net/netip"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
@@ -52,10 +55,11 @@ func (OSRunner) RunSensitive(ctx context.Context, stdin []byte, name string, arg
 
 func (OSRunner) Output(ctx context.Context, name string, args ...string) ([]byte, error) {
 	command := exec.CommandContext(ctx, name, args...)
-	// Output commands are limited to listener inspection and local PostgreSQL
-	// catalog checks; neither receives a password. Preserve their stderr in the
-	// root-only systemd journal so an installation failure is diagnosable without
-	// reflecting any submitted secret through the setup HTTP protocol.
+	// Output commands are limited to listener inspection, local PostgreSQL
+	// catalog checks, and closed systemd rollback properties; none receives a
+	// password. Preserve stderr in the root-only systemd journal so an
+	// installation failure is diagnosable without reflecting any submitted
+	// secret through the setup HTTP protocol.
 	command.Stderr = os.Stderr
 	output, err := command.Output()
 	if err != nil {
@@ -89,14 +93,67 @@ func wildcardListener(output []byte, port string) bool {
 	return false
 }
 
-func anyPortListener(output []byte, port string) bool {
+func tcpListenerPorts(output []byte) (map[string]struct{}, error) {
+	ports := make(map[string]struct{})
 	for _, line := range strings.Split(string(output), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 4 && listenerPort(fields[3]) == port {
-			return true
+		if strings.TrimSpace(line) == "" {
+			continue
 		}
+		fields := strings.Fields(line)
+		if len(fields) < 5 || fields[0] != "LISTEN" {
+			return nil, fmt.Errorf("unexpected ss listener record")
+		}
+		host, port, splitErr := net.SplitHostPort(fields[3])
+		if splitErr != nil || (host != "*" && !validListenerIP(host)) {
+			return nil, fmt.Errorf("unexpected ss listener address")
+		}
+		parsed, err := strconv.ParseUint(port, 10, 16)
+		if err != nil || parsed == 0 || strconv.FormatUint(parsed, 10) != port {
+			return nil, fmt.Errorf("unexpected ss listener address")
+		}
+		ports[strconv.FormatUint(parsed, 10)] = struct{}{}
 	}
-	return false
+	return ports, nil
+}
+
+func validListenerIP(host string) bool {
+	address, err := netip.ParseAddr(host)
+	return err == nil && address.IsValid() && address.Zone() == "" && !address.Is4In6()
+}
+
+// tcpPortRestrictedToLoopback accepts a target port only when at least one
+// listener exists and every listener for that port is exactly IPv4 localhost
+// or IPv6 localhost. The preliminary parser validates every non-empty ss row,
+// including unrelated ports, so malformed inspection output fails closed.
+func tcpPortRestrictedToLoopback(output []byte, targetPort string) (bool, error) {
+	if targetPort == "" {
+		return false, fmt.Errorf("target listener port is required")
+	}
+	if _, err := tcpListenerPorts(output); err != nil {
+		return false, err
+	}
+	ipv4Loopback := netip.AddrFrom4([4]byte{127, 0, 0, 1})
+	ipv6Loopback := netip.IPv6Loopback()
+	found := false
+	for _, line := range strings.Split(string(output), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		host, port, err := net.SplitHostPort(fields[3])
+		if err != nil {
+			return false, fmt.Errorf("unexpected ss listener address")
+		}
+		if port != targetPort {
+			continue
+		}
+		address, err := netip.ParseAddr(host)
+		if err != nil || (address != ipv4Loopback && address != ipv6Loopback) {
+			return false, nil
+		}
+		found = true
+	}
+	return found, nil
 }
 
 func listenerPort(address string) string {

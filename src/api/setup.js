@@ -1,3 +1,5 @@
+import { setupDefaultsValue } from '../utils/setup.js'
+
 const setupEndpoints = Object.freeze({
   status: '/api/v1/setup/status',
   session: '/api/v1/setup/session',
@@ -6,6 +8,9 @@ const setupEndpoints = Object.freeze({
 
 let setupSessionToken = ''
 let setupCsrfToken = ''
+let setupSessionPromise = null
+const SETUP_TOKEN_PATTERN = /^[0-9a-f]{64}$/
+const RFC3339_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/
 
 function setupPathFor(url) {
   if (typeof url !== 'string' || !url.startsWith('/') || url.startsWith('//')) {
@@ -73,7 +78,7 @@ async function setupRequest(url, options = {}) {
 
 function requireSetupSession() {
   if (setupSessionToken && setupCsrfToken) return
-  const error = new Error('安装会话不存在或已经离开当前页面，请生成新的安装码后重试')
+  const error = new Error('安装会话不存在或已经失效，请重新建立安全会话后重试')
   error.code = 'setup_session_missing'
   throw error
 }
@@ -90,26 +95,40 @@ export function hasSetupSession() {
 export const setupApi = {
   getStatus: ({ signal } = {}) => setupRequest(setupEndpoints.status, { signal }),
 
-  async createSession(setupCode) {
-    clearSetupSecrets()
-    const response = await setupRequest(setupEndpoints.session, {
-      method: 'POST',
-      body: JSON.stringify({ setup_code: String(setupCode ?? '') }),
-    })
-    if (
-      typeof response?.session_token !== 'string'
-      || !response.session_token
-      || typeof response?.csrf_token !== 'string'
-      || !response.csrf_token
-    ) {
-      const error = new Error('安装服务没有返回有效的临时会话')
-      error.code = 'invalid_setup_session_response'
-      throw error
-    }
+  createSession({ signal } = {}) {
+    if (setupSessionPromise) return setupSessionPromise
 
-    setupSessionToken = response.session_token
-    setupCsrfToken = response.csrf_token
-    return { expires_at: response.expires_at || null }
+    clearSetupSecrets()
+    const request = (async () => {
+      const response = await setupRequest(setupEndpoints.session, {
+        method: 'POST',
+        body: '{}',
+        signal,
+      })
+      const expiresAt = typeof response?.expires_at === 'string' ? response.expires_at : ''
+      const expiresAtMilliseconds = RFC3339_PATTERN.test(expiresAt) ? Date.parse(expiresAt) : Number.NaN
+      const defaults = setupDefaultsValue(response)
+      if (
+        !SETUP_TOKEN_PATTERN.test(response?.session_token || '')
+        || !SETUP_TOKEN_PATTERN.test(response?.csrf_token || '')
+        || !Number.isFinite(expiresAtMilliseconds)
+        || expiresAtMilliseconds <= Date.now()
+        || !defaults
+      ) {
+        const error = new Error('安装服务没有返回有效的临时会话')
+        error.code = 'invalid_setup_session_response'
+        throw error
+      }
+
+      setupSessionToken = response.session_token
+      setupCsrfToken = response.csrf_token
+      return { expires_at: expiresAt, defaults }
+    })()
+    setupSessionPromise = request
+    request.finally(() => {
+      if (setupSessionPromise === request) setupSessionPromise = null
+    }).catch(() => {})
+    return request
   },
 
   async complete(payload) {

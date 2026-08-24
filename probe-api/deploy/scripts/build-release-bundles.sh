@@ -14,14 +14,18 @@ SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 SUPER_MY_ROOT="$(readlink -f -- "${SCRIPT_DIR}/../../..")"
 readonly SUPER_MY_ROOT
+readonly SUPER_MY_REF="refs/tags/v1.1.0"
 readonly WEB_REF="refs/tags/v1.0.0"
 readonly AGENT_REF="refs/tags/v1.0.1"
+readonly SUPER_MY_REMOTE="https://github.com/Kcmose/super-my.git"
+readonly WEB_REMOTE="https://github.com/Kcmose/my.git"
+readonly AGENT_REMOTE="https://github.com/Kcmose/my-agent.git"
 
 ADMIN_ROOT="$SUPER_MY_ROOT"
 WEB_ROOT="${SUPER_MY_ROOT}/../my"
 AGENT_ROOT="${SUPER_MY_ROOT}/../my-agent"
-OUTPUT_DIR="${SUPER_MY_ROOT}/../probe-panel-release-v1.0.0"
-VERSION="v1.0.0"
+OUTPUT_DIR="${SUPER_MY_ROOT}/../probe-panel-release-v1.1.0"
+VERSION="v1.1.0"
 WORK_ROOT=""
 
 usage() {
@@ -31,15 +35,14 @@ Usage: build-release-bundles.sh [options]
 Build both Debian 13 release bundles locally without uploading anything.
 
 Options:
-  --admin-root DIR   probe-admin project root (default: super-my repository root)
-  --web-root DIR     probe-web project root (default: ../my)
-  --agent-root DIR   probe-agent project root (default: ../my-agent)
   --output-dir DIR   new directory that receives both tarballs and SHA256SUMS
-  --version VERSION  release version; currently pinned to v1.0.0
+  --version VERSION  release version; currently pinned to v1.1.0
   -h, --help         show this help
 
-The probe-api source is always taken from <super-my>/probe-api. Source trees
-must be clean source snapshots without generated dependencies or build output.
+Sources are fixed to the Kcmose/super-my repository containing probe-admin and
+probe-api plus its ../my and ../my-agent sibling repositories. Every repository
+must be clean and exactly at its pinned tag, and the remote tag must resolve to
+the same HEAD before any release manifest is written.
 EOF
 }
 
@@ -92,21 +95,6 @@ take_value() {
 parse_arguments() {
     while (($# > 0)); do
         case "$1" in
-            --admin-root)
-                ADMIN_ROOT="$(take_value "$1" "${2-}")"
-                shift 2
-                ;;
-            --admin-root=*) ADMIN_ROOT="$(take_value --admin-root "${1#*=}")"; shift ;;
-            --web-root)
-                WEB_ROOT="$(take_value "$1" "${2-}")"
-                shift 2
-                ;;
-            --web-root=*) WEB_ROOT="$(take_value --web-root "${1#*=}")"; shift ;;
-            --agent-root)
-                AGENT_ROOT="$(take_value "$1" "${2-}")"
-                shift 2
-                ;;
-            --agent-root=*) AGENT_ROOT="$(take_value --agent-root "${1#*=}")"; shift ;;
             --output-dir)
                 OUTPUT_DIR="$(take_value "$1" "${2-}")"
                 shift 2
@@ -136,6 +124,75 @@ canonical_source_directory() {
     printf '%s\n' "$resolved"
 }
 
+assert_fixed_repository() {
+    local label="$1" root="$2" expected_remote="$3" ref="$4"
+    local top_level origin_urls status_output head tag_object tag_commit remote_tags
+    local remote_oid remote_ref remote_direct='' remote_peeled='' remote_commit
+
+    top_level="$(git -C "$root" rev-parse --show-toplevel 2>/dev/null)" ||
+        die "$label is not a Git repository: $root"
+    top_level="$(readlink -f -- "$top_level")"
+    [[ "$top_level" == "$root" ]] ||
+        die "$label must be the fixed repository root: $root"
+
+    origin_urls="$(git -C "$root" remote get-url --all origin 2>/dev/null)" ||
+        die "$label does not have the required origin remote"
+    [[ "$origin_urls" == "$expected_remote" ]] ||
+        die "$label origin must be exactly $expected_remote"
+
+    status_output="$(git -C "$root" status --porcelain=v1 --untracked-files=all)" ||
+        die "$label working tree status could not be verified"
+    [[ -z "$status_output" ]] ||
+        die "$label working tree is not clean, including untracked files"
+
+    head="$(git -C "$root" rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" ||
+        die "$label HEAD commit could not be verified"
+    tag_object="$(git -C "$root" rev-parse --verify "$ref" 2>/dev/null)" ||
+        die "$label is missing the pinned local tag: $ref"
+    tag_commit="$(git -C "$root" rev-parse --verify "${ref}^{commit}" 2>/dev/null)" ||
+        die "$label is missing the pinned local tag: $ref"
+    [[ "$head" == "$tag_commit" ]] ||
+        die "$label HEAD does not exactly equal the pinned local tag commit: $ref"
+
+    remote_tags="$(git ls-remote --exit-code "$expected_remote" "$ref" "${ref}^{}" 2>/dev/null)" ||
+        die "$label pinned tag could not be verified at $expected_remote"
+    while IFS=$'\t' read -r remote_oid remote_ref; do
+        [[ "$remote_oid" =~ ^[0-9a-f]{40}$ ]] ||
+            die "$label remote tag returned a malformed object ID: $ref"
+        case "$remote_ref" in
+            "$ref")
+                [[ -z "$remote_direct" ]] || die "$label remote tag is ambiguous: $ref"
+                remote_direct="$remote_oid"
+                ;;
+            "${ref}^{}")
+                [[ -z "$remote_peeled" ]] || die "$label remote peeled tag is ambiguous: $ref"
+                remote_peeled="$remote_oid"
+                ;;
+            *) die "$label remote tag lookup returned an unexpected ref: $remote_ref" ;;
+        esac
+    done <<< "$remote_tags"
+    [[ -n "$remote_direct" && "$remote_direct" == "$tag_object" ]] ||
+        die "$label remote tag object does not exactly equal the pinned local tag: $ref"
+    remote_commit="$remote_direct"
+    [[ -z "$remote_peeled" ]] || remote_commit="$remote_peeled"
+    [[ "$remote_commit" == "$head" ]] ||
+        die "$label remote tag does not exactly equal HEAD: $ref"
+}
+
+validate_fixed_repository_sources() {
+    local expected_web expected_agent
+    expected_web="$(readlink -f -- "${SUPER_MY_ROOT}/../my")"
+    expected_agent="$(readlink -f -- "${SUPER_MY_ROOT}/../my-agent")"
+    [[ "$ADMIN_ROOT" == "$SUPER_MY_ROOT" ]] ||
+        die 'probe-admin and probe-api must come from the same fixed super-my repository'
+    [[ "$WEB_ROOT" == "$expected_web" ]] || die "probe-web must use the fixed repository root: $expected_web"
+    [[ "$AGENT_ROOT" == "$expected_agent" ]] || die "probe-agent must use the fixed repository root: $expected_agent"
+
+    assert_fixed_repository super-my "$SUPER_MY_ROOT" "$SUPER_MY_REMOTE" "$SUPER_MY_REF"
+    assert_fixed_repository my "$WEB_ROOT" "$WEB_REMOTE" "$WEB_REF"
+    assert_fixed_repository my-agent "$AGENT_ROOT" "$AGENT_REMOTE" "$AGENT_REF"
+}
+
 assert_regular_file() {
     local path="$1"
     [[ -f "$path" && ! -L "$path" ]] || die "required regular file is missing: $path"
@@ -157,9 +214,14 @@ validate_sources() {
     local api_root="$1" required
     for required in \
         go.mod go.sum cmd/probe-api/main.go cmd/probe-setup/main.go \
-        config/probe-api.env.example deploy/scripts/deploy-common.sh \
-        deploy/scripts/build-release-bundles.sh deploy/scripts/install-release.sh \
-        deploy/setup/probe-panel-setup.service deploy/setup/probe-panel-finalizer.service \
+        config/probe-api.env.example config/probe-postgres-backup.env.example \
+        deploy/scripts/deploy-common.sh deploy/scripts/build-release-bundles.sh \
+        deploy/scripts/install-release.sh deploy/scripts/backup-postgres.sh \
+        deploy/scripts/restore-postgres.sh \
+        deploy/nginx/nginx.conf deploy/nginx/nginx-ip.conf \
+        deploy/systemd/probe-api.service deploy/systemd/probe-postgres-backup.service \
+        deploy/systemd/probe-postgres-backup.timer \
+        deploy/setup/probe-panel-setup.service deploy/setup/probe-panel-setup.socket deploy/setup/probe-panel-finalizer.service \
         deploy/setup/probe-panel-finalizer.path migrations/000001_initial.up.sql; do
         assert_regular_file "$api_root/$required"
     done
@@ -284,7 +346,7 @@ assemble_bundle() {
 format=probe-panel-release-v1
 version=${VERSION}
 architecture=linux-${architecture}
-super_my_ref=refs/tags/${VERSION}
+super_my_ref=${SUPER_MY_REF}
 my_ref=${WEB_REF}
 my_agent_ref=${AGENT_REF}
 EOF
@@ -313,11 +375,11 @@ EOF
 
 main() {
     parse_arguments "$@"
-    [[ "$VERSION" == v1.0.0 ]] ||
-        die 'this release builder is pinned to the reviewed v1.0.0 server release'
+    [[ "$VERSION" == v1.1.0 ]] ||
+        die 'this release builder is pinned to the reviewed v1.1.0 server release'
     require_debian_13
     local command_name
-    for command_name in basename bash cat chmod cp dirname file find go gzip install \
+    for command_name in basename bash cat chmod cp dirname file find git go gzip install \
         mktemp mv npm readlink rm sh sha256sum shellcheck sort tar xargs; do
         require_command "$command_name"
     done
@@ -325,8 +387,10 @@ main() {
     ADMIN_ROOT="$(canonical_source_directory probe-admin "$ADMIN_ROOT")"
     WEB_ROOT="$(canonical_source_directory probe-web "$WEB_ROOT")"
     AGENT_ROOT="$(canonical_source_directory probe-agent "$AGENT_ROOT")"
+    readonly ADMIN_ROOT WEB_ROOT AGENT_ROOT
     local api_root="${SUPER_MY_ROOT}/probe-api"
     api_root="$(canonical_source_directory probe-api "$api_root")"
+    validate_fixed_repository_sources
     validate_sources "$api_root"
 
     local output_parent output_name

@@ -25,7 +25,8 @@ Options:
   -h, --help               Show this help.
 
 The script never creates database credentials, TLS keys, or an administrator
-password. Active configuration and the database are never overwritten.
+password. PROBE_INGRESS_MODE must explicitly select domain or ip. Active
+configuration, ingress mode, TLS material, and the database are never overwritten.
 EOF
 }
 
@@ -83,7 +84,7 @@ if [[ "$SKIP_PACKAGES" != true ]]; then
     apt-get update
     apt-get install -y --no-install-recommends \
         ca-certificates curl nginx postgresql postgresql-client \
-        golang-go nodejs npm util-linux iproute2
+        golang-go nodejs npm util-linux iproute2 python3
 fi
 
 require_commands getent addgroup adduser
@@ -95,7 +96,7 @@ fi
 
 if [[ "$PREPARE_ONLY" == true ]]; then
     log "preparation complete"
-    log "next: create the PostgreSQL role/database, active environment file, Nginx config, allowlist, and TLS files"
+    log "next: create the PostgreSQL role/database, explicit ingress environment, matching active Nginx config, allowlist, and TLS files"
     log "then rerun install.sh without --prepare-only"
     exit 0
 fi
@@ -103,7 +104,7 @@ fi
 [[ -f "$PROBE_ENV_FILE" ]] ||
     die "create $PROBE_ENV_FILE from ${PROBE_CONFIG_DIR}/probe-api.env.example before full installation"
 [[ -f "$PROBE_ACTIVE_NGINX_CONFIG" ]] ||
-    die "create $PROBE_ACTIVE_NGINX_CONFIG from ${PROBE_NGINX_CONFIG_DIR}/nginx.conf.example before full installation"
+    die "create $PROBE_ACTIVE_NGINX_CONFIG from the domain or IP example selected by PROBE_INGRESS_MODE before full installation"
 
 deploy_release "$SOURCE_ROOT" "$RUN_TESTS" false
 

@@ -14,11 +14,13 @@ info:
     management IP/CIDR allowlisting, request size limits, Origin checks, and rate limits are enforced
     before or together with the authentication described here. Unlisted paths and methods are denied.
     All timestamps are RFC 3339 instants and all server-generated timestamps use UTC.
-    This document also describes the short-lived first-run Setup API. Every Setup path overrides the
-    production servers with `http://127.0.0.1:18080`; it is reachable only through an SSH local
-    forward while the machine is uninitialized. It is never published by the production Nginx
-    virtual hosts, where `/install`, `/install/*`, `/api/v1/setup`, and `/api/v1/setup/*`
-    permanently return 404.
+    This document also describes the short-lived first-run Setup API. Every Setup path keeps the
+    local-browser URL `http://127.0.0.1:18080`, but the server listens only on the root-owned Unix
+    socket `/run/probe-panel-setup/setup.sock`. Reach it while the machine is uninitialized through
+    a root SSH Unix-socket forward such as
+    `ssh -N -L 18080:/run/probe-panel-setup/setup.sock root@server`. It is never published by the
+    production Nginx virtual hosts, where `/install`, `/install/*`, `/api/v1/setup`, and
+    `/api/v1/setup/*` permanently return 404.
 servers:
   - url: https://panel.example.com
     description: Allowlisted visitor-panel origin; only anonymous read-only panel routes are exposed.
@@ -28,7 +30,7 @@ servers:
     description: Agent origin and disabled-by-default public API; management routes are not exposed.
 tags:
   - name: setup
-    description: Temporary loopback-only first-run API; absent from the normal Probe API server and production Nginx.
+    description: Temporary root-owned Unix-socket first-run API reached by a local browser through root SSH; absent from the normal Probe API server and production Nginx.
   - name: auth
   - name: panel
   - name: admin
@@ -40,23 +42,25 @@ paths:
   /api/v1/setup/status:
     servers:
       - url: http://127.0.0.1:18080
-        description: Temporary first-run service reached through `ssh -L 18080:127.0.0.1:18080 ...` only.
+        description: Local-browser URL forwarded by root SSH to `/run/probe-panel-setup/setup.sock`; no remote TCP listener exists.
     get:
       tags: [setup]
       operationId: getSetupStatus
       summary: Read the current first-run installation state.
       description: |
-        This route exists only on the independent `probe-setup` loopback listener while first-run
-        setup is active. The TCP peer must be loopback and `Host` must be exactly
-        `127.0.0.1:18080` or `localhost:18080`. `Origin` may be omitted by a non-browser GET; when
-        present it must be exactly `http://127.0.0.1:18080` or `http://localhost:18080`.
-        An `installed` response includes the administrator login URL briefly before the temporary
-        service shuts down. Production Nginx does not proxy this route and permanently returns 404.
-      x-access-boundary: temporary-loopback-ssh-forward-only
+        This route exists only on the root-owned `probe-setup` Unix socket while first-run setup is
+        active. A local browser reaches it through a root SSH Unix-socket forward. `Host` must be
+        exactly `127.0.0.1:18080` or `localhost:18080`. `Origin` may be omitted by a non-browser GET;
+        when present it must be exactly `http://127.0.0.1:18080` or `http://localhost:18080`.
+        An `installed` response may briefly include the administrator login URL and, for IP mode,
+        the public private-CA certificate plus its exact whole-file SHA-256 before the temporary
+        service shuts down. The browser must retain that CA only in page memory. Production Nginx
+        does not proxy this route and permanently returns 404.
+      x-access-boundary: temporary-root-unix-socket-ssh-forward-only
       security: []
       responses:
         '200':
-          description: Current setup state; `admin_url` is present when the state is `installed`.
+          description: Current setup state; terminal handoff metadata may be present only while the temporary service reports `installed`.
           headers:
             Cache-Control:
               schema: { type: string, const: no-store }
@@ -68,19 +72,20 @@ paths:
   /api/v1/setup/session:
     servers:
       - url: http://127.0.0.1:18080
-        description: Temporary first-run service reached through `ssh -L 18080:127.0.0.1:18080 ...` only.
+        description: Local-browser URL forwarded by root SSH to `/run/probe-panel-setup/setup.sock`; no remote TCP listener exists.
     post:
       tags: [setup]
       operationId: createSetupSession
-      summary: Exchange the one-time setup code for one short-lived in-memory session.
+      summary: Mint or rotate the sole short-lived in-memory setup session.
       description: |
-        Accepts the 256-bit lowercase hexadecimal code printed once by the installer. Only its
-        SHA-256 digest and expiry metadata are stored on disk. A valid code is consumed exactly
-        once, expires 30 minutes after creation, and is exchanged for a 15-minute session and CSRF
-        token held only in memory. The body is limited to 64 KiB and unknown, duplicate, missing,
-        or trailing JSON fields are rejected. The TCP peer and `Host` restrictions are the same as
-        the status route; a POST also requires the exact allowed `Origin` header.
-      x-access-boundary: temporary-loopback-ssh-forward-origin
+        Accepts only the strict empty JSON object `{}` over the root-owned Unix socket and returns a
+        new 15-minute session/CSRF pair held only in memory. The first request advances `pending` to
+        `configuring`; a later request while configuring invalidates the previous pair and mints a
+        replacement, so a browser refresh or service restart can recover by rotating credentials. The body is limited to
+        64 KiB; properties, arrays, duplicate/trailing JSON, and non-empty bodies are rejected. The
+        `Host` restrictions are the same as the status route and the exact allowed `Origin` is
+        mandatory.
+      x-access-boundary: temporary-root-unix-socket-ssh-forward-origin
       security: []
       parameters:
         - $ref: '#/components/parameters/SetupOrigin'
@@ -91,7 +96,7 @@ paths:
             schema: { $ref: '#/components/schemas/SetupSessionRequest' }
       responses:
         '200':
-          description: The code was consumed and a single short-lived setup session was created.
+          description: The previous pair, if any, was invalidated and one short-lived setup session was created.
           headers:
             Cache-Control:
               schema: { type: string, const: no-store }
@@ -99,13 +104,12 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/SetupSessionResponse' }
         '400': { $ref: '#/components/responses/SetupBadRequest' }
-        '401': { $ref: '#/components/responses/SetupUnauthorized' }
         '403': { $ref: '#/components/responses/SetupForbidden' }
         '409': { $ref: '#/components/responses/SetupConflict' }
         '413': { $ref: '#/components/responses/SetupPayloadTooLarge' }
         '415': { $ref: '#/components/responses/SetupUnsupportedMediaType' }
         '429':
-          description: More than five setup-code attempts were made in the current one-minute window.
+          description: More than five setup-session mint requests were made in the current one-minute window.
           headers:
             Retry-After:
               schema: { type: integer, minimum: 1 }
@@ -117,7 +121,7 @@ paths:
   /api/v1/setup/complete:
     servers:
       - url: http://127.0.0.1:18080
-        description: Temporary first-run service reached through `ssh -L 18080:127.0.0.1:18080 ...` only.
+        description: Local-browser URL forwarded by root SSH to `/run/probe-panel-setup/setup.sock`; no remote TCP listener exists.
     post:
       tags: [setup]
       operationId: completeSetup
@@ -125,12 +129,12 @@ paths:
       description: |
         Requires the exact `X-Probe-Setup-Session` and `X-CSRF-Token` values returned by the session
         exchange; `Authorization: Bearer` is not accepted. It also requires an allowed `Origin`, an
-        allowed loopback `Host`, a loopback TCP peer, and an `application/json` body no larger than
+        allowed loopback `Host`, the authenticated root-owned Unix-socket transport, and an `application/json` body no larger than
         64 KiB. The JSON object is strict: unknown, duplicate, missing, and trailing fields are
         rejected. Password confirmations are compared in constant time. Accepted secrets are copied
         only for the asynchronous finalizer and are cleared when it returns. Production Nginx never
         exposes this path.
-      x-access-boundary: temporary-loopback-ssh-forward-session-origin-csrf
+      x-access-boundary: temporary-root-unix-socket-ssh-forward-session-origin-csrf
       security:
         - SetupSession: []
           SetupCsrfToken: []
@@ -1080,7 +1084,7 @@ components:
       type: apiKey
       in: header
       name: X-Probe-Setup-Session
-      description: One 64-character lowercase hexadecimal token returned by the one-time setup-code exchange. `Authorization` is not accepted.
+      description: One 64-character lowercase hexadecimal token minted over the root-only setup Unix socket and held only in memory. `Authorization` is not accepted.
     SetupCsrfToken:
       type: apiKey
       in: header
@@ -1115,7 +1119,7 @@ components:
       name: Origin
       in: header
       required: true
-      description: Exact browser origin accepted by the temporary loopback setup service.
+      description: Exact local-browser origin accepted after root SSH forwards traffic to the setup Unix socket.
       schema:
         type: string
         enum:
@@ -1200,7 +1204,7 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/SetupErrorResponse' }
     SetupUnauthorized:
-      description: The setup code or setup-session token is missing, invalid, expired, consumed, or unavailable.
+      description: The setup-session token is missing, invalid, expired, rotated, consumed, or unavailable.
       headers:
         Cache-Control:
           schema: { type: string, const: no-store }
@@ -1208,7 +1212,7 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/SetupErrorResponse' }
     SetupForbidden:
-      description: The loopback peer, exact Host, exact Origin, or setup CSRF check failed.
+      description: The root Unix-socket transport, exact local Host, exact Origin, or setup CSRF check failed.
       headers:
         Cache-Control:
           schema: { type: string, const: no-store }
@@ -1291,49 +1295,118 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorResponse' }
   schemas:
+    SetupDefaults:
+      type: object
+      additionalProperties: false
+      required: [server_ip, panel_url, agent_url, admin_url]
+      description: Detected private-CA IP-mode defaults returned before the user submits configuration.
+      properties:
+        server_ip:
+          oneOf:
+            - type: string
+              format: ipv4
+            - type: string
+              format: ipv6
+          description: Canonical routable server address; private IPv4 and IPv6 ULA values are allowed.
+        panel_url:
+          type: string
+          format: uri
+          pattern: '^https://(?:[0-9]{1,3}(?:\.[0-9]{1,3}){3}|\[[0-9a-f:]+\]):18453$'
+          description: Suggested visitor-panel origin on the fixed IP-mode port.
+        agent_url:
+          type: string
+          format: uri
+          pattern: '^https://(?:[0-9]{1,3}(?:\.[0-9]{1,3}){3}|\[[0-9a-f:]+\]):18454$'
+          description: Suggested Agent origin on the fixed IP-mode port.
+        admin_url:
+          type: string
+          format: uri
+          pattern: '^https://(?:[0-9]{1,3}(?:\.[0-9]{1,3}){3}|\[[0-9a-f:]+\]):18455$'
+          description: Suggested administrator-panel origin on the fixed IP-mode port.
     SetupStatusResponse:
       description: |
-        `pending` waits for the one-time code; `configuring` has consumed it and holds one in-memory
-        session; `finalizing` means the privileged asynchronous finalizer is running; `installed`
-        is terminal success; `recovery_required` is fail-closed terminal failure requiring operator
-        recovery rather than reopening first-run setup.
+        `pending` is ready to mint a setup session; `configuring` holds the one currently valid
+        in-memory session; `finalizing` means the privileged asynchronous finalizer is running;
+        `installed` is terminal success; `recovery_required` is fail-closed terminal failure
+        requiring operator recovery rather than reopening first-run setup.
       oneOf:
         - type: object
           additionalProperties: false
-          required: [status]
+          required: [status, defaults]
           properties:
             status:
               type: string
               enum: [pending, configuring, finalizing, recovery_required]
+            defaults: { $ref: '#/components/schemas/SetupDefaults' }
         - type: object
           additionalProperties: false
-          required: [status, admin_url]
+          required: [status, defaults]
           properties:
             status: { type: string, const: installed }
+            defaults: { $ref: '#/components/schemas/SetupDefaults' }
             admin_url:
               type: string
               format: uri
               pattern: '^https://[^/]+/login$'
-              description: Administrator login URL constructed from the validated bare administrator FQDN.
+              description: Optional administrator login URL constructed from the installed domain or IP origin.
+            private_ca:
+              $ref: '#/components/schemas/SetupPrivateCAHandoff'
+            handoff_unavailable:
+              type: boolean
+              const: true
+              description: The persisted installation succeeded, but safe terminal handoff metadata could not be reconstructed; the UI must show the root SSH/scp fallback and must not redirect automatically.
       example:
         status: installed
-        admin_url: https://admin.monitor.example.net/login
+        defaults:
+          server_ip: 192.0.2.10
+          panel_url: https://192.0.2.10:18453
+          agent_url: https://192.0.2.10:18454
+          admin_url: https://192.0.2.10:18455
+        admin_url: https://192.0.2.10:18455/login
+        private_ca:
+          available: true
+          pem: |
+            -----BEGIN CERTIFICATE-----
+            BASE64_CERTIFICATE_DATA
+            -----END CERTIFICATE-----
+          sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    SetupPrivateCAHandoff:
+      description: |
+        Ephemeral, public trust-bootstrap metadata returned only by the temporary no-store setup
+        status response after a successful IP-mode installation. `sha256` is the lowercase SHA-256
+        of every byte in `pem` (including its exact line endings), matching the Agent install
+        command fingerprint. When `available` is false the installation remains successful, but
+        the UI must use the documented root SSH/scp fallback and must not guess or bypass TLS.
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [available, pem, sha256]
+          properties:
+            available: { type: boolean, const: true }
+            pem:
+              type: string
+              minLength: 1
+              maxLength: 65536
+              description: One or more validated PEM CA-certificate blocks; never contains a private key.
+            sha256:
+              type: string
+              minLength: 64
+              maxLength: 64
+              pattern: '^[0-9a-f]{64}$'
+        - type: object
+          additionalProperties: false
+          required: [available]
+          properties:
+            available: { type: boolean, const: false }
     SetupSessionRequest:
       type: object
       additionalProperties: false
-      required: [setup_code]
-      properties:
-        setup_code:
-          type: string
-          minLength: 64
-          maxLength: 64
-          pattern: '^[0-9a-f]{64}$'
-          writeOnly: true
-          description: 256-bit one-time lowercase hexadecimal code printed once by the installer; valid for 30 minutes.
+      maxProperties: 0
+      description: Must be exactly the empty JSON object `{}`; the root-only Unix socket is the authorization boundary.
     SetupSessionResponse:
       type: object
       additionalProperties: false
-      required: [session_token, csrf_token, expires_at]
+      required: [session_token, csrf_token, expires_at, defaults]
       properties:
         session_token:
           type: string
@@ -1352,13 +1425,21 @@ components:
           format: date-time
           readOnly: true
           description: RFC 3339 expiry of this single in-memory session, normally 15 minutes after exchange.
+        defaults: { $ref: '#/components/schemas/SetupDefaults' }
     SetupCompleteRequest:
       type: object
       additionalProperties: false
-      required: [database, domains, tls, allowlist, administrator]
+      required: [database, domains, network, tls, allowlist, administrator]
+      description: |
+        Selects exactly one ingress mode. In domain mode all three domain values are non-empty,
+        `network.address` is empty, `tls.mode` is `acme`, and `tls.email` is a valid address. In
+        private-CA IP mode all three domain values and `tls.email` are empty, `network.address`
+        is one canonical routable IPv4/IPv6 address, and `tls.mode` is `private_ca`. IP mode uses
+        fixed HTTPS ports 18453 (visitor panel), 18454 (Agent), and 18455 (administrator panel).
       properties:
         database: { $ref: '#/components/schemas/SetupDatabaseInput' }
         domains: { $ref: '#/components/schemas/SetupDomainsInput' }
+        network: { $ref: '#/components/schemas/SetupNetworkInput' }
         tls: { $ref: '#/components/schemas/SetupTLSInput' }
         allowlist:
           type: array
@@ -1385,6 +1466,8 @@ components:
           panel: panel.monitor.example.net
           admin: admin.monitor.example.net
           agent: agent.monitor.example.net
+        network:
+          address: ''
         tls:
           mode: acme
           email: operations@example.net
@@ -1434,29 +1517,57 @@ components:
       type: object
       additionalProperties: false
       required: [panel, admin, agent]
-      description: Three distinct lowercase bare FQDNs; no value may contain another, and schemes, ports, paths, IP literals, trailing dots, and reserved example.com names are rejected.
+      description: |
+        Either all three values are empty for private-CA IP mode, or all three are distinct
+        lowercase bare FQDNs for ACME mode. Partial input is rejected. Configured values may not
+        contain one another; schemes, ports, paths, IP literals, trailing dots, and reserved
+        example.com names are rejected.
       properties:
-        panel: { $ref: '#/components/schemas/SetupBareFQDN' }
-        admin: { $ref: '#/components/schemas/SetupBareFQDN' }
-        agent: { $ref: '#/components/schemas/SetupBareFQDN' }
+        panel: { $ref: '#/components/schemas/SetupOptionalBareFQDN' }
+        admin: { $ref: '#/components/schemas/SetupOptionalBareFQDN' }
+        agent: { $ref: '#/components/schemas/SetupOptionalBareFQDN' }
+    SetupOptionalBareFQDN:
+      oneOf:
+        - const: ''
+        - { $ref: '#/components/schemas/SetupBareFQDN' }
     SetupBareFQDN:
       type: string
       minLength: 3
       maxLength: 253
       pattern: '^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$'
       description: Lowercase bare fully-qualified DNS name. HTTPS origins are constructed by the server.
+    SetupNetworkInput:
+      type: object
+      additionalProperties: false
+      required: [address]
+      properties:
+        address:
+          oneOf:
+            - const: ''
+            - type: string
+              format: ipv4
+            - type: string
+              format: ipv6
+          description: |
+            Empty in domain mode. IP mode requires the canonical textual form of a routable
+            unicast IPv4/IPv6 address. Private addresses are accepted; unspecified, loopback,
+            multicast, link-local, scoped, IPv4-mapped IPv6, and non-canonical forms are rejected.
     SetupTLSInput:
       type: object
       additionalProperties: false
       required: [mode, email]
+      description: ACME requires a valid email; private_ca requires an empty email.
       properties:
         mode:
           type: string
-          const: acme
+          enum: [acme, private_ca]
         email:
-          type: string
-          format: email
-          minLength: 3
+          oneOf:
+            - const: ''
+            - type: string
+              format: email
+              minLength: 3
+              maxLength: 254
           description: ACME account and expiry-notification address.
           x-max-utf8-bytes: 254
     SetupAdministratorInput:

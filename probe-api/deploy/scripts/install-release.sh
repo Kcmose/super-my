@@ -22,6 +22,8 @@ Options:
 
 Database credentials, TLS files, the allowlist, and active Nginx/API
 configuration must already have been finalized by the local setup service.
+This command validates and preserves the explicit domain/IP ingress mode; it
+does not issue certificates, rewrite the active fragment, or switch modes.
 EOF
 }
 

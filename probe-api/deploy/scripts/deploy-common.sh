@@ -20,6 +20,7 @@ readonly PROBE_PGPASS_FILE="${PROBE_CONFIG_DIR}/probe-postgres.pgpass"
 readonly PROBE_ALLOWLIST_FILE="/etc/probe-panel/admin-allowlist.geo"
 readonly PROBE_ACTIVE_NGINX_CONFIG="${PROBE_NGINX_CONFIG_DIR}/nginx.conf"
 readonly PROBE_NGINX_LINK="/etc/nginx/conf.d/probe-panel.conf"
+readonly PROBE_PRIVATE_CA_FILE="/etc/probe-panel/tls/private-ca/ca.pem"
 readonly PROBE_SYSTEMD_UNIT="/etc/systemd/system/probe-api.service"
 readonly PROBE_BACKUP_SERVICE_UNIT="/etc/systemd/system/probe-postgres-backup.service"
 readonly PROBE_BACKUP_TIMER_UNIT="/etc/systemd/system/probe-postgres-backup.timer"
@@ -91,6 +92,174 @@ require_commands() {
     done
 }
 
+login_defs_number() {
+    local key="$1" fallback="${2-}" value
+    [[ -z "$fallback" || "$fallback" =~ ^[0-9]+$ ]] ||
+        die "the internal default for $key must be numeric"
+    [[ -f /etc/login.defs && ! -L /etc/login.defs ]] ||
+        die "/etc/login.defs must be a regular file, not a symbolic link"
+    [[ "$(stat -c '%u:%g' /etc/login.defs)" == 0:0 ]] ||
+        die "/etc/login.defs must be owned by root:root"
+    local mode
+    mode="$(stat -c '%a' /etc/login.defs)"
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || die "/etc/login.defs has an invalid mode"
+    (( (8#$mode & 0022) == 0 )) ||
+        die "/etc/login.defs must not be writable by group or other users"
+
+    value="$(awk -v wanted="$key" -v fallback="$fallback" '
+        /^[[:space:]]*#/ { next }
+        $1 == wanted {
+            count++
+            if (NF != 2 || $2 !~ /^[0-9]+$/) {
+                invalid = 1
+                next
+            }
+            value = $2
+        }
+        END {
+            if (invalid || count > 1) exit 1
+            if (count == 1) {
+                print value
+                exit
+            }
+            if (fallback != "") {
+                print fallback
+                exit
+            }
+            exit 1
+        }
+    ' /etc/login.defs)" || die "/etc/login.defs must define at most one valid numeric $key"
+    printf '%s\n' "$value"
+}
+
+assert_probe_api_service_account() {
+    require_commands awk getent id stat
+
+    getent passwd root >/dev/null 2>&1 || die "the system account database is unavailable"
+    getent group root >/dev/null 2>&1 || die "the system group database is unavailable"
+
+    local passwd_name_count group_name_count
+    passwd_name_count="$(getent passwd | awk -F: '$1 == "probe-api" { count++ } END { print count + 0 }')" ||
+        die "could not enumerate the system account database"
+    group_name_count="$(getent group | awk -F: '$1 == "probe-api" { count++ } END { print count + 0 }')" ||
+        die "could not enumerate the system group database"
+    [[ "$passwd_name_count" == 1 && "$group_name_count" == 1 ]] ||
+        die "probe-api must have exactly one passwd record and one same-name group record"
+
+    local -a passwd_records group_records uid_records gid_records group_ids group_members
+    mapfile -t passwd_records < <(getent passwd probe-api || :)
+    mapfile -t group_records < <(getent group probe-api || :)
+    (( ${#passwd_records[@]} == 1 )) ||
+        die "probe-api must resolve to exactly one service account"
+    (( ${#group_records[@]} == 1 )) ||
+        die "probe-api must resolve to exactly one same-name primary group"
+
+    local account_name account_uid account_gid account_home account_shell
+    local group_name group_gid group_members_field
+    [[ "${passwd_records[0]}" =~ ^([^:]*:){6}[^:]*$ ]] ||
+        die "the probe-api passwd record is malformed"
+    IFS=: read -r account_name _ account_uid account_gid _ account_home account_shell <<< "${passwd_records[0]}"
+    [[ "$account_name" == probe-api && "$account_uid" =~ ^[0-9]+$ && "$account_gid" =~ ^[0-9]+$ ]] ||
+        die "the probe-api passwd record is malformed"
+    [[ "$account_home" == /nonexistent ]] ||
+        die "probe-api must use /nonexistent as its home directory"
+    [[ "$account_shell" == /usr/sbin/nologin ]] ||
+        die "probe-api must use /usr/sbin/nologin as its shell"
+
+    local sys_uid_max_raw uid_min_raw sys_uid_max uid_min numeric_uid numeric_gid
+    uid_min_raw="$(login_defs_number UID_MIN)"
+    (( ${#uid_min_raw} <= 10 && ${#account_uid} <= 10 && ${#account_gid} <= 10 )) ||
+        die "probe-api or login.defs contains an out-of-range numeric identifier"
+    uid_min=$((10#$uid_min_raw))
+    numeric_uid=$((10#$account_uid))
+    numeric_gid=$((10#$account_gid))
+    (( uid_min >= 2 && uid_min <= 4294967294 && numeric_uid <= 4294967294 && numeric_gid <= 4294967294 )) ||
+        die "probe-api or login.defs contains an out-of-range numeric identifier"
+    # login.defs(5) defines the omitted SYS_UID_MAX default as UID_MIN-1.
+    # Debian 13's stock file relies on that default, so preserve it while still
+    # rejecting duplicate, malformed, or explicitly unsafe overrides above.
+    sys_uid_max_raw="$(login_defs_number SYS_UID_MAX "$((uid_min - 1))")"
+    (( ${#sys_uid_max_raw} <= 10 )) ||
+        die "probe-api or login.defs contains an out-of-range numeric identifier"
+    sys_uid_max=$((10#$sys_uid_max_raw))
+    (( sys_uid_max <= 4294967294 )) ||
+        die "probe-api or login.defs contains an out-of-range numeric identifier"
+    (( sys_uid_max >= 1 && uid_min > sys_uid_max )) ||
+        die "/etc/login.defs SYS_UID_MAX must be below UID_MIN"
+    (( numeric_uid >= 1 && numeric_uid <= sys_uid_max && numeric_uid < uid_min )) ||
+        die "probe-api UID is outside the Debian system-account range"
+
+    [[ "${group_records[0]}" =~ ^([^:]*:){3}[^:]*$ ]] ||
+        die "the probe-api group record is malformed"
+    IFS=: read -r group_name _ group_gid group_members_field <<< "${group_records[0]}"
+    [[ "$group_name" == probe-api && "$group_gid" =~ ^[0-9]+$ ]] ||
+        die "the probe-api group record is malformed"
+    (( 10#$group_gid == numeric_gid )) ||
+        die "probe-api must use its same-name group as the primary group"
+
+    mapfile -t uid_records < <(getent passwd "$numeric_uid" || :)
+    if (( ${#uid_records[@]} != 1 )) || [[ "${uid_records[0]}" != "${passwd_records[0]}" ]]; then
+        die "probe-api must have a unique UID"
+    fi
+    mapfile -t gid_records < <(getent group "$numeric_gid" || :)
+    if (( ${#gid_records[@]} != 1 )) || [[ "${gid_records[0]}" != "${group_records[0]}" ]]; then
+        die "the probe-api primary GID must belong to exactly one group"
+    fi
+    [[ "$(id -g probe-api)" == "$numeric_gid" && "$(id -gn probe-api)" == probe-api ]] ||
+        die "probe-api must use its unique same-name primary group"
+
+    local duplicate_uid_owner duplicate_gid_group group_id_output other_primary_user member seen_self=0
+    duplicate_uid_owner="$(getent passwd | awk -F: -v wanted_uid="$numeric_uid" '
+        $3 == wanted_uid && $1 != "probe-api" && other == "" { other = $1 }
+        END { print other }
+    ')" || die "could not enumerate accounts while proving the probe-api UID is unique"
+    [[ -z "$duplicate_uid_owner" ]] ||
+        die "the probe-api UID is also used by another account: $duplicate_uid_owner"
+    duplicate_gid_group="$(getent group | awk -F: -v wanted_gid="$numeric_gid" '
+        $3 == wanted_gid && $1 != "probe-api" && other == "" { other = $1 }
+        END { print other }
+    ')" || die "could not enumerate groups while proving the probe-api GID is unique"
+    [[ -z "$duplicate_gid_group" ]] ||
+        die "the probe-api primary GID is also used by another group: $duplicate_gid_group"
+
+    group_id_output="$(id -G probe-api)" || die "could not enumerate probe-api group membership"
+    read -r -a group_ids <<< "$group_id_output"
+    if (( ${#group_ids[@]} != 1 )) || [[ "${group_ids[0]}" != "$numeric_gid" ]]; then
+        die "probe-api must not have supplementary groups"
+    fi
+
+    if [[ -n "$group_members_field" ]]; then
+        IFS=, read -r -a group_members <<< "$group_members_field"
+        for member in "${group_members[@]}"; do
+            [[ "$member" == probe-api && "$seen_self" -eq 0 ]] ||
+                die "the probe-api group must not contain other or duplicate explicit members"
+            seen_self=1
+        done
+    fi
+    other_primary_user="$(getent passwd | awk -F: -v wanted_gid="$numeric_gid" '
+        $4 == wanted_gid && $1 != "probe-api" && other == "" { other = $1 }
+        END { print other }
+    ')" || die "could not enumerate accounts that use the probe-api primary group"
+    [[ -z "$other_primary_user" ]] ||
+        die "the probe-api primary group is also used by another account: $other_primary_user"
+}
+
+prepare_probe_api_service_account() {
+    require_commands addgroup adduser getent
+
+    local passwd_record group_record
+    passwd_record="$(getent passwd probe-api || :)"
+    group_record="$(getent group probe-api || :)"
+    if [[ -z "$passwd_record" && -z "$group_record" ]]; then
+        addgroup --system probe-api
+        adduser --system --ingroup probe-api --no-create-home --home /nonexistent \
+            --shell /usr/sbin/nologin probe-api
+    elif [[ -z "$passwd_record" || -z "$group_record" ]]; then
+        die "a partial probe-api service account or group already exists; refusing to repair it"
+    fi
+    assert_probe_api_service_account
+}
+
 canonical_directory() {
     local candidate="$1"
     [[ -d "$candidate" ]] || die "directory does not exist: $candidate"
@@ -111,6 +280,7 @@ validate_source_root() {
         probe-api/config/probe-api.env.example \
         probe-api/config/probe-postgres-backup.env.example \
         probe-api/deploy/nginx/nginx.conf \
+        probe-api/deploy/nginx/nginx-ip.conf \
         probe-api/deploy/scripts/deploy-common.sh \
         probe-api/deploy/scripts/build-release-bundles.sh \
         probe-api/deploy/scripts/install.sh \
@@ -158,6 +328,9 @@ validate_source_root() {
             die "source project contains a symbolic link: $project"
         fi
     done
+
+    validate_nginx_template_contract "${source_root}/probe-api/deploy/nginx/nginx.conf" domain
+    validate_nginx_template_contract "${source_root}/probe-api/deploy/nginx/nginx-ip.conf" ip
 
     printf '%s\n' "$source_root"
 }
@@ -209,6 +382,17 @@ assert_private_file() {
         die "$path must not grant group or other permissions"
 }
 
+assert_public_root_file() {
+    local path="$1" owner_group mode
+    [[ -f "$path" && ! -L "$path" ]] || die "required regular file is missing: $path"
+    owner_group="$(stat -c '%U:%G' -- "$path")"
+    [[ "$owner_group" == root:root ]] || die "$path must be owned by root:root"
+    mode="$(stat -c '%a' -- "$path")"
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || die "cannot validate permissions for $path"
+    mode="${mode: -3}"
+    [[ "$mode" == 644 ]] || die "$path must have mode 0644"
+}
+
 require_integer_between() {
     local name="$1" value="$2" minimum="$3" maximum="$4"
     [[ "$value" =~ ^[0-9]+$ ]] || die "$name must be an integer"
@@ -241,6 +425,12 @@ load_probe_env() {
         die "PROBE_DATABASE_URL must be an explicit PostgreSQL URL"
     [[ "$PROBE_DATABASE_URL" != *change-me* ]] ||
         die "replace the placeholder database credential in $PROBE_ENV_FILE"
+    [[ -n "${seen[PROBE_INGRESS_MODE]+x}" ]] ||
+        die "PROBE_INGRESS_MODE must be set explicitly in $PROBE_ENV_FILE"
+    [[ "${PROBE_INGRESS_MODE:-}" == domain || "${PROBE_INGRESS_MODE:-}" == ip ]] ||
+        die "PROBE_INGRESS_MODE must be exactly domain or ip"
+    [[ -n "${seen[PROBE_ADMIN_ORIGIN]+x}" ]] ||
+        die "PROBE_ADMIN_ORIGIN must be set explicitly in $PROBE_ENV_FILE"
     [[ "${PROBE_ADMIN_ORIGIN:-}" =~ ^https://[^/]+$ ]] ||
         die "PROBE_ADMIN_ORIGIN must be one absolute HTTPS origin"
     [[ "$PROBE_ADMIN_ORIGIN" != "https://admin.example.com" ]] ||
@@ -255,25 +445,184 @@ load_probe_env() {
         die "PROBE_AGENT_INSTALLER_URL must be set explicitly in $PROBE_ENV_FILE"
     [[ "${PROBE_AGENT_INSTALLER_URL:-}" =~ ^https://raw[.]githubusercontent[.]com/Kcmose/my-agent/([0-9a-f]{40}|refs/tags/v1[.]0[.]1)/deploy/install[.]sh$ ]] ||
         die "PROBE_AGENT_INSTALLER_URL must use an immutable Kcmose/my-agent GitHub commit or the verified refs/tags/v1.0.1 release"
-    [[ -z "${PROBE_AGENT_INSTALL_CA_FILE:-}" ]] ||
-        die "production Agent downloads must use publicly trusted TLS; remove PROBE_AGENT_INSTALL_CA_FILE"
+    [[ -n "${seen[PROBE_AGENT_INSTALL_CA_FILE]+x}" ]] ||
+        die "PROBE_AGENT_INSTALL_CA_FILE must be set explicitly, using an empty value in domain mode"
     [[ "${PROBE_ADMIN_ALLOWLIST_FILE:-}" == "$PROBE_ALLOWLIST_FILE" ]] ||
         die "PROBE_ADMIN_ALLOWLIST_FILE must be $PROBE_ALLOWLIST_FILE"
     [[ "${PROBE_TRUSTED_PROXY_CIDRS:-}" == "127.0.0.1/32,::1/128" ]] ||
         die "PROBE_TRUSTED_PROXY_CIDRS must trust only the local Nginx proxy"
 
-    local agent_domain
     [[ -f "$PROBE_ACTIVE_NGINX_CONFIG" && ! -L "$PROBE_ACTIVE_NGINX_CONFIG" ]] ||
-        die "active Nginx fragment is missing while validating PROBE_AGENT_PUBLIC_URL"
-    agent_domain="$(awk '$1 == "server_name" { count++; if (count == 4) { value=$2; sub(/;$/, "", value); print value; exit } }' "$PROBE_ACTIVE_NGINX_CONFIG")"
-    [[ -n "$agent_domain" && "$PROBE_AGENT_PUBLIC_URL" == "https://${agent_domain}" ]] ||
-        die "PROBE_AGENT_PUBLIC_URL must match the dedicated Agent hostname in $PROBE_ACTIVE_NGINX_CONFIG"
+        die "active Nginx fragment is missing while validating the ingress environment"
+
+    case "$PROBE_INGRESS_MODE" in
+        domain)
+            [[ -z "$PROBE_AGENT_INSTALL_CA_FILE" ]] ||
+                die "domain mode must not configure PROBE_AGENT_INSTALL_CA_FILE"
+            [[ ! -e "$PROBE_PRIVATE_CA_FILE" && ! -L "$PROBE_PRIVATE_CA_FILE" ]] ||
+                die "domain mode must not retain IP-mode private CA material at $PROBE_PRIVATE_CA_FILE"
+            ;;
+        ip)
+            [[ "$PROBE_AGENT_INSTALL_CA_FILE" == "$PROBE_PRIVATE_CA_FILE" ]] ||
+                die "IP mode PROBE_AGENT_INSTALL_CA_FILE must be $PROBE_PRIVATE_CA_FILE"
+            assert_public_root_file "$PROBE_PRIVATE_CA_FILE"
+            ;;
+    esac
+}
+
+canonical_ip_from_origin() {
+    local origin="$1" expected_port="$2"
+    /usr/bin/python3 - "$origin" "$expected_port" <<'PY'
+import ipaddress
+import sys
+import urllib.parse
+
+origin, expected_port = sys.argv[1], int(sys.argv[2])
+try:
+    parsed = urllib.parse.urlsplit(origin)
+    if parsed.scheme != "https" or parsed.username is not None or parsed.password is not None:
+        raise ValueError
+    if parsed.path or parsed.query or parsed.fragment or parsed.port != expected_port:
+        raise ValueError
+    hostname = parsed.hostname or ""
+    if "%" in hostname:
+        raise ValueError
+    address = ipaddress.ip_address(hostname)
+    if str(address) != hostname.lower():
+        raise ValueError
+    if address.is_unspecified or address.is_loopback or address.is_link_local or address.is_multicast:
+        raise ValueError
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        raise ValueError
+    if isinstance(address, ipaddress.IPv4Address) and int(address) == 0xFFFFFFFF:
+        raise ValueError
+except (ValueError, TypeError):
+    raise SystemExit(1)
+print(address)
+PY
+}
+
+selected_nginx_template() {
+    local source_root="$1"
+    case "${PROBE_INGRESS_MODE:-}" in
+        domain) printf '%s\n' "$source_root/probe-api/deploy/nginx/nginx.conf" ;;
+        ip) printf '%s\n' "$source_root/probe-api/deploy/nginx/nginx-ip.conf" ;;
+        *) die "load the explicit ingress mode before selecting an Nginx template" ;;
+    esac
+}
+
+validate_closed_install_routes() {
+    local template_file="$1" result
+    result="$(awk '
+        /^[[:space:]]*location[[:space:]]+(=|\^~)[[:space:]]+\/install\/?[[:space:]]*\{[[:space:]]*$/ {
+            routes++
+            if ((getline next_line) > 0) {
+                sub(/^[[:space:]]*/, "", next_line)
+                sub(/[[:space:]]*$/, "", next_line)
+                if (next_line == "return 404;") closed++
+            }
+        }
+        END { printf "%d:%d\n", routes + 0, closed + 0 }
+    ' "$template_file")"
+    [[ "$result" == "4:4" ]] ||
+        die "visitor and administrator /install routes must remain fixed 404 responses"
+}
+
+validate_ip_nginx_template_contract() {
+    local template_file="$1"
+    [[ -f "$template_file" && ! -L "$template_file" ]] ||
+        die "IP-mode Nginx source template is missing: $template_file"
+
+    local expected_locations actual_locations port
+    expected_locations="$(cat <<'EOF'
+location ~ ^/api/v1/panel(?:/|$) {
+location = /api {
+location /api/ {
+location = /internal {
+location /internal/ {
+location ~ (^|/)\. {
+location = /install {
+location ^~ /install/ {
+location = /login {
+location ^~ /login/ {
+location = /admin {
+location ^~ /admin/ {
+location = /downloads {
+location ^~ /downloads/ {
+location / {
+location = /api/v1/auth/login {
+location ~ ^/api/v1/(?:auth|admin)(?:/|$) {
+location ~ ^/api/v1/panel(?:/|$) {
+location = /api {
+location /api/ {
+location = /internal {
+location /internal/ {
+location @probe_admin_rate_limited {
+location ~ (^|/)\. {
+location = /install {
+location ^~ /install/ {
+location = /overview {
+location ^~ /overview/ {
+location = /probes {
+location ^~ /probes/ {
+location = /nodes {
+location ^~ /nodes/ {
+location = /downloads {
+location ^~ /downloads/ {
+location / {
+location = /api/v1/agent/enroll {
+location = /api/v1/agent/config {
+location = /api/v1/agent/report {
+location = /downloads/probe-agent/ca.pem {
+location ~ ^/downloads/probe-agent/(?:install[.]sh|SHA256SUMS|probe-agent[.]service|linux-(?:amd64|arm64)/probe-agent)$ {
+location /api/v1/agent/ {
+location @probe_agent_rate_limited {
+location ^~ /api/v1/public/ {
+location / {
+EOF
+)"
+    actual_locations="$(awk '/^[[:space:]]*location[[:space:]]/ {
+        sub(/^[[:space:]]*/, "")
+        sub(/[[:space:]]*$/, "")
+        print
+    }' "$template_file")"
+    [[ "$actual_locations" == "$expected_locations" ]] ||
+        die "IP-mode Nginx source template location contract changed; review the validator before deployment"
+    validate_closed_install_routes "$template_file"
+
+    [[ "$(grep -Ec '^server \{$' "$template_file")" -eq 3 ]] ||
+        die "IP-mode Nginx template must contain exactly three server blocks"
+    [[ "$(grep -Ec '^[[:space:]]*listen[[:space:]]' "$template_file")" -eq 6 ]] ||
+        die "IP-mode Nginx template has an unexpected listener count"
+    for port in 18453 18454 18455; do
+        [[ "$(grep -Fxc "    listen $port ssl default_server;" "$template_file")" -eq 1 &&
+           "$(grep -Fxc "    listen [::]:$port ssl default_server;" "$template_file")" -eq 1 ]] ||
+            die "IP-mode Nginx template must bind TCP $port exactly once per address family"
+    done
+    [[ "$(grep -Fc '    server_name _;' "$template_file")" -eq 3 ]] ||
+        die "IP-mode Nginx template must use three default servers without domain routing"
+    [[ "$(grep -Fo 'PROBE_SETUP_SERVER_IP' "$template_file" | wc -l)" -eq 7 ]] ||
+        die "IP-mode Nginx template server-IP placeholder count changed"
+    [[ "$(grep -Ec '^[[:space:]]*proxy_pass[[:space:]]' "$template_file")" -eq 7 &&
+       "$(grep -Ec '^[[:space:]]*proxy_pass[[:space:]]+http://probe_api;$' "$template_file")" -eq 7 ]] ||
+        die "IP-mode Nginx template has an unexpected upstream route count"
+    [[ "$(grep -Fxc '    proxy_set_header Cookie "";' "$template_file")" -eq 2 &&
+       "$(grep -Fxc '    proxy_hide_header Set-Cookie;' "$template_file")" -eq 2 ]] ||
+        die "IP-mode visitor and Agent surfaces must strip cookies in both directions"
+    grep -Fxq '        alias /etc/probe-panel/tls/private-ca/ca.pem;' "$template_file" ||
+        die "IP-mode Agent CA route must expose only the fixed public CA file"
 }
 
 validate_nginx_template_contract() {
-    local template_file="$1"
+    local template_file="$1" ingress_mode="${2:-domain}"
     [[ -f "$template_file" && ! -L "$template_file" ]] ||
         die "Nginx source template is missing: $template_file"
+
+    if [[ "$ingress_mode" == ip ]]; then
+        validate_ip_nginx_template_contract "$template_file"
+        return
+    fi
+    [[ "$ingress_mode" == domain ]] || die "unknown Nginx template mode: $ingress_mode"
 
     local expected_locations actual_locations
     expected_locations="$(cat <<'EOF'
@@ -285,6 +634,8 @@ location ^~ /api/v1/setup/ {
 location = /internal {
 location /internal/ {
 location ~ (^|/)\. {
+location = /install {
+location ^~ /install/ {
 location = /login {
 location ^~ /login/ {
 location = /admin {
@@ -331,11 +682,21 @@ EOF
     }' "$template_file")"
     [[ "$actual_locations" == "$expected_locations" ]] ||
         die "Nginx source template location contract changed; review and update the validator before deployment"
+    validate_closed_install_routes "$template_file"
 
     [[ "$(grep -Ec '^server \{$' "$template_file")" -eq 6 ]] ||
         die "Nginx source template must contain exactly six server blocks"
     [[ "$(grep -Ec '^[[:space:]]*listen[[:space:]]' "$template_file")" -eq 12 ]] ||
         die "Nginx source template has an unexpected listener count"
+    [[ "$(awk '/^[[:space:]]*listen[[:space:]]/ {
+        port=$2
+        sub(/;$/, "", port)
+        sub(/^.*:/, "", port)
+        seen[port]++
+        total++
+        if (port != "80" && port != "443") bad=1
+    } END { print (!bad && total == 12 && seen["80"] == 4 && seen["443"] == 8) ? 1 : 0 }' "$template_file")" -eq 1 ]] ||
+        die "domain-mode Nginx template must use only its reviewed TCP 80/443 listeners"
     [[ "$(grep -Ec '^[[:space:]]*proxy_pass[[:space:]]' "$template_file")" -eq 7 &&
        "$(grep -Ec '^[[:space:]]*proxy_pass[[:space:]]+http://probe_api;$' "$template_file")" -eq 7 ]] ||
         die "Nginx source template has an unexpected upstream route count"
@@ -359,9 +720,56 @@ EOF
         die "Nginx source template host contract is invalid"
 }
 
+validate_ip_nginx_fragment_structure() {
+    local active_file="$1" template_file="$2"
+    validate_nginx_template_contract "$template_file" ip
+
+    local admin_ip agent_ip server_ip nginx_host normalized_hash template_hash
+    if ! admin_ip="$(canonical_ip_from_origin "$PROBE_ADMIN_ORIGIN" 18455)"; then
+        die "IP mode PROBE_ADMIN_ORIGIN must be https://<canonical-IP>:18455"
+    fi
+    if ! agent_ip="$(canonical_ip_from_origin "$PROBE_AGENT_PUBLIC_URL" 18454)"; then
+        die "IP mode PROBE_AGENT_PUBLIC_URL must be https://<canonical-IP>:18454"
+    fi
+    [[ "$admin_ip" == "$agent_ip" ]] ||
+        die "IP mode administrator and Agent origins must use the same server IP"
+    server_ip="$admin_ip"
+    nginx_host="$server_ip"
+    [[ "$server_ip" != *:* ]] || nginx_host="[$server_ip]"
+    [[ "$PROBE_ADMIN_ORIGIN" == "https://${nginx_host}:18455" ]] ||
+        die "IP mode administrator origin is not canonical"
+    [[ "$PROBE_AGENT_PUBLIC_URL" == "https://${nginx_host}:18454" ]] ||
+        die "IP mode Agent origin is not canonical"
+    [[ "$(grep -Fo -- "$nginx_host" "$active_file" | wc -l)" -eq 7 ]] ||
+        die "active IP-mode Nginx fragment has an unexpected server-IP occurrence count"
+    ! grep -Fq 'PROBE_SETUP_SERVER_IP' "$active_file" ||
+        die "active IP-mode Nginx fragment still contains the setup placeholder"
+
+    normalized_hash="$(awk -v address="$nginx_host" '
+        function replace_literal(text, needle, replacement, position, output) {
+            output=""
+            while ((position=index(text, needle)) > 0) {
+                output=output substr(text, 1, position - 1) replacement
+                text=substr(text, position + length(needle))
+            }
+            return output text
+        }
+        { print replace_literal($0, address, "PROBE_SETUP_SERVER_IP") }
+    ' "$active_file" | sha256sum | awk '{print $1}')"
+    template_hash="$(sha256sum -- "$template_file" | awk '{print $1}')"
+    [[ "$normalized_hash" == "$template_hash" ]] ||
+        die "active IP-mode Nginx fragment may differ from the reviewed template only by PROBE_SETUP_SERVER_IP"
+}
+
 validate_nginx_fragment_structure() {
     local active_file="$1" template_file="$2"
-    validate_nginx_template_contract "$template_file"
+    if [[ "${PROBE_INGRESS_MODE:-}" == ip ]]; then
+        validate_ip_nginx_fragment_structure "$active_file" "$template_file"
+        return
+    fi
+    [[ "${PROBE_INGRESS_MODE:-}" == domain ]] ||
+        die "load the explicit ingress mode before validating the active Nginx fragment"
+    validate_nginx_template_contract "$template_file" domain
 
     local -a server_names=()
     mapfile -t server_names < <(awk '$1 == "server_name" {
@@ -397,6 +805,11 @@ validate_nginx_fragment_structure() {
        "$panel_domain" != *"$agent_domain"* && "$agent_domain" != *"$panel_domain"* &&
        "$admin_domain" != *"$agent_domain"* && "$agent_domain" != *"$admin_domain"* ]] ||
         die "one production hostname must not contain another hostname"
+
+    [[ "$PROBE_ADMIN_ORIGIN" == "https://${admin_domain}" ]] ||
+        die "domain mode PROBE_ADMIN_ORIGIN must match the dedicated administrator hostname"
+    [[ "$PROBE_AGENT_PUBLIC_URL" == "https://${agent_domain}" ]] ||
+        die "domain mode PROBE_AGENT_PUBLIC_URL must match the dedicated Agent hostname"
 
     local normalized_hash template_hash
     normalized_hash="$(awk \
@@ -439,7 +852,7 @@ validate_active_nginx_config() {
 
 validate_nginx_listen_ports() {
     local dump_file="$1"
-    awk '
+    awk -v mode="$PROBE_INGRESS_MODE" '
         /^[[:space:]]*listen[[:space:]]+/ {
             value=$2
             sub(/;$/, "", value)
@@ -450,17 +863,34 @@ validate_nginx_listen_ports() {
             }
             port=value
             sub(/^.*:/, "", port)
-            if (port != "80" && port != "443") {
-                printf "Nginx listener outside 80/443: %s\n", value > "/dev/stderr"
+            allowed=0
+            if (mode == "domain") {
+                allowed=(port == "80" || port == "443")
+            } else if (mode == "ip") {
+                allowed=(port == "18453" || port == "18454" || port == "18455")
+            } else {
+                printf "unsupported PROBE_INGRESS_MODE while validating Nginx listeners: %s\n", mode > "/dev/stderr"
+                bad=1
+                next
+            }
+            if (!allowed) {
+                printf "Nginx listener outside the %s-mode port contract: %s\n", mode, value > "/dev/stderr"
                 bad=1
             }
+            seen[port]++
         }
-        END { exit bad ? 1 : 0 }
-    ' "$dump_file" || die "Nginx may listen only on TCP 80 and 443"
+        END {
+            if (mode == "domain" && (seen["80"] < 1 || seen["443"] < 1)) bad=1
+            if (mode == "ip" && (seen["18453"] != 2 || seen["18454"] != 2 || seen["18455"] != 2)) bad=1
+            if (bad) exit 1
+            exit 0
+        }
+    ' "$dump_file" || die "Nginx listeners do not match PROBE_INGRESS_MODE=$PROBE_INGRESS_MODE"
 }
 
 validate_no_duplicate_nginx_hosts() {
     local dump_file="$1" panel_domain admin_domain agent_domain extra domain count
+    [[ "$PROBE_INGRESS_MODE" == domain ]] || return 0
     read -r panel_domain admin_domain agent_domain extra < <(
         awk '$1 == "server_name" {
             for (i=2; i<=NF; i++) {
@@ -519,6 +949,68 @@ validate_allowlist_with_binary() {
         /usr/bin/test -r "$PROBE_ALLOWLIST_FILE" ||
         die "probe-api cannot read $PROBE_ALLOWLIST_FILE"
     "$api_binary" config validate-admin-allowlist "$PROBE_ALLOWLIST_FILE"
+}
+
+validate_ingress_tls_with_binary() {
+    local api_binary="$1"
+    [[ -x "$api_binary" ]] || die "invalid API binary for ingress TLS validation: $api_binary"
+
+    case "$PROBE_INGRESS_MODE" in
+        domain)
+            local panel_domain admin_domain agent_domain extra
+            read -r panel_domain admin_domain agent_domain extra < <(
+                awk '$1 == "server_name" {
+                    for (i=2; i<=NF; i++) {
+                        sub(/;$/, "", $i)
+                        printf "%s%s", $i, (i == NF ? ORS : OFS)
+                    }
+                    exit
+                }' "$PROBE_ACTIVE_NGINX_CONFIG"
+            )
+            [[ -n "$panel_domain" && -n "$admin_domain" && -n "$agent_domain" && -z "$extra" ]] ||
+                die "could not extract the three domain-mode ingress hostnames for TLS validation"
+            "$api_binary" config validate-ingress-tls domain \
+                "$panel_domain" "$admin_domain" "$agent_domain"
+            ;;
+        ip)
+            local admin_address agent_address
+            if ! admin_address="$(canonical_ip_from_origin "$PROBE_ADMIN_ORIGIN" 18455)"; then
+                die "IP-mode administrator origin is invalid while validating ingress TLS"
+            fi
+            if ! agent_address="$(canonical_ip_from_origin "$PROBE_AGENT_PUBLIC_URL" 18454)"; then
+                die "IP-mode Agent origin is invalid while validating ingress TLS"
+            fi
+            [[ "$admin_address" == "$agent_address" ]] ||
+                die "IP-mode origins disagree while validating ingress TLS"
+            "$api_binary" config validate-ingress-tls ip "$admin_address"
+            ;;
+        *)
+            die "load the explicit ingress mode before validating ingress TLS"
+            ;;
+    esac
+}
+
+validate_certbot_timer_state() {
+    local enabled_state active_state
+    enabled_state="$(systemctl is-enabled certbot.timer 2>/dev/null || true)"
+    active_state="$(systemctl is-active certbot.timer 2>/dev/null || true)"
+    case "$PROBE_INGRESS_MODE" in
+        domain)
+            [[ "$enabled_state" == enabled ]] ||
+                die "domain mode requires certbot.timer to be enabled"
+            [[ "$active_state" == active ]] ||
+                die "domain mode requires certbot.timer to be active"
+            ;;
+        ip)
+            [[ "$enabled_state" == disabled ]] ||
+                die "IP mode requires certbot.timer to be disabled"
+            [[ "$active_state" == inactive ]] ||
+                die "IP mode requires certbot.timer to be inactive"
+            ;;
+        *)
+            die "load the explicit ingress mode before validating certbot.timer"
+            ;;
+    esac
 }
 
 validate_static_artifact() {
@@ -649,6 +1141,7 @@ validate_prebuilt_bundle() {
         source/probe-api/config/probe-api.env.example \
         source/probe-api/config/probe-postgres-backup.env.example \
         source/probe-api/deploy/nginx/nginx.conf \
+        source/probe-api/deploy/nginx/nginx-ip.conf \
         source/probe-api/deploy/scripts/deploy-common.sh \
         source/probe-api/deploy/scripts/build-release-bundles.sh \
         source/probe-api/deploy/scripts/install-release.sh \
@@ -679,6 +1172,8 @@ validate_prebuilt_bundle() {
         die "BUNDLE-SHA256SUMS must cover every artifacts, setup, and source file exactly once"
 
     validate_release_artifacts "$bundle_root/artifacts"
+    validate_nginx_template_contract "$bundle_root/source/probe-api/deploy/nginx/nginx.conf" domain
+    validate_nginx_template_contract "$bundle_root/source/probe-api/deploy/nginx/nginx-ip.conf" ip
     validate_systemd_unit_source "$bundle_root/source/probe-api/deploy/systemd/probe-api.service"
     validate_backup_unit_source \
         "$bundle_root/source/probe-api/deploy/systemd/probe-postgres-backup.service" \
@@ -695,11 +1190,7 @@ install_example_file() {
 prepare_system_layout() {
     local source_root="$1"
 
-    getent group probe-api >/dev/null 2>&1 || addgroup --system probe-api
-    if ! id probe-api >/dev/null 2>&1; then
-        adduser --system --ingroup probe-api --no-create-home --home /nonexistent \
-            --shell /usr/sbin/nologin probe-api
-    fi
+    prepare_probe_api_service_account
 
     install -d -o root -g root -m 0755 "$PROBE_ROOT" "$PROBE_API_DIR" "$PROBE_RELEASES_DIR"
     install -d -o root -g probe-api -m 0750 "$PROBE_BACKUP_SCRIPT_DIR"
@@ -707,7 +1198,13 @@ prepare_system_layout() {
     install -d -o root -g root -m 0755 "$PROBE_NGINX_CONFIG_DIR"
     install -d -o root -g root -m 0700 "$PROBE_BACKUPS_DIR"
     install -d -o probe-api -g probe-api -m 0700 "$PROBE_POSTGRES_BACKUP_DIR"
-    install -d -o root -g probe-api -m 0750 /etc/probe-panel
+    # Nginx needs directory traversal to serve the public IP-mode CA. Active
+    # secrets below this root keep their own fail-closed file permissions.
+    [[ ! -L /etc/probe-panel && ( ! -e /etc/probe-panel || -d /etc/probe-panel ) ]] ||
+        die "/etc/probe-panel must be a real directory"
+    install -d -o root -g root -m 0755 /etc/probe-panel
+    [[ ! -L /etc/probe-panel && "$(stat -c '%u:%g:%a' /etc/probe-panel)" == 0:0:755 ]] ||
+        die "/etc/probe-panel must be a root:root directory with mode 0755"
     install -d -o root -g root -m 0755 /etc/probe-panel/tls /etc/probe-panel/tls/panel /etc/probe-panel/tls/admin /etc/probe-panel/tls/api
 
     if [[ ! -e "$PROBE_ALLOWLIST_FILE" ]]; then
@@ -720,6 +1217,8 @@ prepare_system_layout() {
         "${PROBE_CONFIG_DIR}/probe-postgres-backup.env.example" 0600 root
     install_example_file "${source_root}/probe-api/deploy/nginx/nginx.conf" \
         "${PROBE_NGINX_CONFIG_DIR}/nginx.conf.example" 0644 root
+    install_example_file "${source_root}/probe-api/deploy/nginx/nginx-ip.conf" \
+        "${PROBE_NGINX_CONFIG_DIR}/nginx-ip.conf.example" 0644 root
 }
 
 install_service_assets() {
@@ -835,6 +1334,7 @@ validate_backup_service_assets() {
 }
 
 validate_backup_credentials() {
+    assert_probe_api_service_account
     assert_private_file "$PROBE_PGPASS_FILE" probe-api
     [[ -s "$PROBE_PGPASS_FILE" ]] || die "$PROBE_PGPASS_FILE must not be empty"
     setpriv --reuid=probe-api --regid=probe-api --init-groups --reset-env -- \
@@ -1076,24 +1576,68 @@ run_migrations() {
 validate_runtime_listeners() {
     require_commands ss
     local listeners
-    listeners="$(ss -H -lntp)"
+    # The production validator also runs inside the one-time Finalizer's
+    # ProtectProc=invisible sandbox. Process ownership from ss -p is therefore
+    # intentionally unavailable. Nginx has already passed nginx -T, service
+    # activation, and is-active checks; validate its reviewed ingress ports by
+    # presence while retaining strict loopback checks for API and PostgreSQL.
+    listeners="$(ss -H -lnt)"
 
-    local nginx_bad
-    nginx_bad="$(awk '$0 ~ /\(\("nginx"/ { address=$4; sub(/^.*:/, "", address); if (address != "80" && address != "443") print $0 }' <<<"$listeners")"
-    [[ -z "$nginx_bad" ]] || die "Nginx has a listener outside TCP 80/443"
-
-    ! grep -Eq '(^|[[:space:]])(0[.]0[.]0[.]0|\[::\]|\*):8080([[:space:]]|$)' <<<"$listeners" ||
-        die "probe-api port 8080 is exposed beyond loopback"
-    ! grep -Eq '(^|[[:space:]])(0[.]0[.]0[.]0|\[::\]|\*):5432([[:space:]]|$)' <<<"$listeners" ||
-        die "PostgreSQL port 5432 is exposed beyond loopback"
+    awk -v mode="$PROBE_INGRESS_MODE" '
+        BEGIN {
+            if (mode != "domain" && mode != "ip") {
+                printf "unsupported ingress mode while validating runtime listeners: %s\n", mode > "/dev/stderr"
+                bad=1
+            }
+        }
+        {
+            endpoint=$4
+            port=endpoint
+            sub(/^.*:/, "", port)
+            host=endpoint
+            sub(/:[^:]*$/, "", host)
+            sub(/^\[/, "", host)
+            sub(/\]$/, "", host)
+            if (mode == "domain" && (port == "80" || port == "443")) {
+                ingress[port]=1
+            }
+            if (mode == "ip" && (port == "18453" || port == "18454" || port == "18455")) {
+                ingress[port]=1
+            }
+            if (port == "8080") {
+                api_count++
+                if (host != "127.0.0.1") {
+                    printf "probe-api listener is not IPv4 loopback: %s\n", $4 > "/dev/stderr"
+                    bad=1
+                }
+            }
+            if (port == "5432") {
+                postgres_count++
+                if (host != "127.0.0.1" && host != "::1") {
+                    printf "PostgreSQL listener is not loopback: %s\n", $4 > "/dev/stderr"
+                    bad=1
+                }
+            }
+        }
+        END {
+            if (mode == "domain" && (!ingress["80"] || !ingress["443"])) bad=1
+            if (mode == "ip" && (!ingress["18453"] || !ingress["18454"] || !ingress["18455"])) bad=1
+            if (api_count < 1 || postgres_count < 1) bad=1
+            if (bad) exit 1
+            exit 0
+        }
+    ' <<<"$listeners" || die "runtime listeners violate the ingress or loopback-only service contract"
 }
 
 verify_running_services() {
+    assert_probe_api_service_account
     systemctl is-active --quiet postgresql.service || die "PostgreSQL is not active"
     systemctl is-active --quiet probe-api.service || die "probe-api is not active"
     systemctl is-active --quiet nginx.service || die "Nginx is not active"
     systemctl is-active --quiet probe-postgres-backup.timer ||
         die "probe-postgres-backup.timer is not active"
+    validate_ingress_tls_with_binary "${PROBE_API_DIR}/probe-api"
+    validate_certbot_timer_state
     curl --fail --silent --show-error --max-time 10 \
         http://127.0.0.1:8080/internal/health/ready >/dev/null ||
         die "probe-api readiness check failed"
@@ -1102,7 +1646,7 @@ verify_running_services() {
 
 deploy_prebuilt_release() {
     local bundle_root="$1" release_id="$2"
-    require_commands bash cp env find install sha256sum sort xargs pg_dump pg_restore nginx systemctl systemd-analyze setpriv curl ss flock awk grep sed stat readlink
+    require_commands bash cp env find install sha256sum sort xargs pg_dump pg_restore nginx systemctl systemd-analyze setpriv curl ss flock awk grep sed stat readlink python3
 
     bundle_root="$(canonical_directory "$bundle_root")"
     [[ "$release_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$ ]] ||
@@ -1112,12 +1656,16 @@ deploy_prebuilt_release() {
 
     local source_root="$bundle_root/source"
     local artifact_root="$bundle_root/artifacts"
-    local nginx_template="$source_root/probe-api/deploy/nginx/nginx.conf"
     prepare_system_layout "$source_root"
     acquire_database_maintenance_lock
+    clear_exported_probe_environment
+    load_probe_env
+    local ingress_mode="$PROBE_INGRESS_MODE" nginx_template
+    nginx_template="$(selected_nginx_template "$source_root")"
     validate_active_nginx_config "$nginx_template"
     validate_backup_credentials
     validate_switchable_release_paths
+    clear_exported_probe_environment
 
     local verify_root
     verify_root="$(mktemp -d /var/tmp/probe-prebuilt-verify.XXXXXX)"
@@ -1126,7 +1674,11 @@ deploy_prebuilt_release() {
 
     clear_exported_probe_environment
     load_probe_env
+    [[ "$PROBE_INGRESS_MODE" == "$ingress_mode" ]] ||
+        die "PROBE_INGRESS_MODE changed during prebuilt release validation"
     validate_allowlist_with_binary "$artifact_root/api/probe-api"
+    validate_ingress_tls_with_binary "$artifact_root/api/probe-api"
+    validate_certbot_timer_state
     install_service_assets "$source_root"
     validate_nginx_runtime_config "$nginx_template"
 
@@ -1181,11 +1733,15 @@ deploy_prebuilt_release() {
 
 deploy_release() {
     local source_root="$1" run_tests="$2" validate_only="$3"
-    require_commands bash go npm node cp env find install sha256sum sort xargs pg_dump pg_restore nginx systemctl systemd-analyze setpriv curl ss flock awk grep sed stat readlink
+    require_commands bash go npm node cp env find install sha256sum sort xargs pg_dump pg_restore nginx systemctl systemd-analyze setpriv curl ss flock awk grep sed stat readlink python3
 
+    assert_probe_api_service_account
     acquire_database_maintenance_lock
     validate_deployment_script_sources "$source_root"
-    local nginx_template="${source_root}/probe-api/deploy/nginx/nginx.conf"
+    clear_exported_probe_environment
+    load_probe_env
+    local ingress_mode="$PROBE_INGRESS_MODE" nginx_template
+    nginx_template="$(selected_nginx_template "$source_root")"
     validate_active_nginx_config "$nginx_template"
     validate_backup_credentials
     validate_systemd_unit_source "${source_root}/probe-api/deploy/systemd/probe-api.service"
@@ -1201,7 +1757,11 @@ deploy_release() {
     verify_source_systemd_units "$source_root" "$work_root"
     artifact_root="${work_root}/artifacts"
     load_probe_env
+    [[ "$PROBE_INGRESS_MODE" == "$ingress_mode" ]] ||
+        die "PROBE_INGRESS_MODE changed during release build; refusing to switch ingress mode"
     validate_allowlist_with_binary "$artifact_root/api/probe-api"
+    validate_ingress_tls_with_binary "$artifact_root/api/probe-api"
+    validate_certbot_timer_state
 
     if [[ "$validate_only" == true ]]; then
         [[ -f "$PROBE_SYSTEMD_UNIT" ]] || die "installed probe-api systemd unit is missing"

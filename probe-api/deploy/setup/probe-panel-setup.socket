@@ -1,0 +1,18 @@
+[Unit]
+Description=Probe Panel root-only first-run setup socket
+ConditionPathExists=/var/lib/probe-panel/setup/state.json
+ConditionPathExists=/srv/probe/setup-ui/index.html
+
+[Socket]
+ListenStream=/run/probe-panel-setup/setup.sock
+FileDescriptorName=setup-http
+SocketUser=root
+SocketGroup=root
+SocketMode=0600
+DirectoryMode=0700
+Accept=no
+RemoveOnStop=yes
+Service=probe-panel-setup.service
+
+[Install]
+WantedBy=sockets.target

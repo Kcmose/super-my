@@ -21,7 +21,7 @@ bash probe-api/deploy/scripts/security-smoke.sh \
   --agent-url "$AGENT_URL"
 ```
 
-预览环境应优先通过 `--cacert /absolute/path/to/ca.pem` 显式信任证书；确认 Agent Host 发布私有 CA 时再增加 `--expect-private-ca`，脚本会额外验证游客/管理 Host 为 `404`、Agent Host 为 `200`。只有临时排障且没有 CA 文件时才能使用 `--insecure`，正式环境不得使用。脚本不发送管理员凭据或有效 Agent Token，其输出可以直接作为第 6 阶段安全验收的原始证据。
+域名模式直接使用系统公信根校验 TLS。IP 模式是正式生产入口，应通过 `--cacert /absolute/path/to/ca.pem` 显式信任安装时生成的固定私有 CA，并增加 `--expect-private-ca`；脚本会额外验证游客/管理入口下载 `ca.pem` 为 `404`、Agent 入口为 `200`。`--insecure` 只能用于临时定位问题，不得作为任一生产模式的验收或修复方案。脚本不发送管理员凭据或有效 Agent Token，其输出可以直接作为第 6 阶段安全验收的原始证据。
 
 三个入口的正常边界如下：
 
@@ -57,8 +57,8 @@ sudo ss -ltnp
 - `live` 返回 `200` 和 `{"status":"ok"}`。
 - `ready` 返回 `200` 和 `{"status":"ready"}`；`503` 表示数据库不可用或迁移状态未就绪。
 - API 只监听 `127.0.0.1:8080`（或明确配置的内部地址）。
-- PostgreSQL 不监听公网地址的 `5432`。
-- Nginx 对外监听部署所需的 `80/443`；阶段预览端口以预览配置为准。
+- PostgreSQL `5432` 严格只监听 `127.0.0.1` 和/或 `::1`；出现公网、内网或通配地址都是错误。
+- `PROBE_INGRESS_MODE=domain` 时 Nginx 只监听 `80/443`；`PROBE_INGRESS_MODE=ip` 时只监听 `18453/18454/18455`。
 
 查看最近日志时控制时间范围，避免无关信息和敏感数据扩散：
 
@@ -81,13 +81,13 @@ getent ahosts api.example.invalid
 curl --disable --verbose --output /dev/null "$PANEL_URL/"
 ```
 
-把占位域名替换为实际域名。检查 DNS 是否指向预期主机、主机防火墙是否只开放约定端口，以及 Nginx 是否绑定了正确的 IPv4/IPv6 地址。
+域名模式把占位域名替换为实际域名，检查 DNS 是否指向预期主机。IP 模式则把三个 URL 分别设为同一 IP 的 `https://IP:18453`、`https://IP:18455`、`https://IP:18454`（IPv6 URL 使用 `[]`），不做 DNS 检查。两种模式都要确认防火墙只开放当前模式约定端口，并确认 Nginx 绑定了正确的 IPv4/IPv6 地址。
 
-curl 会读取标准代理环境变量。测试内网预览入口时，代理可能改变 Nginx 看到的来源地址并触发 `403`；为内网主机正确设置 `NO_PROXY`，不要在报告中抄录含认证信息的代理 URL。测试正式公网入口时则按部署网络策略决定是否使用代理。
+curl 会读取标准代理环境变量。测试内网或 IP 入口时，代理可能改变 Nginx 看到的来源地址并触发 `403`；为目标主机正确设置 `NO_PROXY`，不要在报告中抄录含认证信息的代理 URL。测试公网入口时则按部署网络策略决定是否使用代理。
 
 ### TLS 校验失败
 
-正式环境检查证书链、域名和有效期：
+域名模式检查公信证书链、域名和有效期：
 
 ```bash
 openssl s_client -connect panel.example.invalid:443 \
@@ -102,7 +102,18 @@ openssl s_client -connect panel.example.invalid:443 \
 /etc/probe-panel/tls/api/fullchain.pem
 ```
 
-证书修复后先执行 `sudo nginx -t`，成功后再 reload。不要把 `--insecure` 当作生产修复方案。
+可先用当前 API 二进制执行与部署器完全相同的只读校验（把域名替换为活动 Nginx 片段中的三个规范域名）：
+
+```bash
+sudo /srv/probe/api/probe-api config validate-ingress-tls domain \
+  panel.example.invalid admin.example.invalid api.example.invalid
+systemctl is-enabled certbot.timer
+systemctl is-active certbot.timer
+```
+
+两条 timer 命令在域名模式应分别返回 `enabled`、`active`。证书修复后先执行 `sudo nginx -t`，成功后再 reload。不要把 `--insecure` 当作生产修复方案。
+
+IP 模式可执行 `sudo /srv/probe/api/probe-api config validate-ingress-tls ip <规范IP>`，检查固定 `ca.pem`、叶证书/私钥、唯一 IP SAN、ServerAuth、有效期及直接签发关系；IPv6 参数不加 URL 方括号。`systemctl is-enabled certbot.timer` 和 `systemctl is-active certbot.timer` 应分别返回 `disabled`、`inactive`。浏览器需要显式信任该 CA；Agent Host 的 `/downloads/probe-agent/ca.pem` 必须与同一文件一致，管理面板生成命令中的 `-c` 指纹也必须匹配。IP 模式不要用明文 HTTP 规避证书提示。
 
 ## 4. IP/CIDR 白名单返回 403
 
@@ -191,7 +202,7 @@ unset INVALID_AGENT_TOKEN
 | `422` | 上报结构有效，但字段或采样规则不满足协议 |
 | `429` | 单 IP 或单节点速率限制触发 |
 
-Agent host 上的 `/panel/*`、`/auth/*`、`/admin/*` 和根路径都应返回 `404`；只有 `/downloads/probe-agent/` 下五项固定发布资产和私有 CA 预览可选的公开 `ca.pem` 可下载。Agent 无需进入管理 IP 白名单；若错误 Token 得到 `403`，说明请求误入浏览器入口或代理规则不符合设计。
+Agent 入口上的 `/panel/*`、`/auth/*`、`/admin/*` 和根路径都应返回 `404`；只有 `/downloads/probe-agent/` 下五项固定发布资产可下载。IP 模式还且只在 Agent 入口公开固定 `ca.pem`；域名模式不应公开该文件。Agent 无需进入管理 IP 白名单；若错误 Token 得到 `403`，说明请求误入浏览器入口或代理规则不符合设计。
 
 一键安装失败时先不要重新粘贴同一条命令。按错误阶段检查：
 
@@ -245,7 +256,7 @@ bash probe-api/deploy/scripts/load-smoke.sh \
 在关闭故障或完成验收前，至少保存：
 
 - UTC 时间、源码版本/提交标识、Debian、Nginx、Go API、PostgreSQL 版本。
-- 三个入口地址（可以脱敏域名，不包含 URL 凭据）。
+- 当前 `PROBE_INGRESS_MODE` 与三个入口地址（域名模式可脱敏域名，IP 模式保留端口但可脱敏地址；都不包含 URL 凭据）。
 - `security-smoke.sh` 完整输出和退出码。
 - `load-smoke.sh` 参数、完整输出和退出码。
 - `nginx -t` 结果、API live/ready 结果。

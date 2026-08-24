@@ -2,53 +2,40 @@ package setup
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
-	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
-func TestManagerInitializeExchangeAndInstall(t *testing.T) {
+func TestManagerInitializesWithoutCodeAndAcceptsPrivilegedInstalledCommit(t *testing.T) {
 	files := newMemoryFiles()
 	now := time.Date(2026, 8, 24, 10, 0, 0, 0, time.UTC)
-	clock := func() time.Time { return now }
-	manager := newTestManager(files, clock, bytes.NewReader(bytes.Repeat([]byte{0x41}, 128)))
-	code, expiresAt, err := manager.Initialize()
-	if err != nil {
+	manager := newTestManager(files, func() time.Time { return now }, sessionTestRandom(4))
+	if err := manager.Initialize(); err != nil {
 		t.Fatal(err)
 	}
-	if len(code) != 64 || expiresAt.Sub(now) != 30*time.Minute {
-		t.Fatalf("code length/expiry = %d/%s", len(code), expiresAt.Sub(now))
+	if len(files.files) != 1 {
+		t.Fatalf("persistent setup files = %#v, want only state", files.files)
 	}
-	persisted := string(files.files["/code.json"])
-	if strings.Contains(persisted, code) {
-		t.Fatal("plaintext setup code was persisted")
+	if _, exists := files.files["/state.json"]; !exists {
+		t.Fatal("persistent setup state was not created")
 	}
-	var record map[string]any
-	if err := json.Unmarshal([]byte(persisted), &record); err != nil {
-		t.Fatal(err)
-	}
-	if len(record) != 2 || len(record["code_sha256"].(string)) != 64 {
-		t.Fatalf("unexpected setup code record: %#v", record)
-	}
-	if _, _, err := manager.Initialize(); !errors.Is(err, ErrAlreadyExists) {
+	if err := manager.Initialize(); !errors.Is(err, ErrAlreadyExists) {
 		t.Fatalf("duplicate initialize error = %v", err)
 	}
-	if _, err := manager.ExchangeCode(strings.Repeat("0", 64)); !errors.Is(err, ErrInvalidCode) {
-		t.Fatalf("bad code error = %v", err)
-	}
-	credentials, err := manager.ExchangeCode(code)
+
+	credentials, err := manager.CreateSession()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(credentials.SessionToken) != 64 || len(credentials.CSRFToken) != 64 || credentials.ExpiresAt.Sub(now) != 15*time.Minute {
 		t.Fatalf("invalid session credentials: %#v", credentials)
 	}
-	if _, err := manager.ExchangeCode(code); !errors.Is(err, ErrStateConflict) {
-		t.Fatalf("reused code error = %v", err)
+	if state, _ := manager.Status(); state != StateConfiguring {
+		t.Fatalf("state after first session = %q", state)
 	}
-	if err := manager.BeginFinalization(credentials.SessionToken, strings.Repeat("0", 64)); !errors.Is(err, ErrInvalidCSRF) {
+	if err := manager.BeginFinalization(credentials.SessionToken, string(bytes.Repeat([]byte{'0'}, 64))); !errors.Is(err, ErrInvalidCSRF) {
 		t.Fatalf("bad csrf error = %v", err)
 	}
 	if err := manager.BeginFinalization(credentials.SessionToken, credentials.CSRFToken); err != nil {
@@ -57,24 +44,113 @@ func TestManagerInitializeExchangeAndInstall(t *testing.T) {
 	if err := manager.BeginFinalization(credentials.SessionToken, credentials.CSRFToken); !errors.Is(err, ErrStateConflict) {
 		t.Fatalf("concurrent finalization error = %v", err)
 	}
+	if err := manager.states.Transition(StateFinalizing, StateInstalled, now); err != nil {
+		t.Fatalf("privileged installed commit: %v", err)
+	}
 	if err := manager.FinishFinalization(true); err != nil {
 		t.Fatal(err)
 	}
-	status, _ := manager.Status()
-	if status != StateInstalled {
-		t.Fatalf("status = %q", status)
-	}
-	if _, exists := files.files["/code.json"]; exists {
-		t.Fatal("setup code record remains after installation")
+	if state, _ := manager.Status(); state != StateInstalled {
+		t.Fatalf("final state = %q", state)
 	}
 }
 
-func TestManagerSessionExpiresAndFinalizerFailureRequiresRecovery(t *testing.T) {
+func TestManagerRotatesSessionAndRestartCanResign(t *testing.T) {
 	files := newMemoryFiles()
 	now := time.Date(2026, 8, 24, 10, 0, 0, 0, time.UTC)
-	manager := newTestManager(files, func() time.Time { return now }, bytes.NewReader(bytes.Repeat([]byte{0x22}, 96)))
-	code, _, _ := manager.Initialize()
-	credentials, err := manager.ExchangeCode(code)
+	random := sessionTestRandom(4)
+	manager := newTestManager(files, func() time.Time { return now }, random)
+	if err := manager.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+	first, err := manager.CreateSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := manager.CreateSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.SessionToken == second.SessionToken || first.CSRFToken == second.CSRFToken {
+		t.Fatal("session rotation reused credentials")
+	}
+	if err := manager.BeginFinalization(first.SessionToken, first.CSRFToken); !errors.Is(err, ErrInvalidSession) {
+		t.Fatalf("rotated session error = %v", err)
+	}
+
+	restarted := newTestManager(files, func() time.Time { return now }, sessionTestRandom(4))
+	if err := restarted.ReconcileOnStart(); err != nil {
+		t.Fatalf("reconcile configuring state: %v", err)
+	}
+	if err := restarted.BeginFinalization(second.SessionToken, second.CSRFToken); !errors.Is(err, ErrInvalidSession) {
+		t.Fatalf("pre-restart session error = %v", err)
+	}
+	replacement, err := restarted.CreateSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.BeginFinalization(replacement.SessionToken, replacement.CSRFToken); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManagerConcurrentSessionRotationLeavesOneCredentialPair(t *testing.T) {
+	files := newMemoryFiles()
+	now := time.Date(2026, 8, 24, 10, 0, 0, 0, time.UTC)
+	const count = 24
+	manager := newTestManager(files, func() time.Time { return now }, sessionTestRandom(count+2))
+	if err := manager.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+
+	credentials := make(chan SessionCredentials, count)
+	errorsChannel := make(chan error, count)
+	var wait sync.WaitGroup
+	for index := 0; index < count; index++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			value, err := manager.CreateSession()
+			credentials <- value
+			errorsChannel <- err
+		}()
+	}
+	wait.Wait()
+	close(credentials)
+	close(errorsChannel)
+	for err := range errorsChannel {
+		if err != nil {
+			t.Fatalf("concurrent CreateSession: %v", err)
+		}
+	}
+
+	valid := 0
+	for value := range credentials {
+		err := manager.BeginFinalization(value.SessionToken, value.CSRFToken)
+		switch {
+		case err == nil:
+			valid++
+		case errors.Is(err, ErrInvalidSession):
+		case errors.Is(err, ErrStateConflict) && valid == 1:
+			// The valid pair already moved the manager to finalizing; later
+			// attempts are rejected without observing credential validity.
+		default:
+			t.Fatalf("unexpected credential result: %v", err)
+		}
+	}
+	if valid != 1 {
+		t.Fatalf("valid credential pairs = %d, want 1", valid)
+	}
+}
+
+func TestManagerExpiryFailureAndReconciliationFailClosed(t *testing.T) {
+	files := newMemoryFiles()
+	now := time.Date(2026, 8, 24, 10, 0, 0, 0, time.UTC)
+	manager := newTestManager(files, func() time.Time { return now }, sessionTestRandom(4))
+	if err := manager.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+	credentials, err := manager.CreateSession()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,46 +158,99 @@ func TestManagerSessionExpiresAndFinalizerFailureRequiresRecovery(t *testing.T) 
 	if err := manager.BeginFinalization(credentials.SessionToken, credentials.CSRFToken); !errors.Is(err, ErrInvalidSession) {
 		t.Fatalf("expired session error = %v", err)
 	}
+	replacement, err := manager.CreateSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.BeginFinalization(replacement.SessionToken, replacement.CSRFToken); err != nil {
+		t.Fatal(err)
+	}
+	// The privileged worker, not the HTTP manager, owns the durable failure
+	// transition before its result is transported back through the broker.
+	if err := manager.states.MarkRecovery(now); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.FinishFinalization(false); err != nil {
+		t.Fatal(err)
+	}
+	if state, _ := manager.Status(); state != StateRecoveryRequired {
+		t.Fatalf("failure state = %q", state)
+	}
+	if _, err := manager.CreateSession(); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("recovery session error = %v", err)
+	}
 
 	files2 := newMemoryFiles()
 	now = time.Date(2026, 8, 24, 10, 0, 0, 0, time.UTC)
-	manager2 := newTestManager(files2, func() time.Time { return now }, bytes.NewReader(bytes.Repeat([]byte{0x33}, 96)))
-	code, _, _ = manager2.Initialize()
-	credentials, _ = manager2.ExchangeCode(code)
+	manager2 := newTestManager(files2, func() time.Time { return now }, sessionTestRandom(4))
+	if err := manager2.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+	credentials, _ = manager2.CreateSession()
 	if err := manager2.BeginFinalization(credentials.SessionToken, credentials.CSRFToken); err != nil {
 		t.Fatal(err)
 	}
-	if err := manager2.FinishFinalization(false); err != nil {
-		t.Fatal(err)
+	restarted := newTestManager(files2, func() time.Time { return now }, sessionTestRandom(4))
+	if err := restarted.ReconcileOnStart(); err != nil {
+		t.Fatalf("finalizing reconciliation error = %v", err)
 	}
-	status, _ := manager2.Status()
-	if status != StateRecoveryRequired {
-		t.Fatalf("status = %q", status)
+	if state, _ := restarted.Status(); state != StateFinalizing {
+		t.Fatalf("reconciled state = %q", state)
 	}
 }
 
-func TestManagerReconcileFailsClosedAfterRestartOrExpiry(t *testing.T) {
-	files := newMemoryFiles()
+func TestManagerFinalOutcomeUsesPersistentInstalledAsAuthority(t *testing.T) {
 	now := time.Date(2026, 8, 24, 10, 0, 0, 0, time.UTC)
-	manager := newTestManager(files, func() time.Time { return now }, bytes.NewReader(bytes.Repeat([]byte{0x44}, 96)))
-	code, _, _ := manager.Initialize()
-	if _, err := manager.ExchangeCode(code); err != nil {
-		t.Fatal(err)
-	}
-	if err := manager.ReconcileOnStart(); !errors.Is(err, ErrRecoveryNeeded) {
-		t.Fatalf("restart reconciliation error = %v", err)
-	}
-	status, _ := manager.Status()
-	if status != StateRecoveryRequired {
-		t.Fatalf("status = %q", status)
-	}
 
-	files = newMemoryFiles()
-	now = time.Date(2026, 8, 24, 10, 0, 0, 0, time.UTC)
-	manager = newTestManager(files, func() time.Time { return now }, bytes.NewReader(bytes.Repeat([]byte{0x55}, 32)))
-	_, _, _ = manager.Initialize()
-	now = now.Add(31 * time.Minute)
-	if err := manager.ReconcileOnStart(); !errors.Is(err, ErrRecoveryNeeded) {
-		t.Fatalf("expired code reconciliation error = %v", err)
-	}
+	t.Run("broker outcome cannot preempt a running privileged worker", func(t *testing.T) {
+		manager := newTestManager(newMemoryFiles(), func() time.Time { return now }, sessionTestRandom(2))
+		if err := manager.Initialize(); err != nil {
+			t.Fatal(err)
+		}
+		credentials, err := manager.CreateSession()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := manager.BeginFinalization(credentials.SessionToken, credentials.CSRFToken); err != nil {
+			t.Fatal(err)
+		}
+		if err := manager.FinishFinalization(true); !errors.Is(err, ErrFinalizationPending) {
+			t.Fatalf("uncommitted success error = %v", err)
+		}
+		if state, _ := manager.Status(); state != StateFinalizing {
+			t.Fatalf("uncommitted success state = %q", state)
+		}
+		if err := manager.FinishFinalization(false); !errors.Is(err, ErrFinalizationPending) {
+			t.Fatalf("transport cancellation error = %v", err)
+		}
+		if state, _ := manager.Status(); state != StateFinalizing {
+			t.Fatalf("transport cancellation changed state to %q", state)
+		}
+	})
+
+	t.Run("lost result cannot reverse privileged commit", func(t *testing.T) {
+		manager := newTestManager(newMemoryFiles(), func() time.Time { return now }, sessionTestRandom(2))
+		if err := manager.Initialize(); err != nil {
+			t.Fatal(err)
+		}
+		credentials, err := manager.CreateSession()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := manager.BeginFinalization(credentials.SessionToken, credentials.CSRFToken); err != nil {
+			t.Fatal(err)
+		}
+		if err := manager.states.Transition(StateFinalizing, StateInstalled, now); err != nil {
+			t.Fatal(err)
+		}
+		if err := manager.FinishFinalization(false); err != nil {
+			t.Fatalf("lost-result reconciliation error = %v", err)
+		}
+		if state, _ := manager.Status(); state != StateInstalled {
+			t.Fatalf("lost-result state = %q", state)
+		}
+		if err := manager.ReconcileOnStart(); err != nil {
+			t.Fatalf("installed restart reconciliation error = %v", err)
+		}
+	})
 }

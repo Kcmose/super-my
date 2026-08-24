@@ -29,6 +29,9 @@ func TestBrokerImplementsFinalizerAndUsesFixedProductionPaths(t *testing.T) {
 	if broker.ownerUID != 0 {
 		t.Fatalf("production broker owner = %d, want root", broker.ownerUID)
 	}
+	if broker.maximumWait != DefaultMaximumWait {
+		t.Fatalf("production broker wait = %s, want %s", broker.maximumWait, DefaultMaximumWait)
+	}
 }
 
 func TestBrokerTransfersPlaintextRequestAndConsumesExchange(t *testing.T) {
@@ -175,7 +178,7 @@ func TestBrokerRejectsSecretInMaliciousResultWithoutReflectingIt(t *testing.T) {
 	assertNotExists(t, filepath.Join(directory, resultFileName))
 }
 
-func TestBrokerTimeoutAndCancellationCleanOwnedFiles(t *testing.T) {
+func TestBrokerTimeoutAndCancellationPreservePublishedRequestForRootWorker(t *testing.T) {
 	t.Run("hard timeout", func(t *testing.T) {
 		directory, ownerUID := privateTestDirectory(t)
 		broker := newBrokerForTesting(directory, ownerUID, 2*time.Millisecond, 30*time.Millisecond)
@@ -185,8 +188,15 @@ func TestBrokerTimeoutAndCancellationCleanOwnedFiles(t *testing.T) {
 		if !errors.Is(err, ErrTimeout) {
 			t.Fatalf("Finalize() error = %v, want ErrTimeout", err)
 		}
-		assertNotExists(t, filepath.Join(directory, requestFileName))
+		requestPath := filepath.Join(directory, requestFileName)
+		assertSecureFile(t, requestPath, ownerUID)
 		assertNotExists(t, filepath.Join(directory, resultFileName))
+		consumed, consumeErr := readRequestWithOwner(requestPath, ownerUID)
+		if consumeErr != nil {
+			t.Fatalf("root worker could not consume timed-out request: %v", consumeErr)
+		}
+		consumed.ClearSecrets()
+		assertNotExists(t, requestPath)
 	})
 
 	t.Run("already canceled", func(t *testing.T) {
@@ -215,7 +225,14 @@ func TestBrokerTimeoutAndCancellationCleanOwnedFiles(t *testing.T) {
 		if err := receive(t, resultChannel); !errors.Is(err, ErrCanceled) {
 			t.Fatalf("Finalize() error = %v, want ErrCanceled", err)
 		}
-		assertNotExists(t, filepath.Join(directory, requestFileName))
+		requestPath := filepath.Join(directory, requestFileName)
+		assertSecureFile(t, requestPath, ownerUID)
+		consumed, err := readRequestWithOwner(requestPath, ownerUID)
+		if err != nil {
+			t.Fatalf("root worker could not consume canceled request: %v", err)
+		}
+		consumed.ClearSecrets()
+		assertNotExists(t, requestPath)
 	})
 }
 
@@ -330,6 +347,32 @@ func TestRequestCodecRoundTripEscapesSecretsWithoutRedaction(t *testing.T) {
 	defer decoded.ClearSecrets()
 	if !bytes.Equal(decoded.Database.Password, request.Database.Password) || !bytes.Equal(decoded.Administrator.Password, request.Administrator.Password) {
 		t.Fatal("escaped secret did not round trip")
+	}
+}
+
+func TestRequestCodecRoundTripsPrivateCAIPv6Ingress(t *testing.T) {
+	request := validRequest()
+	request.Domains = setup.DomainInput{}
+	request.Network = setup.NetworkInput{Address: "2001:db8::25"}
+	request.TLS = setup.TLSInput{Mode: "private_ca", Email: ""}
+	defer request.ClearSecrets()
+
+	encoded, err := encodeCompleteRequest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := setup.DecodeCompleteRequest(encoded)
+	clear(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer decoded.ClearSecrets()
+	access, err := decoded.AccessConfiguration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Network.Address != "2001:db8::25" || access.AgentOrigin != "https://[2001:db8::25]:18454" {
+		t.Fatalf("decoded IP access = %#v", access)
 	}
 }
 
@@ -592,6 +635,7 @@ func validRequest() setup.CompleteRequest {
 			Admin: "admin.monitor.test",
 			Agent: "api.monitor.test",
 		},
+		Network:   setup.NetworkInput{Address: ""},
 		TLS:       setup.TLSInput{Mode: "acme", Email: "operator@monitor.test"},
 		Allowlist: []string{"192.0.2.44", "2001:db8:1234::/48"},
 		Administrator: setup.AdministratorInput{

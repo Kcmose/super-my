@@ -18,6 +18,7 @@ import (
 	"probe-api/internal/config"
 	"probe-api/internal/database"
 	"probe-api/internal/httpapi"
+	"probe-api/internal/ingresstls"
 	"probe-api/internal/maintenance"
 	"probe-api/internal/migrate"
 	"probe-api/internal/nodemanagement"
@@ -50,15 +51,7 @@ func run(args []string) error {
 		fmt.Printf("probe-api %s commit=%s built_at=%s\n", version, commit, builtAt)
 		return nil
 	case "config":
-		if len(args) != 3 || args[1] != "validate-admin-allowlist" {
-			return errors.New("usage: probe-api config validate-admin-allowlist <path>")
-		}
-		allowlist, err := access.LoadNginxGeoAllowlist(args[2])
-		if err != nil {
-			return fmt.Errorf("validate management allowlist: %w", err)
-		}
-		fmt.Printf("management allowlist valid: %d entries\n", allowlist.Len())
-		return nil
+		return runConfigCommand(args)
 	case "serve", "migrate", "user":
 		// handled below
 	default:
@@ -257,5 +250,46 @@ func newLogger(levelName string) *slog.Logger {
 }
 
 func usageError() error {
-	return errors.New("usage: probe-api <serve|migrate up|migrate status|user bootstrap-admin <username>|config validate-admin-allowlist <path>|version>")
+	return errors.New("usage: probe-api <serve|migrate up|migrate status|user bootstrap-admin <username>|config validate-admin-allowlist <path>|config validate-ingress-tls <domain PANEL ADMIN AGENT|ip ADDRESS>|version>")
+}
+
+func runConfigCommand(args []string) error {
+	if len(args) == 3 && args[1] == "validate-admin-allowlist" {
+		allowlist, err := access.LoadNginxGeoAllowlist(args[2])
+		if err != nil {
+			return fmt.Errorf("validate management allowlist: %w", err)
+		}
+		fmt.Printf("management allowlist valid: %d entries\n", allowlist.Len())
+		return nil
+	}
+	if len(args) >= 3 && args[1] == "validate-ingress-tls" {
+		paths := ingresstls.ProductionPaths()
+		switch args[2] {
+		case "domain":
+			if len(args) != 6 {
+				return ingressTLSUsageError()
+			}
+			if err := ingresstls.ValidateDomain(ingresstls.DomainConfig{
+				Paths: paths, PanelHost: args[3], AdminHost: args[4], AgentHost: args[5],
+			}); err != nil {
+				return fmt.Errorf("validate domain ingress TLS: %w", err)
+			}
+		case "ip":
+			if len(args) != 4 {
+				return ingressTLSUsageError()
+			}
+			if err := ingresstls.ValidateIP(ingresstls.IPConfig{Paths: paths, Address: args[3]}); err != nil {
+				return fmt.Errorf("validate IP ingress TLS: %w", err)
+			}
+		default:
+			return ingressTLSUsageError()
+		}
+		fmt.Printf("ingress TLS valid: %s\n", args[2])
+		return nil
+	}
+	return errors.New("usage: probe-api config <validate-admin-allowlist PATH|validate-ingress-tls domain PANEL ADMIN AGENT|validate-ingress-tls ip ADDRESS>")
+}
+
+func ingressTLSUsageError() error {
+	return errors.New("usage: probe-api config validate-ingress-tls <domain PANEL ADMIN AGENT|ip ADDRESS>")
 }

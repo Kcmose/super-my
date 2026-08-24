@@ -33,7 +33,7 @@ bash probe-api/deploy/scripts/upgrade.sh \
 - 切换发布链接；
 - 重启或重载服务。
 
-它会解析新源码中的三个 systemd 单元，并按新源码模板核对活动 Nginx 三 Host 与全部路由；不会只检查旧的已安装单元。验证全程持有与备份/恢复共用的数据库维护锁，因此不能与定时备份或恢复演练并行。
+它会解析新源码中的三个正式 systemd 单元，并读取持久化的 `PROBE_INGRESS_MODE`，按对应的新源码模板核对活动 Nginx 全部入口、端口与路由；不会只检查旧的已安装单元。待部署的新 API 二进制还会在任何迁移或发布切换前直接使用 Go `crypto/x509` 复核当前模式的证书。`domain` 模式只能使用 80/443，三个固定证书/私钥必须分别匹配对应 DNS SAN、ServerAuth、公信根和 fullchain 中间证书，且 `certbot.timer` 必须为 enabled/active；`ip` 模式只能使用 18453/18454/18455，固定叶证书必须仅含所选 IP SAN、由固定有效私有 CA 直接签发，且 `certbot.timer` 必须为 disabled/inactive。验证不会要求另一模式的证书材料。验证全程持有与备份/恢复共用的数据库维护锁，因此不能与定时备份或恢复演练并行。
 
 依赖下载产生的 Go/npm 缓存仅存在于 Debian 构建环境。两个前端的 `node_modules` 和 `dist` 位于临时构建副本，不写回同步源码目录。
 
@@ -52,12 +52,12 @@ bash probe-api/deploy/scripts/upgrade.sh \
 
 1. 源码和活动配置预检；
 2. 四工程独立测试与构建，其中 Agent 同时生成 amd64/arm64 首次安装资产和 SHA256 清单；
-3. 新源码 systemd 单元、Nginx 三 Host/路由、白名单和发布产物校验；
+3. 新源码 systemd 单元、当前 ingress 模式的 Nginx 入口/路由、证书链、Certbot timer、白名单和发布产物校验；
 4. 新发布写入 `/srv/probe/releases/<release-id>/` 并生成 SHA-256 清单；
 5. `pg_dump` 写入 `/srv/probe/backups/pre-upgrade-<release-id>.dump`，再用 `pg_restore --list` 验证；
 6. 新 API 二进制执行前向迁移；
 7. 原子替换 API、Agent 下载、游客前端、管理前端和迁移清单五个活动链接；
-8. API 重启、Nginx reload-or-restart、readiness 和监听地址验收。
+8. API 重启、Nginx reload-or-restart、证书与 Certbot timer 运行态复验、readiness 和监听地址验收。
 
 升级不会覆盖：
 
@@ -70,7 +70,7 @@ bash probe-api/deploy/scripts/upgrade.sh \
 PostgreSQL 数据目录
 ```
 
-升级不会把新源码中的示例复制到 `/srv/probe/config`。比较配置时直接使用本次同步源码中的 `probe-api/config/*.example` 和 `probe-api/deploy/nginx/nginx.conf`，避免把旧 `.example` 误认为当前版本契约。
+升级不会覆盖活动环境或 Nginx 配置，也不会重生成证书或切换 ingress 模式。比较配置时直接使用本次同步源码中的 `probe-api/config/*.example` 以及与当前模式对应的 `probe-api/deploy/nginx/nginx.conf` 或 `nginx-ip.conf`，避免把旧 `.example` 误认为当前版本契约。
 
 ## 4. 升级后验收
 
@@ -86,9 +86,9 @@ journalctl -u probe-api --since '-10 minutes' --no-pager
 
 - 游客 Host 无需登录即可读取允许的 Panel API，但没有登录页或管理 API；
 - 管理 Host 未登录 API 返回 401，管理员登录和写操作正常；
-- API Host 的 Agent 注册、配置和上报路由正常，五项固定发布资产可下载且 SHA256 通过；私有 CA 预览还应验证 `ca.pem` 与命令指纹一致。未知下载和浏览器管理路由返回 404；panel/admin Host 的下载路径返回 404；
+- Agent 入口的注册、配置和上报路由正常，五项固定发布资产可下载且 SHA256 通过；IP 生产模式还应验证只有 Agent 入口可下载固定 `ca.pem`，且其完整文件 SHA-256 与管理面板命令指纹一致；域名模式不应公开 `ca.pem`。未知下载和浏览器管理路由返回 404；panel/admin 入口的下载路径返回 404；
 - 非白名单来源不能读取两个前端的 HTML、JS、CSS；
-- Nginx 只监听 80/443，API 仅监听 `127.0.0.1:8080`，PostgreSQL 未暴露公网；
+- Nginx 只监听当前模式允许的 80/443 或 18453/18454/18455，API 仅监听 `127.0.0.1:8080`，PostgreSQL 未暴露公网；
 - Agent 在升级窗口后继续上报，且没有任何反向连接或远程升级行为。
 
 ## 5. 失败和回退
@@ -113,4 +113,4 @@ diff -u \
   /path/to/offline-redacted-active-env
 ```
 
-修改活动配置后先执行 `upgrade.sh --validate-only`。活动 Nginx 片段只允许基于当前源码模板替换三个域名；证书继续放在模板固定路径。修改白名单时，必须先通过同一份 API 二进制的 allowlist 校验和 `nginx -t`，再重启 API、重载 Nginx，避免两个白名单层漂移。
+修改活动配置后先执行 `upgrade.sh --validate-only`。活动 Nginx 片段只允许基于当前模式的源码模板替换三个域名或唯一 IP 占位符；`PROBE_INGRESS_MODE`、Origin、Agent URL、证书路径与监听端口必须成套一致。修改白名单时，必须先通过同一份 API 二进制的 allowlist 校验和 `nginx -t`，再重启 API、重载 Nginx，避免两个白名单层漂移。

@@ -62,7 +62,7 @@ func newTestManager(files *memoryFiles, now func() time.Time, random io.Reader) 
 	if err != nil {
 		panic(err)
 	}
-	manager, err := NewManager(states, files, "/code.json", WithClock(now), WithRandom(random))
+	manager, err := NewManager(states, WithClock(now), WithRandom(random))
 	if err != nil {
 		panic(err)
 	}

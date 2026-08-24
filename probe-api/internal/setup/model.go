@@ -53,14 +53,60 @@ type DatabaseInput struct {
 }
 
 type DomainInput struct {
-	Panel string `json:"panel"`
-	Admin string `json:"admin"`
-	Agent string `json:"agent"`
+	Panel   string `json:"panel"`
+	Admin   string `json:"admin"`
+	Agent   string `json:"agent"`
+	decoded bool
+}
+
+type NetworkInput struct {
+	Address string `json:"address"`
+	decoded bool
 }
 
 type TLSInput struct {
-	Mode  string `json:"mode"`
-	Email string `json:"email"`
+	Mode    string `json:"mode"`
+	Email   string `json:"email"`
+	decoded bool
+}
+
+func (input *DomainInput) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Panel *string `json:"panel"`
+		Admin *string `json:"admin"`
+		Agent *string `json:"agent"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil || wire.Panel == nil || wire.Admin == nil || wire.Agent == nil {
+		return errors.New("domains must contain panel, admin, and agent")
+	}
+	input.Panel, input.Admin, input.Agent = *wire.Panel, *wire.Admin, *wire.Agent
+	input.decoded = true
+	return nil
+}
+
+func (input *NetworkInput) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Address *string `json:"address"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil || wire.Address == nil {
+		return errors.New("network must contain address")
+	}
+	input.Address = *wire.Address
+	input.decoded = true
+	return nil
+}
+
+func (input *TLSInput) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Mode  *string `json:"mode"`
+		Email *string `json:"email"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil || wire.Mode == nil || wire.Email == nil {
+		return errors.New("tls must contain mode and email")
+	}
+	input.Mode, input.Email = *wire.Mode, *wire.Email
+	input.decoded = true
+	return nil
 }
 
 type AdministratorInput struct {
@@ -72,13 +118,10 @@ type AdministratorInput struct {
 type CompleteRequest struct {
 	Database      DatabaseInput      `json:"database"`
 	Domains       DomainInput        `json:"domains"`
+	Network       NetworkInput       `json:"network"`
 	TLS           TLSInput           `json:"tls"`
 	Allowlist     []string           `json:"allowlist"`
 	Administrator AdministratorInput `json:"administrator"`
-}
-
-type SessionRequest struct {
-	SetupCode string `json:"setup_code"`
 }
 
 var completeRequestSchema = objectSchema{
@@ -87,6 +130,9 @@ var completeRequestSchema = objectSchema{
 	},
 	"domains": {
 		"panel": nil, "admin": nil, "agent": nil,
+	},
+	"network": {
+		"address": nil,
 	},
 	"tls": {
 		"mode": nil, "email": nil,
@@ -97,21 +143,18 @@ var completeRequestSchema = objectSchema{
 	},
 }
 
-func DecodeSessionRequest(data []byte) (SessionRequest, error) {
-	var request SessionRequest
-	if err := decodeStrictObject(data, &request, objectSchema{"setup_code": nil}); err != nil {
-		return SessionRequest{}, err
-	}
-	if len(request.SetupCode) != 64 || strings.Trim(request.SetupCode, "0123456789abcdef") != "" {
-		return SessionRequest{}, errors.New("setup code is invalid")
-	}
-	return request, nil
-}
-
 func DecodeCompleteRequest(data []byte) (CompleteRequest, error) {
 	var request CompleteRequest
 	if err := decodeStrictObject(data, &request, completeRequestSchema); err != nil {
+		request.ClearSecrets()
 		return CompleteRequest{}, err
+	}
+	// Empty strings are meaningful in the mutually exclusive IP ingress mode,
+	// so semantic validation alone cannot distinguish an explicitly empty field
+	// from an omitted object/member. Keep the wire contract structurally strict.
+	if !request.Domains.decoded || !request.Network.decoded || !request.TLS.decoded {
+		request.ClearSecrets()
+		return CompleteRequest{}, errors.New("request is missing domains, network, or tls")
 	}
 	if err := request.Validate(); err != nil {
 		request.ClearSecrets()
@@ -122,7 +165,7 @@ func DecodeCompleteRequest(data []byte) (CompleteRequest, error) {
 }
 
 func (request CompleteRequest) Validate() error {
-	if request.Database.Mode != localPostgresMode && request.Database.Mode != "local_postgresql" {
+	if request.Database.Mode != localPostgresMode {
 		return errors.New("database.mode must be local")
 	}
 	if !postgresIdentifier.MatchString(request.Database.Name) {
@@ -140,25 +183,7 @@ func (request CompleteRequest) Validate() error {
 	if !secretsEqual(request.Database.Password, request.Database.PasswordConfirmation) {
 		return errors.New("database password confirmation does not match")
 	}
-	panelHost, err := validateDomain(request.Domains.Panel, "domains.panel")
-	if err != nil {
-		return err
-	}
-	adminHost, err := validateDomain(request.Domains.Admin, "domains.admin")
-	if err != nil {
-		return err
-	}
-	agentHost, err := validateDomain(request.Domains.Agent, "domains.agent")
-	if err != nil {
-		return err
-	}
-	if domainsOverlap(panelHost, adminHost) || domainsOverlap(panelHost, agentHost) || domainsOverlap(adminHost, agentHost) {
-		return errors.New("panel, admin, and agent domains must be distinct and must not contain one another")
-	}
-	if request.TLS.Mode != "acme" {
-		return errors.New("tls.mode must be acme")
-	}
-	if err := validateEmail(request.TLS.Email); err != nil {
+	if _, err := request.AccessConfiguration(); err != nil {
 		return err
 	}
 	if _, err := normalizeCIDRs(request.Allowlist, "allowlist"); err != nil {

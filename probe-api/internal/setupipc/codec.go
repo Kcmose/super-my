@@ -113,6 +113,13 @@ func encodeCompleteRequest(request setup.CompleteRequest) ([]byte, error) {
 		return nil, ErrProtocol
 	}
 
+	encoded = append(encoded, `},"network":{"address":`...)
+	encoded, err = appendJSONString(encoded, []byte(request.Network.Address))
+	if err != nil {
+		clear(encoded)
+		return nil, ErrProtocol
+	}
+
 	encoded = append(encoded, `},"tls":{"mode":`...)
 	encoded, err = appendJSONString(encoded, []byte(request.TLS.Mode))
 	if err != nil {

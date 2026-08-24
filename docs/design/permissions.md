@@ -47,7 +47,7 @@ HEAD 只在对应 GET 路由明确支持时与 GET 同权限，且不得产生�
 | `api.example.com/api/v1/{auth,panel,admin}/*` | 不适用 | 不适用 | 不暴露 | 返回 `404`，浏览器 API 无第二入口 |
 | `/internal/*` | 仅回环/运维私网 | 内部凭据（若跨主机） | 不对公网 | 健康检查不经过公网 server block |
 
-静态部署边界同样 fail closed：`panel.example.com` 的根目录固定为 `/srv/probe/web`，`admin.example.com` 的根目录固定为 `/srv/probe/admin`。两个目录分别来自 `probe-web` 与 `probe-admin` 的独立构建/安装流程，不允许复制、软链接或 fallback 到另一套产物。`/api`、`/internal`、`/downloads`、跨 Host API 与隐藏文件由 Nginx 在 SPA fallback 前明确返回 `404`。Agent Host 另有只读的 `/srv/probe/agent` 发布链接，但只允许精确匹配五项发布资产，以及仅供私有 CA 预览使用的固定 `ca.pem`，不能列目录或读取其他路径。
+静态部署边界同样 fail closed：游客入口的根目录固定为 `/srv/probe/web`，管理入口固定为 `/srv/probe/admin`；入口可使用三域名或同一 IP 的固定端口。两个目录分别来自 `probe-web` 与 `probe-admin` 的独立构建/安装流程，不允许复制、软链接或 fallback 到另一套产物。`/api`、`/internal`、`/downloads`、跨入口 API 与隐藏文件由 Nginx 在 SPA fallback 前明确返回 `404`。Agent 入口另有只读的 `/srv/probe/agent` 发布链接，但只允许精确匹配五项发布资产，以及私有 CA IP 模式的固定 `ca.pem`，不能列目录或读取其他路径。
 
 ## 3. 完整 V1 路由权限矩阵
 
@@ -109,7 +109,7 @@ Agent 不提交可信 `node_id`；API 从 Token 绑定关系取得节点身份�
 | 方法 | 路由 | 条件 | 内容 |
 |---|---|---|---|
 | GET/HEAD | `/downloads/probe-agent/install.sh` | 精确路径 | 公开首次安装器 |
-| GET/HEAD | `/downloads/probe-agent/ca.pem` | 精确路径 | 仅私有 CA 预览发布的公开证书；生产通常不存在 |
+| GET/HEAD | `/downloads/probe-agent/ca.pem` | 精确路径 | 仅私有 CA IP 模式发布的公开证书；三域名模式不存在 |
 | GET/HEAD | `/downloads/probe-agent/probe-agent.service` | 精确路径 | 公开 systemd 单元 |
 | GET/HEAD | `/downloads/probe-agent/SHA256SUMS` | 精确路径 | 当前原子发布的校验清单 |
 | GET/HEAD | `/downloads/probe-agent/linux-amd64/probe-agent` | 精确路径 | Linux amd64 Agent |

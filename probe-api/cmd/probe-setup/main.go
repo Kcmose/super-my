@@ -5,8 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/netip"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -18,7 +21,13 @@ import (
 
 const (
 	defaultStateFile = "/var/lib/probe-panel/setup/state.json"
-	defaultCodeFile  = "/var/lib/probe-panel/setup/setup-code.json"
+	systemdFDStart   = uintptr(3)
+	setupFDName      = "setup-http"
+	// The worker deadline deliberately precedes both the broker and systemd
+	// 30-minute deadlines. This minute is reserved for independent rollback,
+	// durable terminal-state reconciliation, and result publication.
+	privilegedFinalizeTimeout       = 25 * time.Minute
+	privilegedFinalizeCleanupBudget = time.Minute
 )
 
 func main() {
@@ -33,27 +42,24 @@ func run(args []string, finalizer setup.Finalizer) error {
 		return errors.New("usage: probe-setup <init|serve|finalize>")
 	}
 	if args[0] == "finalize" {
-		return runPrivilegedFinalizer()
+		finalizeContext, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stopSignals()
+		return runPrivilegedFinalizer(finalizeContext)
 	}
 	files := setup.NewRootFileStore()
 	statePath := envString("PROBE_SETUP_STATE_FILE", defaultStateFile)
-	codePath := envString("PROBE_SETUP_CODE_FILE", defaultCodeFile)
 	states, err := setup.NewStateStore(files, statePath)
 	if err != nil {
 		return err
 	}
-	manager, err := setup.NewManager(states, files, codePath)
+	manager, err := setup.NewManager(states)
 	if err != nil {
 		return err
 	}
 	if args[0] == "init" {
-		code, _, err := manager.Initialize()
-		if err != nil {
+		if err := manager.Initialize(); err != nil {
 			return fmt.Errorf("initialize setup: %w", err)
 		}
-		// The installer captures this single line and displays it directly to
-		// the administrator. It is never written to a file or structured log.
-		fmt.Println(code)
 		return nil
 	}
 
@@ -64,18 +70,29 @@ func run(args []string, finalizer setup.Finalizer) error {
 		finalizer = setupipc.NewBroker()
 	}
 	logger := newLogger(envString("PROBE_SETUP_LOG_LEVEL", "info"))
+	defaults, err := setupDefaultsFromServerIP(os.Getenv("PROBE_SETUP_SERVER_IP"))
+	if err != nil {
+		return err
+	}
+	socketPath := envString("PROBE_SETUP_SOCKET_PATH", setup.DefaultSocketPath)
 	server, err := setup.NewServer(setup.ServerConfig{
-		ListenAddress: envString("PROBE_SETUP_LISTEN_ADDR", setup.DefaultListenAddress),
-		AdminRoot:     strings.TrimSpace(os.Getenv("PROBE_SETUP_ADMIN_ROOT")),
+		SocketPath: socketPath,
+		AdminRoot:  strings.TrimSpace(os.Getenv("PROBE_SETUP_ADMIN_ROOT")),
+		Defaults:   defaults,
 	}, logger, manager, finalizer)
 	if err != nil {
 		return err
 	}
+	listener, err := activatedSystemdListener()
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	errChannel := make(chan error, 1)
-	go func() { errChannel <- server.ListenAndServe() }()
-	logger.Info("setup server listening", "address", setup.DefaultListenAddress)
+	go func() { errChannel <- server.Serve(listener) }()
+	logger.Info("setup server ready", "socket", socketPath)
 	select {
 	case err := <-errChannel:
 		if errors.Is(err, setup.ErrServerClosed) {
@@ -92,27 +109,104 @@ func run(args []string, finalizer setup.Finalizer) error {
 	return nil
 }
 
-func runPrivilegedFinalizer() error {
+func activatedSystemdListener() (net.Listener, error) {
+	if err := validateSystemdActivation(os.Getpid(), os.Getenv("LISTEN_PID"), os.Getenv("LISTEN_FDS"), os.Getenv("LISTEN_FDNAMES")); err != nil {
+		return nil, err
+	}
+	for _, name := range []string{"LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES"} {
+		if err := os.Unsetenv(name); err != nil {
+			return nil, fmt.Errorf("clear systemd socket environment: %w", err)
+		}
+	}
+
+	file := os.NewFile(systemdFDStart, setupFDName)
+	if file == nil {
+		return nil, errors.New("setup systemd socket descriptor is unavailable")
+	}
+	listener, listenerErr := net.FileListener(file)
+	closeErr := file.Close()
+	if listenerErr != nil {
+		return nil, fmt.Errorf("adopt setup systemd socket: %w", listenerErr)
+	}
+	if closeErr != nil {
+		_ = listener.Close()
+		return nil, fmt.Errorf("close inherited setup socket descriptor: %w", closeErr)
+	}
+	return listener, nil
+}
+
+func validateSystemdActivation(processID int, listenPIDValue, listenFDsValue, listenFDNames string) error {
+	listenPID, err := strconv.Atoi(strings.TrimSpace(listenPIDValue))
+	if err != nil || listenPID != processID {
+		return errors.New("setup service requires a systemd socket for this process")
+	}
+	listenFDs, err := strconv.Atoi(strings.TrimSpace(listenFDsValue))
+	if err != nil || listenFDs != 1 {
+		return errors.New("setup service requires exactly one systemd socket")
+	}
+	if listenFDNames != setupFDName {
+		return errors.New("setup service received an unexpected systemd socket")
+	}
+	return nil
+}
+
+func setupDefaultsFromServerIP(value string) (*setup.SetupDefaults, error) {
+	value = strings.TrimSpace(value)
+	address, err := netip.ParseAddr(value)
+	if err != nil || value == "" || address.String() != value || address.Zone() != "" || address.Is4In6() || !address.IsGlobalUnicast() {
+		return nil, errors.New("PROBE_SETUP_SERVER_IP must be a canonical routable IPv4 or IPv6 address")
+	}
+	origin := func(port int) string {
+		return "https://" + net.JoinHostPort(address.String(), strconv.Itoa(port))
+	}
+	return &setup.SetupDefaults{
+		ServerIP: address.String(),
+		PanelURL: origin(setup.PanelHTTPSPort),
+		AgentURL: origin(setup.AgentHTTPSPort),
+		AdminURL: origin(setup.AdminHTTPSPort),
+	}, nil
+}
+
+func runPrivilegedFinalizer(parentContext context.Context) error {
+	if parentContext == nil {
+		return errors.New("privileged finalizer context is required")
+	}
+	statePath, err := fixedIPCPath("PROBE_SETUP_STATE_FILE", defaultStateFile)
+	if err != nil {
+		return err
+	}
+	states, err := setup.NewStateStore(setup.NewRootFileStore(), statePath)
+	if err != nil {
+		return err
+	}
+	// Always publish only to the reviewed root-private result path. If its
+	// environment override is invalid, this fixed fallback still lets a waiting
+	// broker observe the closed failure after recovery has been persisted.
+	resultPath := setupipc.DefaultResultPath
+	fail := func(cause error) error {
+		return publishPrivilegedFinalizerOutcome(states, resultPath, cause)
+	}
 	requestPath, err := fixedIPCPath("PROBE_SETUP_FINALIZE_REQUEST_FILE", setupipc.DefaultRequestPath)
 	if err != nil {
-		return err
+		return fail(err)
 	}
-	resultPath, err := fixedIPCPath("PROBE_SETUP_FINALIZE_RESULT_FILE", setupipc.DefaultResultPath)
+	validatedResultPath, err := fixedIPCPath("PROBE_SETUP_FINALIZE_RESULT_FILE", setupipc.DefaultResultPath)
 	if err != nil {
-		return err
+		return fail(err)
 	}
+	resultPath = validatedResultPath
 	bundleRoot, err := requiredEnvironment("PROBE_SETUP_BUNDLE_ROOT")
 	if err != nil {
-		return err
+		return fail(err)
 	}
 	releaseID, err := requiredEnvironment("PROBE_SETUP_RELEASE_ID")
 	if err != nil {
-		return err
+		return fail(err)
 	}
 
 	request, err := setupipc.ReadRequest(requestPath)
 	if err != nil {
-		return errors.New("consume privileged setup request: setup IPC is unavailable")
+		return fail(errors.New("consume privileged setup request: setup IPC is unavailable"))
 	}
 	defer request.ClearSecrets()
 
@@ -120,23 +214,84 @@ func runPrivilegedFinalizer() error {
 		BundleRoot:  bundleRoot,
 		ReleaseID:   releaseID,
 		RequireRoot: true,
+		CommitInstalled: func(now time.Time) error {
+			return states.Transition(setup.StateFinalizing, setup.StateInstalled, now.UTC())
+		},
 	})
-	result := setupipc.Result{Success: false, ErrorCode: setupipc.ErrorCodeInternal}
 	if err == nil {
-		err = finalizer.Finalize(context.Background(), request)
-		if err == nil {
-			result = setupipc.Result{Success: true}
-		}
+		return executePrivilegedFinalizer(
+			parentContext,
+			func(finalizeContext context.Context) error {
+				return finalizer.Finalize(finalizeContext, request)
+			},
+			func(finalizeErr error) error {
+				return publishPrivilegedFinalizerOutcome(states, resultPath, finalizeErr)
+			},
+		)
 	}
-	if writeErr := setupipc.WriteResult(resultPath, result); writeErr != nil {
-		return errors.New("publish privileged setup result: setup IPC is unavailable")
+	return publishPrivilegedFinalizerOutcome(states, resultPath, err)
+}
+
+func executePrivilegedFinalizer(parentContext context.Context, finalize func(context.Context) error, publish func(error) error) error {
+	finalizeContext, cancel := context.WithTimeout(parentContext, privilegedFinalizeTimeout)
+	finalizeErr := finalize(finalizeContext)
+	cancel()
+
+	// A canceled Finalize returns only after its deferred, independently timed
+	// production rollback has completed. Reconciliation and IPC publication are
+	// deliberately outside the canceled worker context so the first termination
+	// signal cannot interrupt either durable terminal outcome.
+	return publish(finalizeErr)
+}
+
+func publishPrivilegedFinalizerOutcome(states *setup.StateStore, resultPath string, finalizeErr error) error {
+	result, terminalErr := reconcilePrivilegedFinalizerState(states, finalizeErr, time.Now().UTC())
+	if result.Success {
+		// Installed is already durable; neither an IPC transport error nor a
+		// stale failure from the caller may reverse that terminal state.
+		finalizeErr = nil
 	}
-	if err != nil {
+	writeErr := setupipc.WriteResult(resultPath, result)
+	if finalizeErr != nil {
 		// Finalizer errors are intentionally constructed without submitted
 		// passwords. The HTTP process receives only the closed error code above.
-		newLogger(envString("PROBE_SETUP_LOG_LEVEL", "info")).Error("privileged setup finalization failed", "error", err)
+		newLogger(envString("PROBE_SETUP_LOG_LEVEL", "info")).Error("privileged setup finalization failed", "error", finalizeErr)
 	}
-	return nil
+	var outcomeErrors []error
+	if writeErr != nil {
+		outcomeErrors = append(outcomeErrors, errors.New("publish privileged setup result: setup IPC is unavailable"))
+	}
+	if terminalErr != nil {
+		outcomeErrors = append(outcomeErrors, errors.New("persist privileged setup terminal state"))
+	}
+	return errors.Join(outcomeErrors...)
+}
+
+func reconcilePrivilegedFinalizerState(states *setup.StateStore, finalizeErr error, now time.Time) (setupipc.Result, error) {
+	failure := setupipc.Result{Success: false, ErrorCode: setupipc.ErrorCodeInternal}
+	if states == nil {
+		return failure, errors.New("setup state store is unavailable")
+	}
+	record, err := states.Load()
+	if err != nil {
+		return failure, err
+	}
+	if record.Status == setup.StateInstalled {
+		return setupipc.Result{Success: true}, nil
+	}
+	if record.Status != setup.StateRecoveryRequired {
+		if err := states.MarkRecovery(now.UTC()); err != nil {
+			latest, loadErr := states.Load()
+			if loadErr == nil && latest.Status == setup.StateInstalled {
+				return setupipc.Result{Success: true}, nil
+			}
+			return failure, err
+		}
+	}
+	if finalizeErr == nil {
+		return failure, errors.New("privileged finalizer returned without an installed commit")
+	}
+	return failure, nil
 }
 
 func fixedIPCPath(name, expected string) (string, error) {

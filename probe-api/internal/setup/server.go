@@ -1,6 +1,7 @@
 package setup
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -19,20 +20,32 @@ import (
 )
 
 const (
-	DefaultListenAddress = "127.0.0.1:18080"
+	DefaultSocketPath    = "/run/probe-panel-setup/setup.sock"
+	DefaultBrowserHost   = "127.0.0.1:18080"
+	DefaultBrowserOrigin = "http://127.0.0.1:18080"
 	DefaultMaxBodyBytes  = int64(64 * 1024)
 )
 
 var ErrServerClosed = http.ErrServerClosed
 
 type ServerConfig struct {
-	ListenAddress          string
+	SocketPath             string
 	AdminRoot              string
+	Defaults               *SetupDefaults
 	MaxBodyBytes           int64
 	SessionLimit           int
 	SessionWindow          time.Duration
 	FinalizeTimeout        time.Duration
 	InstalledShutdownDelay time.Duration
+	privateCALoader        privateCALoader
+	installedAccessLoader  installedAccessLoader
+}
+
+type SetupDefaults struct {
+	ServerIP string `json:"server_ip"`
+	PanelURL string `json:"panel_url"`
+	AgentURL string `json:"agent_url"`
+	AdminURL string `json:"admin_url"`
 }
 
 type Server struct {
@@ -47,15 +60,26 @@ type Server struct {
 	wg                     sync.WaitGroup
 	installedMu            sync.RWMutex
 	installedAdminURL      string
+	installedPrivateCA     *setupPrivateCAMetadata
+	installedHandoffReady  bool
+	installedHandoffFailed bool
+	terminalShutdownOnce   sync.Once
+	privateCALoader        privateCALoader
+	installedAccessLoader  installedAccessLoader
 	installedShutdownDelay time.Duration
+	socketPath             string
+	defaults               *SetupDefaults
 }
 
 func NewServer(config ServerConfig, logger *slog.Logger, manager *Manager, finalizer Finalizer) (*Server, error) {
-	if config.ListenAddress == "" {
-		config.ListenAddress = DefaultListenAddress
+	if config.SocketPath == "" {
+		config.SocketPath = DefaultSocketPath
 	}
-	if config.ListenAddress != DefaultListenAddress {
-		return nil, errors.New("setup server must listen on 127.0.0.1:18080")
+	if config.SocketPath != DefaultSocketPath {
+		return nil, errors.New("setup server must use the fixed private Unix socket")
+	}
+	if config.Defaults == nil || strings.TrimSpace(config.Defaults.ServerIP) == "" || strings.TrimSpace(config.Defaults.PanelURL) == "" || strings.TrimSpace(config.Defaults.AgentURL) == "" || strings.TrimSpace(config.Defaults.AdminURL) == "" {
+		return nil, errors.New("setup network defaults are required")
 	}
 	if config.MaxBodyBytes == 0 {
 		config.MaxBodyBytes = DefaultMaxBodyBytes
@@ -73,9 +97,9 @@ func NewServer(config ServerConfig, logger *slog.Logger, manager *Manager, final
 		config.FinalizeTimeout = 35 * time.Minute
 	}
 	if config.InstalledShutdownDelay == 0 {
-		config.InstalledShutdownDelay = 15 * time.Second
+		config.InstalledShutdownDelay = 25 * time.Second
 	}
-	if config.SessionLimit < 1 || config.SessionLimit > 100 || config.SessionWindow < time.Second || config.SessionWindow > time.Hour || config.FinalizeTimeout < time.Minute || config.FinalizeTimeout > time.Hour || config.InstalledShutdownDelay < time.Second || config.InstalledShutdownDelay > time.Minute {
+	if config.SessionLimit < 1 || config.SessionLimit > 100 || config.SessionWindow < time.Second || config.SessionWindow > time.Hour || config.FinalizeTimeout < time.Minute || config.FinalizeTimeout > time.Hour || config.InstalledShutdownDelay < 25*time.Second || config.InstalledShutdownDelay > time.Minute {
 		return nil, errors.New("setup server limits are invalid")
 	}
 	if manager == nil || finalizer == nil {
@@ -83,6 +107,12 @@ func NewServer(config ServerConfig, logger *slog.Logger, manager *Manager, final
 	}
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	if config.privateCALoader == nil {
+		config.privateCALoader = loadPrivateCA
+	}
+	if config.installedAccessLoader == nil {
+		config.installedAccessLoader = loadInstalledAccess
 	}
 	root, err := validateStaticRoot(config.AdminRoot)
 	if err != nil {
@@ -93,23 +123,38 @@ func NewServer(config ServerConfig, logger *slog.Logger, manager *Manager, final
 		manager: manager, finalizer: finalizer, logger: logger,
 		limiter: newFixedWindowLimiter(config.SessionLimit, config.SessionWindow, manager.now),
 		ctx:     ctx, cancel: cancel, installedShutdownDelay: config.InstalledShutdownDelay,
+		socketPath: config.SocketPath, defaults: cloneSetupDefaults(config.Defaults),
+		privateCALoader:       config.privateCALoader,
+		installedAccessLoader: config.installedAccessLoader,
 	}
 	server.handler = server.securityMiddleware(server.routes(root, config.MaxBodyBytes, config.FinalizeTimeout))
 	server.httpServer = &http.Server{
-		Addr:              config.ListenAddress,
 		Handler:           server.handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,
 		IdleTimeout:       30 * time.Second,
 		ErrorLog:          log.New(io.Discard, "", 0),
+		ConnContext: func(ctx context.Context, connection net.Conn) context.Context {
+			if authorizedRootUnixConnection(connection, config.SocketPath) {
+				return context.WithValue(ctx, setupTransportContextKey{}, true)
+			}
+			return ctx
+		},
 	}
 	return server, nil
 }
 
 func (server *Server) Handler() http.Handler { return server.handler }
 
-func (server *Server) ListenAndServe() error { return server.httpServer.ListenAndServe() }
+func (server *Server) Serve(listener net.Listener) error {
+	if err := validateActivatedUnixListener(listener, server.socketPath); err != nil {
+		return err
+	}
+	server.wg.Add(1)
+	go server.watchTerminalState()
+	return server.httpServer.Serve(listener)
+}
 
 func (server *Server) Shutdown(ctx context.Context) error {
 	server.cancel()
@@ -175,10 +220,22 @@ func (server *Server) status(writer http.ResponseWriter) {
 		httpError(writer, http.StatusServiceUnavailable, "setup_state_unavailable", "setup state is unavailable")
 		return
 	}
-	response := map[string]any{"status": status}
+	response := map[string]any{"status": status, "defaults": server.defaults}
+	if status == StateInstalled {
+		server.ensureInstalledHandoff()
+		server.scheduleTerminalShutdown()
+	} else if status == StateRecoveryRequired {
+		server.scheduleTerminalShutdown()
+	}
 	server.installedMu.RLock()
 	if status == StateInstalled && server.installedAdminURL != "" {
 		response["admin_url"] = server.installedAdminURL
+	}
+	if status == StateInstalled && server.installedPrivateCA != nil {
+		response["private_ca"] = *server.installedPrivateCA
+	}
+	if status == StateInstalled && server.installedHandoffFailed {
+		response["handoff_unavailable"] = true
 	}
 	server.installedMu.RUnlock()
 	writeJSON(writer, http.StatusOK, response)
@@ -188,7 +245,7 @@ func (server *Server) session(writer http.ResponseWriter, request *http.Request,
 	allowed, retryAfter := server.limiter.Allow()
 	if !allowed {
 		writer.Header().Set("Retry-After", strconv.Itoa(max(1, int(retryAfter.Seconds()))))
-		httpError(writer, http.StatusTooManyRequests, "rate_limited", "too many setup code attempts")
+		httpError(writer, http.StatusTooManyRequests, "rate_limited", "too many setup session requests")
 		return
 	}
 	body, status, err := readJSONBody(writer, request, maxBody)
@@ -196,26 +253,29 @@ func (server *Server) session(writer http.ResponseWriter, request *http.Request,
 		httpError(writer, status, "invalid_request", err.Error())
 		return
 	}
-	decoded, err := DecodeSessionRequest(body)
+	err = decodeEmptyObject(body)
 	clear(body)
 	if err != nil {
 		httpError(writer, http.StatusBadRequest, "invalid_request", "setup session request is invalid")
 		return
 	}
-	credentials, err := server.manager.ExchangeCode(decoded.SetupCode)
-	decoded.SetupCode = ""
+	credentials, err := server.manager.CreateSession()
 	if err != nil {
-		status := http.StatusUnauthorized
-		code := "invalid_setup_code"
-		if !errors.Is(err, ErrInvalidCode) {
-			status = http.StatusConflict
-			code = "setup_state_conflict"
+		if errors.Is(err, ErrStateConflict) {
+			httpError(writer, http.StatusConflict, "setup_state_conflict", "setup session cannot be created in the current state")
+			return
 		}
-		httpError(writer, status, code, "setup session cannot be created")
+		httpError(writer, http.StatusServiceUnavailable, "setup_session_unavailable", "setup session is unavailable")
 		return
 	}
 	writer.Header().Set("Cache-Control", "no-store")
-	writeJSON(writer, http.StatusOK, credentials)
+	response := map[string]any{
+		"session_token": credentials.SessionToken,
+		"csrf_token":    credentials.CSRFToken,
+		"expires_at":    credentials.ExpiresAt,
+		"defaults":      server.defaults,
+	}
+	writeJSON(writer, http.StatusOK, response)
 }
 
 func (server *Server) complete(writer http.ResponseWriter, request *http.Request, maxBody int64, finalizeTimeout time.Duration) {
@@ -267,38 +327,105 @@ func (server *Server) runFinalizer(request CompleteRequest, timeout time.Duratio
 	defer cancel()
 	err := server.finalizer.Finalize(ctx, request)
 	if finishErr := server.manager.FinishFinalization(err == nil); finishErr != nil {
-		server.logger.Error("setup finalization state update failed")
-		return
+		if errors.Is(finishErr, ErrFinalizationPending) {
+			server.logger.Warn("privileged setup finalization outcome is still pending")
+		} else {
+			server.logger.Error("setup finalization state update failed")
+		}
 	}
-	if err != nil {
+	state, stateErr := server.manager.Status()
+	if stateErr != nil {
+		server.logger.Error("setup terminal state is unavailable")
+	} else if state == StateInstalled {
+		// The root-owned persistent commit is authoritative even if the IPC
+		// success result was lost, malformed, or could not be cleaned up.
+		server.ensureInstalledHandoff()
+		server.logger.Info("setup finalization completed")
+		server.scheduleTerminalShutdown()
+	} else if state == StateRecoveryRequired {
 		server.logger.Error("setup finalization failed")
-		return
+		server.scheduleTerminalShutdown()
+	} else {
+		server.logger.Warn("setup finalization is awaiting the privileged worker outcome")
 	}
-	server.installedMu.Lock()
-	server.installedAdminURL = "https://" + request.Domains.Admin + "/login"
-	server.installedMu.Unlock()
-	server.logger.Info("setup finalization completed")
-	server.scheduleInstalledShutdown()
 }
 
-func (server *Server) scheduleInstalledShutdown() {
-	go func() {
-		timer := time.NewTimer(server.installedShutdownDelay)
-		defer timer.Stop()
-		select {
-		case <-timer.C:
-		case <-server.ctx.Done():
+func (server *Server) watchTerminalState() {
+	defer server.wg.Done()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		state, err := server.manager.Status()
+		if err == nil && (state == StateInstalled || state == StateRecoveryRequired) {
+			if state == StateInstalled {
+				server.ensureInstalledHandoff()
+			}
+			server.scheduleTerminalShutdown()
 			return
 		}
-		shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = server.httpServer.Shutdown(shutdownContext)
-	}()
+		select {
+		case <-server.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (server *Server) ensureInstalledHandoff() {
+	server.installedMu.RLock()
+	ready := server.installedHandoffReady
+	server.installedMu.RUnlock()
+	if ready {
+		return
+	}
+
+	access, err := server.installedAccessLoader(DefaultAPIEnvironmentPath)
+	var privateCA *setupPrivateCAMetadata
+	if err == nil && access.Mode == IngressModeIP {
+		metadata, loadErr := server.privateCALoader(DefaultPrivateCACertificatePath)
+		if loadErr != nil || !validPrivateCAMetadata(metadata) {
+			metadata = setupPrivateCAMetadata{Available: false}
+			server.logger.Warn("private CA browser handoff is unavailable")
+		}
+		privateCA = &metadata
+	}
+
+	server.installedMu.Lock()
+	defer server.installedMu.Unlock()
+	if server.installedHandoffReady {
+		return
+	}
+	server.installedHandoffReady = true
+	if err != nil {
+		server.installedHandoffFailed = true
+		server.logger.Warn("installed setup handoff metadata is unavailable")
+		return
+	}
+	server.installedAdminURL = access.AdminURL
+	server.installedPrivateCA = privateCA
+}
+
+func (server *Server) scheduleTerminalShutdown() {
+	server.terminalShutdownOnce.Do(func() {
+		go func() {
+			timer := time.NewTimer(server.installedShutdownDelay)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+			case <-server.ctx.Done():
+				return
+			}
+			server.cancel()
+			shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_ = server.httpServer.Shutdown(shutdownContext)
+		}()
+	})
 }
 
 func (server *Server) securityMiddleware(next http.Handler) http.Handler {
-	allowedHosts := map[string]struct{}{"127.0.0.1:18080": {}, "localhost:18080": {}}
-	allowedOrigins := map[string]struct{}{"http://127.0.0.1:18080": {}, "http://localhost:18080": {}}
+	allowedHosts := map[string]struct{}{DefaultBrowserHost: {}, "localhost:18080": {}}
+	allowedOrigins := map[string]struct{}{DefaultBrowserOrigin: {}, "http://localhost:18080": {}}
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		headers := writer.Header()
 		headers.Set("Cache-Control", "no-store")
@@ -311,7 +438,7 @@ func (server *Server) securityMiddleware(next http.Handler) http.Handler {
 			httpError(writer, http.StatusForbidden, "forbidden_host", "request host is forbidden")
 			return
 		}
-		if !loopbackPeer(request.RemoteAddr) {
+		if authorized, _ := request.Context().Value(setupTransportContextKey{}).(bool); !authorized {
 			httpError(writer, http.StatusForbidden, "forbidden_peer", "request peer is forbidden")
 			return
 		}
@@ -382,13 +509,34 @@ func setupSessionToken(header string) (string, bool) {
 	return token, len(token) == 64 && strings.Trim(token, "0123456789abcdef") == ""
 }
 
-func loopbackPeer(remoteAddress string) bool {
-	host, _, err := net.SplitHostPort(remoteAddress)
-	if err != nil {
-		return false
+type setupTransportContextKey struct{}
+
+func authorizeSetupTestRequest(request *http.Request) *http.Request {
+	return request.WithContext(context.WithValue(request.Context(), setupTransportContextKey{}, true))
+}
+
+func decodeEmptyObject(body []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('{') || decoder.More() {
+		return errors.New("request body must be an empty JSON object")
 	}
-	address := net.ParseIP(host)
-	return address != nil && address.IsLoopback()
+	closing, err := decoder.Token()
+	if err != nil || closing != json.Delim('}') {
+		return errors.New("request body must be an empty JSON object")
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return errors.New("request body must contain one JSON object")
+	}
+	return nil
+}
+
+func cloneSetupDefaults(defaults *SetupDefaults) *SetupDefaults {
+	if defaults == nil {
+		return nil
+	}
+	clone := *defaults
+	return &clone
 }
 
 func writeJSON(writer http.ResponseWriter, status int, value any) {

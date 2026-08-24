@@ -1,6 +1,6 @@
-# V1 最终架构与边界（冻结）
+# V1 最终架构与边界（v1.1 入口修订）
 
-状态：阶段 0 冻结稿
+状态：阶段 0 冻结稿；v1.0 原三域名入口在 v1.1 扩展为下述 `domain`/`ip` 二选一模式，本文以 v1.1 当前契约为准。
 
 适用范围：`probe-agent/`、`probe-api/`、`probe-web/`、`probe-admin/` 及其部署配置
 
@@ -10,28 +10,30 @@ V1 由六个独立部分组成：
 
 - `probe-agent`：Go 编写的 Linux 探针，只主动拉取配置和上报数据。
 - `probe-api`：Go `net/http` API，负责认证、授权、数据写入、查询、聚合、清理和审计。
-- `probe-web`：Vue/Vite 游客面板，仅通过 `panel.example.com` 的同源只读 API 访问后端。
-- `probe-admin`：Vue/Vite 管理面板，仅通过 `admin.example.com` 的同源认证、管理和所需只读 API 访问后端。
+- `probe-web`：Vue/Vite 游客面板，仅通过游客逻辑入口（域名模式 `panel.example.com`，IP 模式 `IP:18453`）的同源只读 API 访问后端。
+- `probe-admin`：Vue/Vite 管理面板，仅通过管理逻辑入口（域名模式 `admin.example.com`，IP 模式 `IP:18455`）的同源认证、管理和所需只读 API 访问后端。
 - PostgreSQL：唯一持久化数据库。
 - Nginx：唯一公网入口，负责 TLS、管理入口 IP/CIDR 白名单、反向代理、静态文件和基础限流。
 
-两个浏览器入口都固定为同源模式且互不共享静态产物。匿名游客访问 `https://panel.example.com`，该 Host 只提供 `probe-web` 和 `/api/v1/panel/*`；管理员访问 `https://admin.example.com`，该 Host 只提供 `probe-admin`、`/api/v1/auth/*`、`/api/v1/admin/*`，并可按管理页面需要代理只读 `/api/v1/panel/*`。两者本轮都必须通过同一严格 IP/CIDR 白名单；游客匿名不代表公网开放。`api.example.com` 只暴露 Agent API 和默认关闭的可选 public API。任一前端都不跨域调用另一个浏览器 Host 或 `api.example.com`。
+两个浏览器入口都固定为同源模式且互不共享静态产物。`PROBE_INGRESS_MODE=domain` 使用三个公信 HTTPS Host 和 80/443；`PROBE_INGRESS_MODE=ip` 使用同一规范 IP 的三个固定 HTTPS 端口：游客 18453、Agent 18454、管理 18455，并使用含该 IP SAN 的固定私有 CA 证书。两种模式只能选一个，都是生产契约，不得混用监听、Origin、Nginx 模板或 TLS 材料。
+
+匿名游客通过游客入口只获得 `probe-web` 和 `/api/v1/panel/*`；管理员通过管理入口只获得 `probe-admin`、`/api/v1/auth/*`、`/api/v1/admin/*` 以及管理页面所需的只读 `/api/v1/panel/*`。两者都必须通过同一严格 IP/CIDR 白名单；游客匿名不代表公网开放。Agent 入口只暴露 Agent API、固定下载资产和默认关闭的可选 public API。任一前端都不跨入口调用其他逻辑入口。
 
 ```mermaid
 flowchart TB
-    V["白名单内匿名游客"] -->|"HTTPS：panel.example.com"| NP["Nginx：panel 虚拟主机\nIP/CIDR 白名单"]
+    V["白名单内匿名游客"] -->|"HTTPS：panel.example.com 或 IP:18453"| NP["Nginx：游客逻辑入口\nIP/CIDR 白名单"]
     NP -->|"独立静态根"| W["probe-web\n独立构建产物"]
     NP -->|"仅匿名只读 /api/v1/panel/*"| A["probe-api\n127.0.0.1:8080"]
 
-    B["白名单内管理员"] -->|"HTTPS：admin.example.com"| NA["Nginx：admin 虚拟主机\nIP/CIDR 白名单"]
+    B["白名单内管理员"] -->|"HTTPS：admin.example.com 或 IP:18455"| NA["Nginx：管理逻辑入口\nIP/CIDR 白名单"]
     NA -->|"独立静态根"| M["probe-admin\n独立构建产物"]
     NA -->|"/api/v1/auth/*、admin/*\n及管理页所需 panel/*"| A
 
-    G["任意网络位置的 probe-agent\n不监听端口"] -->|"HTTPS 主动请求\napi.example.com/api/v1/agent/*"| NG["Nginx：api 虚拟主机\nAgent 限流，不套管理白名单"]
+    G["任意网络位置的 probe-agent\n不监听端口"] -->|"HTTPS 主动请求\napi.example.com 或 IP:18454"| NG["Nginx：Agent 逻辑入口\nAgent 限流，不套管理白名单"]
     NG -->|"Bearer Agent Token"| A
 
     P["可选公共只读客户端"] -.->|"独立 API Key；默认关闭"| NG
-    A -->|"pgx / 私有连接"| D[("PostgreSQL")]
+    A -->|"pgx / 本机 loopback"| D[("PostgreSQL")]
 
     A -. "禁止反连" .-> G
 ```
@@ -87,24 +89,26 @@ mianban/
 
 | 发起方 | 目标 | 允许的协议 | 是否允许 | 说明 |
 |---|---|---|---:|---|
-| 游客浏览器 | `panel.example.com` | HTTPS | 是 | 必须先通过 Nginx IP/CIDR 白名单，只加载 `probe-web` |
+| 游客浏览器 | 游客入口：`panel.example.com` 或 `IP:18453` | HTTPS | 是 | 必须先通过 Nginx IP/CIDR 白名单，只加载 `probe-web` |
 | `probe-web` | 同源 `/api/v1/panel/*` | HTTPS JSON | 是 | 白名单内匿名只读，无游客账号或 Session |
 | `probe-web` | `/api/v1/auth/*`、`/api/v1/admin/*` | 任意 | 否 | panel Host 不暴露，返回 `404` |
-| 管理员浏览器 | `admin.example.com` | HTTPS | 是 | 必须先通过 Nginx IP/CIDR 白名单，只加载 `probe-admin` |
+| 管理员浏览器 | 管理入口：`admin.example.com` 或 `IP:18455` | HTTPS | 是 | 必须先通过 Nginx IP/CIDR 白名单，只加载 `probe-admin` |
 | `probe-admin` | 同源 `/api/v1/auth/*`、`/api/v1/admin/*` | HTTPS JSON | 是 | Session、`admin` 角色和写请求 CSRF 由 API 校验 |
 | `probe-admin` | 同源 `/api/v1/panel/*` | HTTPS JSON | 是 | 仅复用管理页面所需的只读面板数据 |
 | `probe-web`、`probe-admin` | PostgreSQL | 任意 | 否 | 前端不能访问数据库 |
-| Agent | `api.example.com/api/v1/agent/*` | HTTPS JSON，可 gzip | 是 | Agent 主动发起，Bearer Agent Token |
-| 目标机管理员 | `api.example.com/downloads/probe-agent/*` | HTTPS GET/HEAD | 是 | 只下载发布时固定的公开首次安装资产，不携带节点令牌 |
+| Agent | Agent 入口的 `/api/v1/agent/*` | HTTPS JSON，可 gzip | 是 | 域名模式为 `api.example.com`，IP 模式为 `IP:18454`；Agent 主动发起，Bearer Agent Token |
+| 目标机管理员 | Agent 入口的 `/downloads/probe-agent/*` | HTTPS GET/HEAD | 是 | 只下载发布时固定的公开首次安装资产，不携带节点令牌；IP 模式另有固定公开 `ca.pem` |
 | API/Nginx | Agent | 任意入站连接 | 否 | 服务端不得反连 Agent |
-| API | PostgreSQL | pgx/PostgreSQL | 是 | 仅本机或私有网络 |
-| 公网 | API `:8080` | HTTP | 否 | API 仅监听回环地址或容器私网 |
+| API | PostgreSQL | pgx/PostgreSQL | 是 | V1 仅本机 loopback；`5432` 不允许监听内网或公网地址 |
+| 公网 | API `:8080` | HTTP | 否 | API 固定只监听 `127.0.0.1:8080` |
 | 公网 | PostgreSQL `:5432` | PostgreSQL | 否 | 不对公网开放 |
 | 公网 | Agent | 任意入站连接 | 否 | Agent 不监听任何端口 |
 
-## 4. Nginx 主机与路由边界
+## 4. Nginx 入口与路由边界
 
-### `panel.example.com`
+下列三节表达逻辑入口。域名模式分别映射到 `panel.example.com`、`admin.example.com`、`api.example.com`，使用公信证书和 TCP 80/443；IP 模式分别映射到同一 IP 的 TCP 18453、18455、18454，使用固定私有 CA 签发的 IP SAN 证书。两种模式的路由权限不变。IP 模式中 Cookie 不按端口隔离，因此游客和 Agent 入口还必须清空上游 `Cookie` 并隐藏 `Set-Cookie`。
+
+### 游客逻辑入口（`panel.example.com` 或 `IP:18453`）
 
 - `/*`：白名单通过后只提供 `/srv/probe/web` 中的 `probe-web` 构建产物及其 SPA fallback。
 - `/api/v1/panel/*`：白名单通过后匿名只读，不要求账号、密码或 Session。
@@ -112,7 +116,7 @@ mianban/
 - `/login`、`/login/*`、`/admin`、`/admin/*`：在 SPA fallback 前返回 `404`，避免把管理端浏览器路由伪装成游客页面。
 - `/downloads`、`/downloads/*`：在 SPA fallback 前返回 `404`，Agent 安装文件不能从游客入口取得。
 
-### `admin.example.com`
+### 管理逻辑入口（`admin.example.com` 或 `IP:18455`）
 
 - `/*`：白名单通过后只提供 `/srv/probe/admin` 中的 `probe-admin` 构建产物及其 SPA fallback。
 - `/api/v1/auth/*`、`/api/v1/admin/*`：白名单通过后同源反代到 API；登录和管理身份仅限管理员。
@@ -121,15 +125,15 @@ mianban/
 - `/overview`、`/overview/*`、`/nodes`、`/nodes/*`、`/probes`、`/probes/*`：在 SPA fallback 前返回 `404`，不承载游客端浏览器路由。
 - `/downloads`、`/downloads/*`：在 SPA fallback 前返回 `404`，管理 Host 不兼任 Agent 文件站点。
 
-### `api.example.com`
+### Agent 逻辑入口（`api.example.com` 或 `IP:18454`）
 
 - `/api/v1/agent/*`：不使用管理 IP 白名单；由一次性注册令牌或 Agent Token 认证，并单独限流。
-- `/downloads/probe-agent/*`：只允许发布器生成的 `install.sh`、`probe-agent.service`、`SHA256SUMS`、`linux-amd64/probe-agent`、`linux-arm64/probe-agent`，以及私有 CA 预览可选的公开 `ca.pem`；仅 GET/HEAD，不含节点秘密、目录列表或任意文件读取。
+- `/downloads/probe-agent/*`：只允许发布器生成的 `install.sh`、`probe-agent.service`、`SHA256SUMS`、`linux-amd64/probe-agent`、`linux-arm64/probe-agent`，以及私有 CA IP 模式的公开 `ca.pem`；仅 GET/HEAD，不含节点秘密、目录列表或任意文件读取。
 - `/api/v1/public/*`：默认返回 `404`；显式开启后只允许冻结的 GET/HEAD 路由并校验独立 API Key。
 - `/api/v1/auth/*`、`/api/v1/panel/*`、`/api/v1/admin/*`：不在该主机暴露，返回 `404`，避免形成第二套管理入口。
 - `/internal/*`：公网虚拟主机不暴露。
 
-HTTP 只用于将三个已知主机名重定向到各自 HTTPS Host；生产公网只开放 80/443。未知 Host、未知 API 路径和跨 Host 路由全部 fail closed。SPA fallback 仅处理非 API 客户端路由，不能吞掉 `/api` 或 `/internal`。
+域名模式的 HTTP 只用于将三个已知主机名重定向到各自 HTTPS Host，对外只开放 80/443。IP 模式没有 HTTP 重定向或 80/443 监听，对外只开放 18453/18454/18455，三个端口均为 HTTPS。未知 Host、未知 API 路径和跨入口路由全部 fail closed。SPA fallback 仅处理非 API 客户端路由，不能吞掉 `/api` 或 `/internal`。
 
 ## 5. 信任边界
 
@@ -152,7 +156,7 @@ HTTP 只用于将三个已知主机名重定向到各自 HTTPS Host；生产公�
 ### Agent 注册与运行
 
 1. 管理员新建已启用节点后，管理 API 创建 15 分钟有效的一次性注册令牌，并只在当次响应中返回包含该令牌的首次安装命令；新命令原子废止同节点此前未使用的命令。禁用节点不签发，已注册节点重新生成前必须确认重装影响。
-2. 管理员在目标机可使用 `sudo` 的 Shell 主动执行命令。命令禁用用户 curl 配置，从已发布、`immutable=true` 且由当前源码明确允许的 GitHub Raw `refs/tags/v1.0.1` 版本读取安装器；Shell 完整解析最终入口后安装器才产生副作用。命令以 `-e` 传入 Agent Origin、以 `-t` 传入 15 分钟一次性令牌；私有 CA 预览另传证书 SHA-256，并在发送令牌前校验固定 `ca.pem`。这不是服务端反连或远程下发。
+2. 管理员在目标机可使用 `sudo` 的 Shell 主动执行命令。命令禁用用户 curl 配置，从已发布、`immutable=true` 且由当前源码明确允许的 GitHub Raw `refs/tags/v1.0.1` 版本读取安装器；Shell 完整解析最终入口后安装器才产生副作用。命令以 `-e` 传入 Agent Origin、以 `-t` 传入 15 分钟一次性令牌；IP 生产模式另传固定 `ca.pem` 完整文件的 SHA-256，并在发送令牌前下载和校验该 CA。域名模式使用系统公信根，不携带私有 CA 参数。这不是服务端反连或远程下发。
 3. Agent 主动调用 `POST /api/v1/agent/enroll`，服务端按节点串行、原子消费当前令牌，废止该节点其余安装命令并吊销旧 Agent Token，再一次性返回新设备 Token；安装器将其落入 `0600` 状态文件后从环境文件删除注册令牌。
 4. Agent 使用状态文件中的设备 Token，周期性主动调用 `GET /api/v1/agent/config`。
 5. Agent 在内存中保留最多 5 分钟的待上报数据，调用 `POST /api/v1/agent/report` 批量上报；失败时指数退避，最长 60 秒。
@@ -160,9 +164,9 @@ HTTP 只用于将三个已知主机名重定向到各自 HTTPS Host；生产公�
 
 ### 匿名面板查询与管理员修改
 
-1. 白名单内游客浏览器从 `panel.example.com` 加载 `probe-web`；游客无需登录即可匿名读取同源 `/panel/*`。
+1. 白名单内游客浏览器从游客入口（域名模式 `panel.example.com`，IP 模式 `IP:18453`）加载 `probe-web`；游客无需登录即可匿名读取同源 `/panel/*`。
 2. 游客不是数据库用户，没有用户名、密码、角色、Cookie 或 Session；匿名访问仍受 Nginx 与 Go API 两层 IP/CIDR 白名单保护。
-3. 只有管理员拥有账户。管理员从 `admin.example.com` 加载独立 `probe-admin`，通过同源 `/auth/login` 登录后，API 创建服务端 Session；数据库只保存 Session Token 哈希。
+3. 只有管理员拥有账户。管理员从管理入口（域名模式 `admin.example.com`，IP 模式 `IP:18455`）加载独立 `probe-admin`，通过同源 `/auth/login` 登录后，API 创建服务端 Session；数据库只保存 Session Token 哈希。
 4. 修改和管理查询经同源 `/admin/*`，必须是 `admin`，写请求还必须通过 CSRF 与审计要求；管理页面所需状态只读调用同源 `/panel/*`。
 
 ### 聚合与清理
@@ -208,7 +212,7 @@ V1 不引入 Redis、消息队列、ClickHouse、TimescaleDB、独立任务队�
 
 ## 9. 架构验收不变量
 
-- 关闭 Nginx 的 80/443 后，公网无法直接访问 API、数据库或 Agent。
+- Nginx 只监听当前模式的入口端口：`domain` 为 80/443，`ip` 为 18453/18454/18455；关闭当前这组入口后，外部无法直接访问面板或 Agent API。API 8080 与 PostgreSQL 5432 始终只在 loopback。
 - 非白名单来源无法从 panel 或 admin Host 取得 HTML、JS、CSS，也无法调用 `/panel/*`、`/auth/*` 或 `/admin/*`。
 - 非白名单来源可到达 Agent API，但缺少有效 Agent 凭据时必须失败。
 - 伪造 `X-Forwarded-For`、`X-Real-IP` 等请求头不能改变白名单判定结果。
@@ -217,6 +221,6 @@ V1 不引入 Redis、消息队列、ClickHouse、TimescaleDB、独立任务队�
 - panel Host 的 auth/admin/agent/public 与 admin Host 的 agent/public 均返回 `404`；api Host 的 auth/panel/admin 也返回 `404`。
 - panel/admin Host 的 `/downloads/*` 返回 `404`；Agent Host 只有五项固定发布资产和可选公开 `ca.pem` 可 GET/HEAD，未知文件和写请求失败。
 - panel Host 的登录/管理浏览器路由与 admin Host 的游客浏览器路由均在 SPA fallback 前返回 `404`。
-- `panel.example.com` 不能读取 `probe-admin` 静态根，`admin.example.com` 不能读取 `probe-web` 静态根；同名哨兵文件验证不会串站。
+- 无论是域名 Host 还是 IP 固定端口，游客入口都不能读取 `probe-admin` 静态根，管理入口都不能读取 `probe-web` 静态根；同名哨兵文件验证不会串站。
 - Agent 二进制没有监听端口，服务端没有通向 Agent 的连接代码。
 - 四套工程可独立构建，任意一个构建过程不读取其他工程的源码或产物。

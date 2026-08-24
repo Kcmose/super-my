@@ -24,29 +24,44 @@ bash -n "$BUILDER"
 sh -n "$0"
 
 help_output=$(bash "$BUILDER" --help)
-for option in --admin-root --web-root --agent-root --output-dir --version; do
+for option in --output-dir --version; do
     printf '%s\n' "$help_output" | grep -Fq -- "$option" || fail "help is missing $option"
 done
 printf '%s\n' "$help_output" | grep -Fq 'without uploading anything' ||
     fail 'help must state that the builder never uploads'
+printf '%s\n' "$help_output" | grep -Fq 'Sources are fixed to the Kcmose/super-my repository' ||
+    fail 'help must state that source repositories are fixed'
 
 if bash "$BUILDER" --unknown-option >/dev/null 2>&1; then
     fail 'builder accepted an unknown option'
 fi
-if bash "$BUILDER" --admin-root >/dev/null 2>&1; then
-    fail 'builder accepted a missing option value'
-fi
 if bash "$BUILDER" --version v1.0.1 >/dev/null 2>&1; then
     fail 'builder accepted an unreviewed server version'
 fi
+for option in --admin-root --web-root --agent-root; do
+    if bash "$BUILDER" "$option" /tmp/untrusted-source >/dev/null 2>&1; then
+        fail "builder accepted forbidden source override: $option"
+    fi
+done
 
 # These are literal source-code contracts and must not expand in this process.
 # shellcheck disable=SC2016
 for contract in \
     'release bundles must be built on Debian 13' \
-    'VERSION="v1.0.0"' \
+    'VERSION="v1.1.0"' \
+    'SUPER_MY_REF="refs/tags/v1.1.0"' \
     'WEB_REF="refs/tags/v1.0.0"' \
     'AGENT_REF="refs/tags/v1.0.1"' \
+    'SUPER_MY_REMOTE="https://github.com/Kcmose/super-my.git"' \
+    'WEB_REMOTE="https://github.com/Kcmose/my.git"' \
+    'AGENT_REMOTE="https://github.com/Kcmose/my-agent.git"' \
+    'readonly ADMIN_ROOT WEB_ROOT AGENT_ROOT' \
+    'validate_fixed_repository_sources' \
+    'git -C "$root" status --porcelain=v1 --untracked-files=all' \
+    'git -C "$root" rev-parse --verify "${ref}^{commit}"' \
+    'git ls-remote --exit-code "$expected_remote" "$ref" "${ref}^{}"' \
+    'remote tag object does not exactly equal the pinned local tag' \
+    'remote tag does not exactly equal HEAD' \
     'npm test' \
     'npm audit --omit=dev --audit-level=high' \
     'npm run build' \
@@ -62,6 +77,12 @@ for contract in \
     'artifacts/migrations' \
     'source/probe-api/config' \
     'source/probe-api/deploy' \
+    'config/probe-postgres-backup.env.example' \
+    'deploy/scripts/install-release.sh deploy/scripts/backup-postgres.sh' \
+    'deploy/scripts/restore-postgres.sh' \
+    'deploy/systemd/probe-api.service deploy/systemd/probe-postgres-backup.service' \
+    'deploy/systemd/probe-postgres-backup.timer' \
+    'deploy/nginx/nginx.conf deploy/nginx/nginx-ip.conf' \
     '$bundle_root/source/probe-api/deploy/scripts/install-release.sh' \
     'RELEASE-MANIFEST' \
     'BUNDLE-SHA256SUMS' \
@@ -77,6 +98,16 @@ for contract in \
     assert_contains "$contract" "$BUILDER"
 done
 
+proof_line=$(grep -n '^[[:space:]]*validate_fixed_repository_sources[[:space:]]*$' "$BUILDER" | tail -n 1 | cut -d: -f1)
+# This grep pattern matches a literal source invocation, including its variable syntax.
+# shellcheck disable=SC2016
+assemble_line=$(grep -n '^[[:space:]]*assemble_bundle "$architecture"' "$BUILDER" | tail -n 1 | cut -d: -f1)
+if [ -z "$proof_line" ] ||
+    [ -z "$assemble_line" ] ||
+    [ "$proof_line" -ge "$assemble_line" ]; then
+    fail 'all fixed repositories must be proven before a bundle manifest can be assembled'
+fi
+
 if grep -Eq '(^|[[:space:]])(gh|curl)[[:space:]].*(release (create|upload|edit)|uploads[.]github[.]com)' "$BUILDER"; then
     fail 'local release builder must not create or upload a GitHub release'
 fi
@@ -87,8 +118,8 @@ for contract in \
     'immutable' \
     'gh api' \
     'gh release download' \
-    'probe-panel-v1.0.0-linux-amd64.tar.gz' \
-    'probe-panel-v1.0.0-linux-arm64.tar.gz' \
+    'probe-panel-v1.1.0-linux-amd64.tar.gz' \
+    'probe-panel-v1.1.0-linux-arm64.tar.gz' \
     'SHA256SUMS' \
     'sha256sum --check --strict'; do
     assert_contains "$contract" "$WORKFLOW"

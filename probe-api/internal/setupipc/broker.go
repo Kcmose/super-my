@@ -12,9 +12,9 @@ const (
 	DefaultDirectory   = "/run/probe-panel-setup"
 	DefaultRequestPath = DefaultDirectory + "/finalize.json"
 	DefaultResultPath  = DefaultDirectory + "/result.json"
+	DefaultMaximumWait = 30 * time.Minute
 
 	defaultPollInterval = 100 * time.Millisecond
-	defaultMaximumWait  = 30 * time.Minute
 )
 
 // Broker is the unprivileged setup server's narrow handoff to the privileged
@@ -34,7 +34,7 @@ func NewBroker() *Broker {
 		directory:    DefaultDirectory,
 		ownerUID:     0,
 		pollInterval: defaultPollInterval,
-		maximumWait:  defaultMaximumWait,
+		maximumWait:  DefaultMaximumWait,
 	}
 }
 
@@ -49,7 +49,7 @@ func newBrokerForTesting(directory string, ownerUID uint32, pollInterval, maximu
 	}
 }
 
-func (broker *Broker) Finalize(ctx context.Context, request setup.CompleteRequest) (returnErr error) {
+func (broker *Broker) Finalize(ctx context.Context, request setup.CompleteRequest) error {
 	if broker == nil || ctx == nil || broker.directory == "" || broker.pollInterval <= 0 || broker.maximumWait <= 0 {
 		return ErrUnavailable
 	}
@@ -96,20 +96,11 @@ func (broker *Broker) Finalize(ctx context.Context, request setup.CompleteReques
 	}
 	clear(payload)
 
-	// Once this caller publishes finalize.json it owns cleanup of this exchange.
-	// A pre-existing conflict is intentionally never cleaned by the loser.
-	defer func() {
-		cleanupFailed := false
-		if err := directory.removeIfExists(requestFileName, maxRequestBytes); err != nil {
-			cleanupFailed = true
-		}
-		if err := directory.removeIfExists(resultFileName, maxResultBytes); err != nil {
-			cleanupFailed = true
-		}
-		if cleanupFailed {
-			returnErr = ErrUnavailable
-		}
-	}()
+	// Publication transfers request ownership to the root path-triggered
+	// worker. In particular, cancellation or timeout must not race that worker
+	// by unlinking finalize.json before ReadRequest can atomically consume it.
+	// The worker owns the request and the broker consumes a result only when it
+	// is actually observed.
 
 	waitContext, cancel := context.WithTimeout(ctx, broker.maximumWait)
 	defer cancel()

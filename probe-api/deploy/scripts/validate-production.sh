@@ -53,22 +53,24 @@ validate_source() {
     local resolved
     resolved="$(validate_source_root "$SOURCE_ROOT")"
     validate_deployment_script_sources "$resolved"
-    validate_nginx_template_contract "${resolved}/probe-api/deploy/nginx/nginx.conf"
+    validate_nginx_template_contract "${resolved}/probe-api/deploy/nginx/nginx.conf" domain
+    validate_nginx_template_contract "${resolved}/probe-api/deploy/nginx/nginx-ip.conf" ip
     log "source layout is valid: $resolved"
 }
 
 validate_host() {
     require_root
-    require_commands bash sha256sum systemd-analyze nginx setpriv awk grep sed stat
+    require_commands bash sha256sum systemctl systemd-analyze nginx setpriv awk grep sed stat python3
     local resolved_source
     resolved_source="$(validate_source_root "$SOURCE_ROOT")"
+    clear_exported_probe_environment
     load_probe_env
     validate_backup_credentials
     validate_switchable_release_paths
     validate_systemd_unit_source "$PROBE_SYSTEMD_UNIT"
     validate_backup_service_assets
     systemd-analyze verify "$PROBE_SYSTEMD_UNIT" "$PROBE_BACKUP_SERVICE_UNIT" "$PROBE_BACKUP_TIMER_UNIT"
-    validate_nginx_runtime_config "${resolved_source}/probe-api/deploy/nginx/nginx.conf"
+    validate_nginx_runtime_config "$(selected_nginx_template "$resolved_source")"
 
     local api_real agent_real web_real admin_real migrations_real release_dir
     api_real="$(readlink -f -- "${PROBE_API_DIR}/probe-api")"
@@ -90,12 +92,16 @@ validate_host() {
     )
     validate_release_artifacts "$release_dir"
     validate_allowlist_with_binary "$api_real"
+    validate_ingress_tls_with_binary "$api_real"
+    validate_certbot_timer_state
     log "installed production host assets are valid"
 }
 
 validate_runtime() {
     require_root
-    require_commands systemctl curl ss
+    require_commands systemctl curl ss python3
+    clear_exported_probe_environment
+    load_probe_env
     verify_running_services
     systemctl is-active --quiet probe-postgres-backup.timer ||
         die "probe-postgres-backup.timer is not active"

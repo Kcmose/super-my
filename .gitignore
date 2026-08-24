@@ -1,0 +1,21 @@
+# Local secrets and overrides
+.env
+.env.*
+!.env.example
+*.local
+
+# Frontend dependencies and build output
+**/node_modules/
+**/dist/
+
+# Go build and test output
+**/bin/
+*.exe
+*.test
+*.out
+coverage/
+
+# Runtime data
+*.log
+*.pid
+tmp/

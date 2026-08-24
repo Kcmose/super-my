@@ -1,0 +1,29 @@
+version: 1
+kind: static-site
+
+build:
+  command: npm run build
+  artifact_directory: dist
+
+install:
+  destination: /srv/probe/admin
+  owner: root
+  group: root
+  directory_mode: "0755"
+  file_mode: "0644"
+
+runtime:
+  daemon: false
+  writable: false
+  audience: administrators
+  authentication: admin-session
+  fetch_credentials: include
+  allowed_api_prefixes:
+    - /api/v1/auth/
+    - /api/v1/admin/
+    - /api/v1/panel/
+
+ingress:
+  owner: probe-api
+  configuration: probe-api/deploy/nginx/nginx.conf
+  note: The admin project owns only its isolated static artifact layout; the shared HTTPS and API ingress remains in probe-api.

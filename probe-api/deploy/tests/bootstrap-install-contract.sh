@@ -348,8 +348,9 @@ for contract in \
     '/etc/systemd/system/probe-postgres-backup.timer' \
     'unit_is_installed probe-postgres-backup.service' \
     'unit_is_installed probe-postgres-backup.timer' \
-    'the legacy /srv/probe layout contains an unexpected entry' \
-    'the legacy releases directory contains an unexpected entry' \
+    "'the legacy /srv/probe layout' /srv/probe releases setup-ui" \
+    "'the legacy releases directory' \"\$RELEASES_ROOT\" \"\${LEGACY_RELEASE##*/}\"" \
+    'contains an unexpected entry' \
     'write_pending_setup_state()' \
     'remove_legacy_setup_code()' \
     'MIGRATION_BACKUP="$TEMP_ROOT/legacy-backup"' \

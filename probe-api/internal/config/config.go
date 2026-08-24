@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -18,7 +19,9 @@ import (
 	"probe-api/internal/access"
 )
 
-const defaultAgentInstallerURL = "https://raw.githubusercontent.com/Kcmose/my-agent/41989960ac9947bb9511e5ba94a3a38a3dba8da9/deploy/install.sh"
+const defaultAgentInstallerURL = "https://raw.githubusercontent.com/Kcmose/my-agent/refs/tags/v1.0.0/deploy/install.sh"
+
+var agentInstallerVersionPattern = regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
 
 type Config struct {
 	ListenAddress             string
@@ -290,11 +293,14 @@ func validateAgentInstallerURL(value string) error {
 	parsed, _ := url.Parse(value)
 	if parsed.Host != "raw.githubusercontent.com" || !strings.HasPrefix(parsed.Path, pathPrefix) ||
 		!strings.HasSuffix(parsed.Path, pathSuffix) {
-		return errors.New("PROBE_AGENT_INSTALLER_URL must use the Kcmose/my-agent GitHub Raw install script at an immutable commit")
+		return errors.New("PROBE_AGENT_INSTALLER_URL must use the Kcmose/my-agent GitHub Raw install script at an immutable revision")
 	}
 	revision := strings.TrimSuffix(strings.TrimPrefix(parsed.Path, pathPrefix), pathSuffix)
-	if len(revision) != 40 || strings.Trim(revision, "0123456789abcdef") != "" {
-		return errors.New("PROBE_AGENT_INSTALLER_URL must pin a full 40-character lowercase Git commit")
+	isFullCommit := len(revision) == 40 && strings.Trim(revision, "0123456789abcdef") == ""
+	version := strings.TrimPrefix(revision, "refs/tags/")
+	isReleaseTag := version != revision && agentInstallerVersionPattern.MatchString(version)
+	if !isFullCommit && !isReleaseTag {
+		return errors.New("PROBE_AGENT_INSTALLER_URL must pin a full lowercase Git commit or refs/tags/vMAJOR.MINOR.PATCH release")
 	}
 	return nil
 }

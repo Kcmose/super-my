@@ -103,6 +103,15 @@ func TestLoadValidatesAgentInstallerURL(t *testing.T) {
 		"https://raw.githubusercontent.com/Kcmose/my-agent/main/deploy/install.sh",
 		"https://raw.githubusercontent.com/Kcmose/my-agent/refs/heads/main/deploy/install.sh",
 		"https://raw.githubusercontent.com/Kcmose/my-agent/0123456789abcdef/deploy/install.sh",
+		"https://raw.githubusercontent.com/Kcmose/my-agent/v1/deploy/install.sh",
+		"https://raw.githubusercontent.com/Kcmose/my-agent/v1.0/deploy/install.sh",
+		"https://raw.githubusercontent.com/Kcmose/my-agent/v1.0.0/deploy/install.sh",
+		"https://raw.githubusercontent.com/Kcmose/my-agent/v01.0.0/deploy/install.sh",
+		"https://raw.githubusercontent.com/Kcmose/my-agent/v1.0.0-beta/deploy/install.sh",
+		"https://raw.githubusercontent.com/Kcmose/my-agent/V1.0.0/deploy/install.sh",
+		"https://raw.githubusercontent.com/Kcmose/my-agent/refs/tags/v1/deploy/install.sh",
+		"https://raw.githubusercontent.com/Kcmose/my-agent/refs/tags/v01.0.0/deploy/install.sh",
+		"https://raw.githubusercontent.com/Kcmose/my-agent/refs/heads/v1.0.0/deploy/install.sh",
 		"https://raw.githubusercontent.com/other/my-agent/0123456789012345678901234567890123456789/deploy/install.sh",
 		"https://raw.githubusercontent.com/Kcmose/my-agent/0123456789012345678901234567890123456789/install.sh",
 	} {
@@ -113,9 +122,16 @@ func TestLoadValidatesAgentInstallerURL(t *testing.T) {
 			}
 		})
 	}
-	t.Setenv("PROBE_AGENT_INSTALLER_URL", defaultAgentInstallerURL)
-	if _, err := Load(); err != nil {
-		t.Fatalf("Load() rejected the immutable GitHub installer URL: %v", err)
+	for _, value := range []string{
+		defaultAgentInstallerURL,
+		"https://raw.githubusercontent.com/Kcmose/my-agent/0123456789012345678901234567890123456789/deploy/install.sh",
+	} {
+		t.Run("valid-"+value, func(t *testing.T) {
+			t.Setenv("PROBE_AGENT_INSTALLER_URL", value)
+			if _, err := Load(); err != nil {
+				t.Fatalf("Load() rejected immutable GitHub installer URL %q: %v", value, err)
+			}
+		})
 	}
 }
 

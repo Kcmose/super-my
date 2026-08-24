@@ -10,7 +10,7 @@ Probe Panel 是一套面向 Linux 节点的轻量监控与网络探测面板。�
 
 ## 服务端一键安装（首次初始化）
 
-干净的 Debian 13 `amd64`/`arm64` 服务器不需要安装 Go 或 npm，也不需要手工上传四个工程。先登录 root 或执行 `sudo -i` 进入 root Shell；安装命令本身不依赖最小系统预装 `sudo`。修订后的服务端版本固定为不可变的 `v1.1.0`（发布完成后对应 GitHub Release）：
+干净的 Debian 13 `amd64`/`arm64` 服务器不需要安装 Go 或 npm，也不需要手工上传四个工程。先登录 root 或执行 `sudo -i` 进入 root Shell；安装命令本身不依赖最小系统预装 `sudo`。修订后的服务端版本固定为不可变的 [`v1.1.0` GitHub Release](https://github.com/Kcmose/super-my/releases/tag/v1.1.0)：
 
 ```bash
 curl -fsSL --proto '=https' --tlsv1.2 \

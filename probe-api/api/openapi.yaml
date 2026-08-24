@@ -1633,7 +1633,7 @@ components:
           type: string
           minLength: 1
           readOnly: true
-          description: One-time shell command for a user-initiated first installation. It contains the enrollment token and must be handled as a secret.
+          description: One-time GitHub Raw bootstrap command for a user-initiated first installation. It contains the enrollment token as a short argument and must be handled as a secret. Private-preview TLS adds only a pinned public-certificate SHA256; the command never disables TLS verification itself.
     AgentTokenResponse:
       type: object
       additionalProperties: false

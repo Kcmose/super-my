@@ -110,7 +110,7 @@ func NewServer(cfg config.Config, logger *slog.Logger, db Database, options ...O
 			settings.authService, cfg.MaxPanelBodyBytes, cfg.AdminOrigin)
 	}
 	if settings.authService != nil {
-		installCommandGenerator := agentbootstrap.New(cfg.AgentPublicURL, cfg.AgentInstallCAPEM)
+		installCommandGenerator := agentbootstrap.New(cfg.AgentPublicURL, cfg.AgentInstallerURL, cfg.AgentInstallCAPEM)
 		RegisterAdminManagementRoutes(mux, logger,
 			settings.nodeManagementService, settings.userManagementService, settings.auditLogService,
 			settings.authService, cfg.MaxPanelBodyBytes, cfg.AdminOrigin, installCommandGenerator)

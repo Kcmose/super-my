@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -16,6 +17,8 @@ import (
 
 	"probe-api/internal/access"
 )
+
+const defaultAgentInstallerURL = "https://raw.githubusercontent.com/Kcmose/my-agent/41989960ac9947bb9511e5ba94a3a38a3dba8da9/deploy/install.sh"
 
 type Config struct {
 	ListenAddress             string
@@ -33,6 +36,7 @@ type Config struct {
 	MaxPanelBodyBytes         int64
 	AdminOrigin               string
 	AgentPublicURL            string
+	AgentInstallerURL         string
 	AgentInstallCAFile        string
 	AgentInstallCAPEM         []byte
 	AdminAllowlistFile        string
@@ -70,6 +74,7 @@ func Load() (Config, error) {
 		MaxPanelBodyBytes:         64 * 1024,
 		AdminOrigin:               envString("PROBE_ADMIN_ORIGIN", "https://admin.example.com"),
 		AgentPublicURL:            envString("PROBE_AGENT_PUBLIC_URL", "https://api.example.com"),
+		AgentInstallerURL:         envString("PROBE_AGENT_INSTALLER_URL", defaultAgentInstallerURL),
 		AgentInstallCAFile:        strings.TrimSpace(os.Getenv("PROBE_AGENT_INSTALL_CA_FILE")),
 		AdminAllowlistFile:        strings.TrimSpace(os.Getenv("PROBE_ADMIN_ALLOWLIST_FILE")),
 		SessionTTL:                12 * time.Hour,
@@ -178,6 +183,9 @@ func Load() (Config, error) {
 	if err := validateHTTPSOrigin("PROBE_AGENT_PUBLIC_URL", cfg.AgentPublicURL); err != nil {
 		return Config{}, err
 	}
+	if err := validateAgentInstallerURL(cfg.AgentInstallerURL); err != nil {
+		return Config{}, err
+	}
 	if cfg.AgentInstallCAFile != "" {
 		cfg.AgentInstallCAPEM, err = loadPublicCABundle(cfg.AgentInstallCAFile)
 		if err != nil {
@@ -257,6 +265,40 @@ func validateHTTPSOrigin(name, value string) error {
 	return nil
 }
 
+func validateHTTPSResourceURL(name, value string) error {
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return fmt.Errorf("%s must be an absolute https URL", name)
+	}
+	if parsed.User != nil || parsed.Opaque != "" || parsed.Path == "" || parsed.Path == "/" ||
+		parsed.RawPath != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" ||
+		strings.HasSuffix(parsed.Path, "/") || path.Clean(parsed.Path) != parsed.Path || parsed.String() != value {
+		return fmt.Errorf("%s must be a canonical https file URL without credentials, query, or fragment", name)
+	}
+	return nil
+}
+
+func validateAgentInstallerURL(value string) error {
+	const (
+		name       = "PROBE_AGENT_INSTALLER_URL"
+		pathPrefix = "/Kcmose/my-agent/"
+		pathSuffix = "/deploy/install.sh"
+	)
+	if err := validateHTTPSResourceURL(name, value); err != nil {
+		return err
+	}
+	parsed, _ := url.Parse(value)
+	if parsed.Host != "raw.githubusercontent.com" || !strings.HasPrefix(parsed.Path, pathPrefix) ||
+		!strings.HasSuffix(parsed.Path, pathSuffix) {
+		return errors.New("PROBE_AGENT_INSTALLER_URL must use the Kcmose/my-agent GitHub Raw install script at an immutable commit")
+	}
+	revision := strings.TrimSuffix(strings.TrimPrefix(parsed.Path, pathPrefix), pathSuffix)
+	if len(revision) != 40 || strings.Trim(revision, "0123456789abcdef") != "" {
+		return errors.New("PROBE_AGENT_INSTALLER_URL must pin a full 40-character lowercase Git commit")
+	}
+	return nil
+}
+
 func loadPublicCABundle(path string) ([]byte, error) {
 	if !filepath.IsAbs(path) {
 		return nil, errors.New("must be an absolute path")
@@ -307,6 +349,9 @@ func (c Config) ValidateDatabase() error {
 func (c Config) ValidateServe() error {
 	if c.AgentPublicURL == "" || c.AgentPublicURL == "https://api.example.com" {
 		return errors.New("PROBE_AGENT_PUBLIC_URL must be set to the deployed Agent HTTPS origin before serving")
+	}
+	if c.AgentInstallerURL == "" {
+		return errors.New("PROBE_AGENT_INSTALLER_URL must name the published Agent installer before serving")
 	}
 	return nil
 }

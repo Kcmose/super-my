@@ -241,12 +241,16 @@ func TestAdminManagementTokenResponsesAreOneTimeAndNeverCached(t *testing.T) {
 			}
 			if test.name == "enrollment" {
 				body := response.Body.String()
-				for _, expected := range []string{"install_command", "https://api.example.com/downloads/probe-agent/SHA256SUMS", "--enrollment-token-stdin"} {
+				for _, expected := range []string{
+					"install_command",
+					"https://raw.githubusercontent.com/Kcmose/my-agent/41989960ac9947bb9511e5ba94a3a38a3dba8da9/deploy/install.sh",
+					"sudo bash -s --", "-e", "https://api.example.com", "-t",
+				} {
 					if !strings.Contains(body, expected) {
 						t.Fatalf("enrollment response is missing %q: %s", expected, body)
 					}
 				}
-				if strings.Contains(body, "--insecure") || strings.Contains(body, "curl -k") {
+				if strings.Contains(body, "--insecure") || strings.Contains(body, "curl -k") || strings.Contains(body, "base64") {
 					t.Fatalf("enrollment response weakens TLS: %s", body)
 				}
 			}

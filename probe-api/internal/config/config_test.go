@@ -18,6 +18,7 @@ func TestLoadDefaults(t *testing.T) {
 	t.Setenv("PROBE_API_LISTEN_ADDR", "")
 	t.Setenv("PROBE_DATABASE_URL", "")
 	t.Setenv("PROBE_LOG_LEVEL", "")
+	t.Setenv("PROBE_AGENT_INSTALLER_URL", "")
 
 	cfg, err := Load()
 	if err != nil {
@@ -29,8 +30,8 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.ReadTimeout != 15*time.Second {
 		t.Fatalf("ReadTimeout = %s", cfg.ReadTimeout)
 	}
-	if cfg.AgentPublicURL != "https://api.example.com" || len(cfg.AgentInstallCAPEM) != 0 {
-		t.Fatalf("unexpected Agent bootstrap defaults: url=%q ca_bytes=%d", cfg.AgentPublicURL, len(cfg.AgentInstallCAPEM))
+	if cfg.AgentPublicURL != "https://api.example.com" || cfg.AgentInstallerURL != defaultAgentInstallerURL || len(cfg.AgentInstallCAPEM) != 0 {
+		t.Fatalf("unexpected Agent bootstrap defaults: url=%q installer=%q ca_bytes=%d", cfg.AgentPublicURL, cfg.AgentInstallerURL, len(cfg.AgentInstallCAPEM))
 	}
 	if err := cfg.ValidateDatabase(); err == nil {
 		t.Fatal("ValidateDatabase() accepted an empty URL")
@@ -41,7 +42,7 @@ func TestLoadDefaults(t *testing.T) {
 }
 
 func TestValidateServeRequiresAnExplicitAgentOrigin(t *testing.T) {
-	cfg := Config{AgentPublicURL: "https://agent.example.net:8443"}
+	cfg := Config{AgentPublicURL: "https://agent.example.net:8443", AgentInstallerURL: defaultAgentInstallerURL}
 	if err := cfg.ValidateServe(); err != nil {
 		t.Fatalf("ValidateServe() rejected an explicit Agent origin: %v", err)
 	}
@@ -88,7 +89,33 @@ func TestLoadValidatesAgentBootstrapOriginAndPublicCA(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := Load(); err == nil {
-		t.Fatal("Load() accepted a CA bundle too large for a safe one-line command")
+		t.Fatal("Load() accepted a CA bundle larger than the configured public CA size limit")
+	}
+}
+
+func TestLoadValidatesAgentInstallerURL(t *testing.T) {
+	for _, value := range []string{
+		"http://raw.example/install.sh",
+		"https://raw.example",
+		"https://raw.example/deploy/../install.sh",
+		"https://raw.example/install.sh?branch=main",
+		"https://user@raw.example/install.sh",
+		"https://raw.githubusercontent.com/Kcmose/my-agent/main/deploy/install.sh",
+		"https://raw.githubusercontent.com/Kcmose/my-agent/refs/heads/main/deploy/install.sh",
+		"https://raw.githubusercontent.com/Kcmose/my-agent/0123456789abcdef/deploy/install.sh",
+		"https://raw.githubusercontent.com/other/my-agent/0123456789012345678901234567890123456789/deploy/install.sh",
+		"https://raw.githubusercontent.com/Kcmose/my-agent/0123456789012345678901234567890123456789/install.sh",
+	} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("PROBE_AGENT_INSTALLER_URL", value)
+			if _, err := Load(); err == nil {
+				t.Fatalf("Load() accepted unsafe Agent installer URL %q", value)
+			}
+		})
+	}
+	t.Setenv("PROBE_AGENT_INSTALLER_URL", defaultAgentInstallerURL)
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load() rejected the immutable GitHub installer URL: %v", err)
 	}
 }
 

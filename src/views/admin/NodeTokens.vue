@@ -366,10 +366,10 @@ function showInstallCommand(response, { reinstallation = false } = {}) {
     value: response.install_command,
     nodeId: response.node_id,
     time: response.expires_at,
-    timeLabel: '命令内令牌过期时间',
+		timeLabel: '命令内令牌过期时间',
 		notice: reinstallation
-			? '这是重新安装命令：请先进入目标机 root Shell（如 sudo -i）再粘贴。若在另一台主机成功注册，原 Agent 会立即失效。命令可能留在 Shell 历史和剪贴板中，请用后主动覆盖。'
-			: '命令含 15 分钟有效的一次性令牌，新生成的命令会废止旧命令。请先进入目标机 root Shell（如 sudo -i）再粘贴；用后请主动覆盖 Shell 历史和剪贴板中的敏感内容。',
+			? '这是重新安装命令：请直接粘贴到目标机可使用 sudo 的 Shell。若在另一台主机成功注册，原 Agent 会立即失效。一次性令牌可能短暂出现在进程参数，并可能留在 Shell 历史和剪贴板中，请用后主动覆盖。'
+			: '命令含 15 分钟有效的一次性令牌，新生成的命令会废止旧命令。请直接粘贴到目标机可使用 sudo 的 Shell；令牌可能短暂出现在进程参数，并可能留在 Shell 历史和剪贴板中，请用后主动覆盖。',
   })
 }
 

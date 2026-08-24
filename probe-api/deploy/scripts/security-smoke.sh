@@ -9,6 +9,7 @@ CONNECT_TIMEOUT="${CONNECT_TIMEOUT:-5}"
 MAX_TIME="${MAX_TIME:-15}"
 CA_CERT="${CA_CERT:-}"
 INSECURE=0
+EXPECT_PRIVATE_CA=0
 
 usage() {
     cat <<'USAGE'
@@ -25,6 +26,7 @@ Options:
   --max-time SEC           curl total timeout per request (default: 15)
   --cacert FILE            Trust this absolute PEM CA/certificate path
   --insecure               Allow an untrusted TLS certificate (preview only)
+  --expect-private-ca      Require ca.pem only on the Agent download host
   -h, --help               Show this help
 
 This check deliberately sends no cookie, CSRF token, administrator credential,
@@ -103,6 +105,10 @@ while (($# > 0)); do
             ;;
         --insecure)
             INSECURE=1
+            shift
+            ;;
+        --expect-private-ca)
+            EXPECT_PRIVATE_CA=1
             shift
             ;;
         -h | --help)
@@ -237,6 +243,10 @@ check_status "visitor entry hides Agent API" 404 \
     "$PANEL_URL/api/v1/agent/config?version=0" || true
 check_status "visitor entry hides Agent downloads" 404 \
     "$PANEL_URL/downloads/probe-agent/install.sh" || true
+if ((EXPECT_PRIVATE_CA == 1)); then
+    check_status "visitor entry hides the private Agent CA" 404 \
+        "$PANEL_URL/downloads/probe-agent/ca.pem" || true
+fi
 
 # Administrator entry: its own static UI and panel reads are reachable from an
 # allowlisted source, but auth/admin API calls require an administrator session.
@@ -251,6 +261,10 @@ check_status "administrator entry hides Agent API" 404 \
     "$ADMIN_URL/api/v1/agent/config?version=0" || true
 check_status "administrator entry hides Agent downloads" 404 \
     "$ADMIN_URL/downloads/probe-agent/install.sh" || true
+if ((EXPECT_PRIVATE_CA == 1)); then
+    check_status "administrator entry hides the private Agent CA" 404 \
+        "$ADMIN_URL/downloads/probe-agent/ca.pem" || true
+fi
 
 # Agent entry: only Agent paths are exposed. The generated value is guaranteed
 # to be a deliberately invalid, non-secret smoke value rather than a deployed
@@ -270,6 +284,10 @@ check_status "Agent entry serves the reviewed bootstrap installer" 200 \
 check_header_absent "Agent download does not create a session" "Set-Cookie" || true
 check_status "Agent entry serves the checksum manifest" 200 \
     "$AGENT_URL/downloads/probe-agent/SHA256SUMS" || true
+if ((EXPECT_PRIVATE_CA == 1)); then
+    check_status "Agent entry serves the pinned private CA" 200 \
+        "$AGENT_URL/downloads/probe-agent/ca.pem" || true
+fi
 check_status "Agent entry rejects unknown download files" 404 \
     "$AGENT_URL/downloads/probe-agent/unknown" || true
 check_status "Agent download route rejects writes" 403 \

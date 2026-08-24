@@ -1,6 +1,8 @@
 package agentbootstrap
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,23 +12,19 @@ import (
 
 func TestBuildUsesVerifiedHTTPSAndQuotesOneTimeToken(t *testing.T) {
 	token := "enroll.v1.one-time-secret"
-	command := New("https://agent.example.com:8443", nil).Build(token)
+	installerURL := "https://raw.githubusercontent.com/Kcmose/my-agent/0123456789012345678901234567890123456789/deploy/install.sh"
+	command := New("https://agent.example.com:8443", installerURL, nil).Build(token)
 
 	for _, expected := range []string{
-		"--proto", "=https", "--tlsv1.2",
+		"curl -q -fsSL", "--proto", "=https", "--proto-redir", "--tlsv1.2",
 		"--connect-timeout", "--max-time",
-		"https://agent.example.com:8443/downloads/probe-agent/SHA256SUMS",
-		"https://agent.example.com:8443/downloads/probe-agent/install.sh",
-		"--api-url", "https://agent.example.com:8443/api/v1/agent",
-		"--download-base-url", "https://agent.example.com:8443/downloads/probe-agent",
-		"--enrollment-token-stdin", token,
-		"mktemp -d", "trap cleanup", "sha256sum", "id -u",
+		installerURL, "sudo bash -s --", "-e", "https://agent.example.com:8443", "-t", token,
 	} {
 		if !strings.Contains(command, expected) {
 			t.Fatalf("command does not contain %q: %s", expected, command)
 		}
 	}
-	for _, forbidden := range []string{"sh -c ", "sudo", "curl -k", "--insecure", "curl |", "eval "} {
+	for _, forbidden := range []string{"base64", "SHA256SUMS", "--enrollment-token-stdin", "--insecure", "curl -k", "eval "} {
 		if strings.Contains(command, forbidden) {
 			t.Fatalf("command contains unsafe fragment %q: %s", forbidden, command)
 		}
@@ -34,7 +32,7 @@ func TestBuildUsesVerifiedHTTPSAndQuotesOneTimeToken(t *testing.T) {
 	if count := strings.Count(command, token); count != 1 {
 		t.Fatalf("one-time token appears %d times in command, want 1: %s", count, command)
 	}
-	if !strings.Contains(command, "curl -q --fail") {
+	if !strings.HasPrefix(command, "curl -q -fsSL") {
 		t.Fatalf("curl must disable per-user configuration before strict TLS flags: %s", command)
 	}
 }
@@ -45,13 +43,28 @@ func TestShellQuoteHandlesSingleQuotes(t *testing.T) {
 	}
 }
 
-func TestBuildEmbedsConfiguredPublicCA(t *testing.T) {
-	command := New("https://192.0.2.10", []byte("PUBLIC CA\n")).Build("token")
-	if !strings.Contains(command, "UFVCTElDIENBCg==") ||
-		!strings.Contains(command, "base64 -d") ||
-		!strings.Contains(command, "--cacert") ||
-		!strings.Contains(command, "--ca-file") {
-		t.Fatalf("private-CA command is incomplete: %s", command)
+func TestBuildUsesConfiguredPublicCAFingerprint(t *testing.T) {
+	caPEM := []byte("PUBLIC CA\n")
+	digest := sha256.Sum256(caPEM)
+	command := New("https://192.0.2.10", "https://raw.example/install.sh", caPEM).Build("token")
+	if !strings.Contains(command, "-c '"+fmt.Sprintf("%x", digest)+"'") || strings.Contains(command, "PUBLIC CA") {
+		t.Fatalf("private-CA fingerprint command is incomplete: %s", command)
+	}
+}
+
+func TestBuildKeepsPrivateCAPreviewCommandCompact(t *testing.T) {
+	installerURL := "https://raw.githubusercontent.com/Kcmose/my-agent/0123456789012345678901234567890123456789/deploy/install.sh"
+	token := "enroll.v1.abcdefghijklmnopqrstuvwxyz01234567890123456"
+	command := New("https://192.168.33.253:18454", installerURL, []byte("PUBLIC CA\n")).Build(token)
+
+	if got, limit := len(command), 400; got > limit {
+		t.Fatalf("private-CA bootstrap command is %d bytes, want at most %d: %s", got, limit, command)
+	}
+	if count := strings.Count(command, " | "); count != 1 {
+		t.Fatalf("bootstrap command has %d pipes, want exactly 1: %s", count, command)
+	}
+	if strings.ContainsAny(command, "\r\n") {
+		t.Fatalf("bootstrap command must remain one line: %q", command)
 	}
 }
 
@@ -63,37 +76,15 @@ func TestBuildRunsDownloadedInstallerWithExpectedArguments(t *testing.T) {
 	capturePath := filepath.Join(temporaryDirectory, "installer-arguments")
 	fakeCurl := `#!/bin/sh
 set -eu
-output=
-while [ "$#" -gt 0 ]; do
-	if [ "$1" = --output ]; then
-		output=$2
-		shift 2
-	else
-		shift
-	fi
-done
-[ -n "$output" ]
-write_installer() {
-	printf '%s\n' \
-		'#!/bin/sh' \
-		'set -eu' \
-		'printf '\''%s\n'\'' "$@" > "$PROBE_BOOTSTRAP_CAPTURE"' \
-		'while [ "$#" -gt 0 ]; do if [ "$1" = --ca-file ]; then test -s "$2"; cat "$2" >> "$PROBE_BOOTSTRAP_CAPTURE"; shift 2; elif [ "$1" = --enrollment-token-stdin ]; then IFS= read -r token; printf '\''stdin-token\n%s\n'\'' "$token" >> "$PROBE_BOOTSTRAP_CAPTURE"; shift; else shift; fi; done' \
-		> "$1"
-}
-case "$output" in
-	*/SHA256SUMS)
-		fixture="${output}.installer"
-		write_installer "$fixture"
-		hash=$(sha256sum "$fixture" | awk '{ print $1 }')
-		printf '%s  install.sh\n' "$hash" > "$output"
-		rm -f "$fixture"
-		;;
-	*) write_installer "$output" ;;
-esac
+printf '%s\n' '#!/bin/sh' 'set -eu' 'printf '\''%s\n'\'' "$@" > "$PROBE_BOOTSTRAP_CAPTURE"'
 `
-	fakeID := "#!/bin/sh\n[ \"${1:-}\" = -u ] && printf '0\\n'\n"
-	for name, contents := range map[string]string{"curl": fakeCurl, "id": fakeID} {
+	fakeSudo := `#!/bin/sh
+set -eu
+[ "$1" = bash ]
+shift
+exec bash "$@"
+`
+	for name, contents := range map[string]string{"curl": fakeCurl, "sudo": fakeSudo} {
 		path := filepath.Join(temporaryDirectory, name)
 		if err := os.WriteFile(path, []byte(contents), 0o700); err != nil {
 			t.Fatal(err)
@@ -101,7 +92,9 @@ esac
 	}
 
 	token := "enroll.v1.abcdefghijklmnopqrstuvwxyz0123456789"
-	command := New("https://agent.example.com:8443", []byte("PUBLIC CA\n")).Build(token)
+	caPEM := []byte("PUBLIC CA\n")
+	digest := sha256.Sum256(caPEM)
+	command := New("https://agent.example.com:8443", "https://raw.example/install.sh", caPEM).Build(token)
 	process := exec.Command("sh", "-c", command)
 	process.Env = append(os.Environ(),
 		"PATH="+temporaryDirectory+":"+os.Getenv("PATH"),
@@ -115,12 +108,9 @@ esac
 		t.Fatal(err)
 	}
 	for _, expected := range []string{
-		"--api-url\nhttps://agent.example.com:8443/api/v1/agent\n",
-		"--download-base-url\nhttps://agent.example.com:8443/downloads/probe-agent\n",
-		"--enrollment-token-stdin\n",
-		"stdin-token\n" + token + "\n",
-		"--ca-file\n",
-		"PUBLIC CA\n",
+		"-e\nhttps://agent.example.com:8443\n",
+		"-t\n" + token + "\n",
+		"-c\n" + fmt.Sprintf("%x", digest) + "\n",
 	} {
 		if !strings.Contains(string(captured), expected) {
 			t.Fatalf("installer capture does not contain %q: %q", expected, captured)

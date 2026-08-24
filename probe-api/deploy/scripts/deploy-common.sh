@@ -244,6 +244,10 @@ load_probe_env() {
         die "PROBE_AGENT_PUBLIC_URL must be one absolute HTTPS origin"
     [[ "$PROBE_AGENT_PUBLIC_URL" != "https://api.example.com" ]] ||
         die "replace the example Agent public origin in $PROBE_ENV_FILE"
+    [[ -n "${seen[PROBE_AGENT_INSTALLER_URL]+x}" ]] ||
+        die "PROBE_AGENT_INSTALLER_URL must be set explicitly in $PROBE_ENV_FILE"
+    [[ "${PROBE_AGENT_INSTALLER_URL:-}" =~ ^https://raw[.]githubusercontent[.]com/Kcmose/my-agent/[0-9a-f]{40}/deploy/install[.]sh$ ]] ||
+        die "PROBE_AGENT_INSTALLER_URL must use an immutable Kcmose/my-agent GitHub commit"
     [[ -z "${PROBE_AGENT_INSTALL_CA_FILE:-}" ]] ||
         die "production Agent downloads must use publicly trusted TLS; remove PROBE_AGENT_INSTALL_CA_FILE"
     [[ "${PROBE_ADMIN_ALLOWLIST_FILE:-}" == "$PROBE_ALLOWLIST_FILE" ]] ||
@@ -300,7 +304,7 @@ location / {
 location = /api/v1/agent/enroll {
 location = /api/v1/agent/config {
 location = /api/v1/agent/report {
-location ~ ^/downloads/probe-agent/(?:install[.]sh|SHA256SUMS|probe-agent[.]service|linux-(?:amd64|arm64)/probe-agent)$ {
+location ~ ^/downloads/probe-agent/(?:ca[.]pem|install[.]sh|SHA256SUMS|probe-agent[.]service|linux-(?:amd64|arm64)/probe-agent)$ {
 location /api/v1/agent/ {
 location @probe_agent_rate_limited {
 location ^~ /api/v1/public/ {

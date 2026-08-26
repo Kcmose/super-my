@@ -49,8 +49,12 @@ jobs:
           set -Eeuo pipefail
           [[ -n "${RUNNER_TEMP:-}" ]]
           [[ "$RUNNER_TEMP" == /* ]]
-          printf 'RELEASE_OUTPUT=%s\n' \
-            "$RUNNER_TEMP/probe-panel-management-release-v1.2.0" >> "$GITHUB_ENV"
+          {
+            printf 'RELEASE_OUTPUT=%s\n' \
+              "$RUNNER_TEMP/probe-panel-management-release-v1.2.0"
+            printf 'BUILD_SOURCE=%s\n' \
+              "$RUNNER_TEMP/probe-panel-management-source-v1.2.0"
+          } >> "$GITHUB_ENV"
 
       - name: Install Debian 13 build prerequisites
         shell: bash
@@ -115,11 +119,22 @@ jobs:
           [[ "$remote_tag_object" == "$local_tag_object" ]]
           [[ "${remote_tag_commit:-$remote_tag_object}" == "$local_tag_commit" ]]
 
+      - name: Prepare a root-owned immutable source copy
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ ! -e "$BUILD_SOURCE" ]]
+          cp -a --no-preserve=ownership "$GITHUB_WORKSPACE" "$BUILD_SOURCE"
+          [[ "$(stat -c '%u' "$BUILD_SOURCE")" -eq "$(id -u)" ]]
+          [[ -z "$(git -C "$BUILD_SOURCE" status --porcelain=v1 --untracked-files=all)" ]]
+          [[ "$(git -C "$BUILD_SOURCE" rev-parse --verify 'HEAD^{commit}')" == \
+            "$(git -C "$BUILD_SOURCE" rev-parse --verify 'refs/tags/v1.2.0^{commit}')" ]]
+
       - name: Build management-only release assets
         shell: bash
         run: |
           set -Eeuo pipefail
-          bash probe-api/deploy/scripts/build-release-bundles.sh \
+          bash "$BUILD_SOURCE/probe-api/deploy/scripts/build-release-bundles.sh" \
             --profile management \
             --version v1.2.0 \
             --output-dir "$RELEASE_OUTPUT"
@@ -149,9 +164,10 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          source_commit="$(git rev-parse --verify 'refs/tags/v1.2.0^{commit}')"
+          source_commit="$(git -C "$BUILD_SOURCE" rev-parse --verify \
+            'refs/tags/v1.2.0^{commit}')"
           [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]]
-          cd probe-api
+          cd "$BUILD_SOURCE/probe-api"
           go run ./cmd/probe-support-gate verify \
             --support-root deploy/support \
             --release v1.2.0 \

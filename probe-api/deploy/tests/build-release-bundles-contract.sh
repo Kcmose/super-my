@@ -704,11 +704,18 @@ fi
 # shellcheck disable=SC2016
 for contract in \
     'push:' \
+    'branches:' \
+    '- main' \
     'tags:' \
     '- v1.2.0' \
-    "if: github.event_name == 'push' && github.ref == 'refs/tags/v1.2.0'" \
+    'workflow_dispatch:' \
+    "(github.ref == 'refs/tags/v1.2.0' || github.ref == 'refs/heads/main')) ||" \
+    "(github.event_name == 'workflow_dispatch' && inputs.version == 'v1.2.0')" \
     'image: debian:13-slim' \
     'contents: read' \
+    '- name: Install pinned ShellCheck 0.11.0' \
+    'SHELLCHECK_ARCHIVE_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198' \
+    '[[ "$(shellcheck --version | awk' \
     'uses: actions/checkout@v4' \
     'fetch-depth: 0' \
     'persist-credentials: false' \
@@ -717,13 +724,16 @@ for contract in \
     '[[ "$GITHUB_REPOSITORY" == Kcmose/super-my ]]' \
     'git status --porcelain=v1 --untracked-files=all' \
     'git ls-remote --exit-code origin' \
-    'bash probe-api/deploy/scripts/build-release-bundles.sh' \
+    '- name: Prepare a root-owned clean source copy' \
+    'cp -a --no-preserve=ownership -- "$GITHUB_WORKSPACE" "$BUILD_SOURCE"' \
+    'find "$BUILD_SOURCE" ! -uid "$(id -u)" -print -quit' \
+    'bash "$BUILD_SOURCE/probe-api/deploy/scripts/build-release-bundles.sh"' \
     '--profile management' \
     '--version v1.2.0' \
     'probe-panel-management-v1.2.0-linux-amd64.tar.gz' \
     'probe-panel-management-v1.2.0-linux-arm64.tar.gz' \
     '- name: Bind candidate tarballs to the verified tag commit' \
-    'source_commit="$(git rev-parse --verify '\''refs/tags/v1.2.0^{commit}'\'')"' \
+    'git -C "$BUILD_SOURCE" rev-parse --verify' \
     'go run ./cmd/probe-support-gate verify' \
     '--release-assets "$RELEASE_OUTPUT"' \
     '--source-commit "$source_commit"' \
@@ -746,18 +756,21 @@ checkout_count=$(grep -Fc 'uses: actions/checkout@' "$WORKFLOW")
 [ "$checkout_count" -eq 1 ] ||
     fail 'management release workflow must perform exactly one checkout'
 
+candidate_copy_line=$(grep -Fn -- '- name: Prepare a root-owned clean source copy' "$WORKFLOW" | cut -d: -f1)
 candidate_build_line=$(grep -Fn -- '- name: Build management-only release assets' "$WORKFLOW" | cut -d: -f1)
 candidate_shape_line=$(grep -Fn -- '- name: Require exactly the three management assets' "$WORKFLOW" | cut -d: -f1)
 candidate_binding_line=$(grep -Fn -- '- name: Bind candidate tarballs to the verified tag commit' "$WORKFLOW" | cut -d: -f1)
 candidate_upload_line=$(grep -Fn -- '- name: Upload the unpublished management candidate' "$WORKFLOW" | cut -d: -f1)
-if [ -z "$candidate_build_line" ] ||
+if [ -z "$candidate_copy_line" ] ||
+    [ -z "$candidate_build_line" ] ||
     [ -z "$candidate_shape_line" ] ||
     [ -z "$candidate_binding_line" ] ||
     [ -z "$candidate_upload_line" ] ||
+    [ "$candidate_copy_line" -ge "$candidate_build_line" ] ||
     [ "$candidate_build_line" -ge "$candidate_shape_line" ] ||
     [ "$candidate_shape_line" -ge "$candidate_binding_line" ] ||
     [ "$candidate_binding_line" -ge "$candidate_upload_line" ]; then
-    fail 'candidate assets must be built, shape-checked, commit-bound, and only then uploaded'
+    fail 'candidate source must be copied, built, shape-checked, commit-bound, and only then uploaded'
 fi
 
 candidate_binding_section=$(sed -n \
@@ -766,7 +779,7 @@ candidate_binding_section=$(sed -n \
 # These are literal workflow shell variables and must not expand in this contract.
 # shellcheck disable=SC2016
 for binding_contract in \
-    'source_commit="$(git rev-parse --verify '\''refs/tags/v1.2.0^{commit}'\'')"' \
+    'git -C "$BUILD_SOURCE" rev-parse --verify' \
     '[[ "$source_commit" =~ ^[0-9a-f]{40}$ ]]' \
     '--release v1.2.0' \
     '--require-zero-supported' \

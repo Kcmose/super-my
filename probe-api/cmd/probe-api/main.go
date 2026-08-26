@@ -250,7 +250,7 @@ func newLogger(levelName string) *slog.Logger {
 }
 
 func usageError() error {
-	return errors.New("usage: probe-api <serve|migrate up|migrate status|user bootstrap-admin <username>|config validate-admin-allowlist <path>|config validate-ingress-tls <domain PANEL ADMIN AGENT|ip ADDRESS>|version>")
+	return errors.New("usage: probe-api <serve|migrate up|migrate status|user bootstrap-admin <username>|config validate-admin-allowlist <path>|config validate-ingress-tls <domain PANEL ADMIN AGENT|ip ADDRESS|admin-domain ADMIN|admin-ip ADDRESS>|version>")
 }
 
 func runConfigCommand(args []string) error {
@@ -281,15 +281,31 @@ func runConfigCommand(args []string) error {
 			if err := ingresstls.ValidateIP(ingresstls.IPConfig{Paths: paths, Address: args[3]}); err != nil {
 				return fmt.Errorf("validate IP ingress TLS: %w", err)
 			}
+		case "admin-domain":
+			if len(args) != 4 {
+				return ingressTLSUsageError()
+			}
+			if err := ingresstls.ValidateAdminDomain(ingresstls.AdminDomainConfig{
+				Paths: paths, AdminHost: args[3],
+			}); err != nil {
+				return fmt.Errorf("validate management domain ingress TLS: %w", err)
+			}
+		case "admin-ip":
+			if len(args) != 4 {
+				return ingressTLSUsageError()
+			}
+			if err := ingresstls.ValidateIP(ingresstls.IPConfig{Paths: paths, Address: args[3]}); err != nil {
+				return fmt.Errorf("validate management IP ingress TLS: %w", err)
+			}
 		default:
 			return ingressTLSUsageError()
 		}
 		fmt.Printf("ingress TLS valid: %s\n", args[2])
 		return nil
 	}
-	return errors.New("usage: probe-api config <validate-admin-allowlist PATH|validate-ingress-tls domain PANEL ADMIN AGENT|validate-ingress-tls ip ADDRESS>")
+	return errors.New("usage: probe-api config <validate-admin-allowlist PATH|validate-ingress-tls domain PANEL ADMIN AGENT|validate-ingress-tls ip ADDRESS|validate-ingress-tls admin-domain ADMIN|validate-ingress-tls admin-ip ADDRESS>")
 }
 
 func ingressTLSUsageError() error {
-	return errors.New("usage: probe-api config validate-ingress-tls <domain PANEL ADMIN AGENT|ip ADDRESS>")
+	return errors.New("usage: probe-api config validate-ingress-tls <domain PANEL ADMIN AGENT|ip ADDRESS|admin-domain ADMIN|admin-ip ADDRESS>")
 }

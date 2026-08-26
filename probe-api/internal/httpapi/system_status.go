@@ -29,13 +29,15 @@ type systemStatusResponse struct {
 	CheckedAt        time.Time              `json:"checked_at"`
 	API              systemComponentStatus  `json:"api"`
 	Database         systemComponentStatus  `json:"database"`
+	Agent            systemComponentStatus  `json:"agent"`
 	SecurityBoundary systemSecurityBoundary `json:"security_boundary"`
 }
 
 type systemStatusHandler struct {
-	database    Database
-	pingTimeout time.Duration
-	now         func() time.Time
+	database            Database
+	pingTimeout         time.Duration
+	agentRuntimeEnabled bool
+	now                 func() time.Time
 }
 
 func registerSystemStatusRoute(
@@ -44,6 +46,7 @@ func registerSystemStatusRoute(
 	database Database,
 	authService AuthService,
 	pingTimeout time.Duration,
+	agentRuntimeEnabled bool,
 ) {
 	if mux == nil || logger == nil || authService == nil {
 		return
@@ -51,7 +54,10 @@ func registerSystemStatusRoute(
 	if pingTimeout <= 0 {
 		pingTimeout = 5 * time.Second
 	}
-	handler := systemStatusHandler{database: database, pingTimeout: pingTimeout, now: time.Now}
+	handler := systemStatusHandler{
+		database: database, pingTimeout: pingTimeout,
+		agentRuntimeEnabled: agentRuntimeEnabled, now: time.Now,
+	}
 	secured := sessionAuthMiddleware(logger, authService,
 		requireRoleMiddleware(auth.RoleAdmin, http.HandlerFunc(handler.serve)))
 	secured = authNoStoreMiddleware(secured)
@@ -84,6 +90,7 @@ func (handler systemStatusHandler) serve(writer http.ResponseWriter, request *ht
 		CheckedAt: handler.now().UTC(),
 		API:       systemComponentStatus{Status: "ready", Version: systemAPIVersion},
 		Database:  systemComponentStatus{Status: databaseStatus},
+		Agent:     systemComponentStatus{Status: agentRuntimeStatus(handler.agentRuntimeEnabled)},
 		SecurityBoundary: systemSecurityBoundary{
 			ManagementIPAllowlistEnforced: true,
 			AdministratorSessionRequired:  true,
@@ -91,4 +98,11 @@ func (handler systemStatusHandler) serve(writer http.ResponseWriter, request *ht
 			RemoteOperationsEnabled:       false,
 		},
 	})
+}
+
+func agentRuntimeStatus(enabled bool) string {
+	if enabled {
+		return "configured"
+	}
+	return "not_configured"
 }

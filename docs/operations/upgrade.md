@@ -1,116 +1,166 @@
-# 生产升级
+# 管理端升级、验证与卸载
 
-升级只从同步到 Debian 13 的新源码目录开始。不要在 Windows 本地安装依赖或生成构建产物，也不要把新源码直接覆盖 `/srv/probe` 中的活动发布。
+本文只适用于独立的 management 产品，即 `probe-admin` 管理界面与 `probe-api` API。
+它不升级、验证或卸载 Agent 和访客前端，也不会接管无关 Nginx 站点或 PostgreSQL
+数据库。
 
-## 1. 升级前检查
+`management v1.2.0` 是尚未发布的第一个独立 management candidate baseline，
+没有合法的 management 前序版本，所以它不能作为升级目标取得 `upgrade` 证据，
+机器账本固定为 60 candidate、0 supported。第一个有效升级目标是 v1.2.1：每个
+cell 必须从同平台、同架构、同入口的不可变 v1.2.0 升级。下面的 v1.2.1 命令只是
+未来晋级合同，不是当前可执行的生产升级通知。
 
-1. 把新版本同步到新的只含源码目录，例如 `/var/tmp/probe-source-20260824/`。
-2. 阅读版本的数据库迁移和配置变化；确认当前备份空间充足。
-3. 确认 `/srv/probe/config/probe-api.env`、活动 Nginx 配置、TLS 和白名单已由配置管理或离线方式另行备份。
-4. 确认 PostgreSQL、API 和 Nginx 当前健康：
+## 1. 统一使用根 `install.sh`
 
-```bash
-bash /var/tmp/probe-source-20260824/probe-api/deploy/scripts/validate-production.sh runtime
-```
-
-脚本不会更新系统包，也不会修改防火墙。若新版本需要新的 Debian 包，先按变更说明人工安装。
-
-## 2. 只验证、不切换
-
-建议先运行：
-
-```bash
-cd /var/tmp/probe-source-20260824
-bash probe-api/deploy/scripts/upgrade.sh \
-  --source-root /var/tmp/probe-source-20260824 \
-  --validate-only
-```
-
-该模式会在临时目录中分别测试并构建 `probe-api`、`probe-agent`、`probe-web` 和 `probe-admin`，并检查当前活动配置、systemd 与 Nginx，但不会：
-
-- 创建数据库备份；
-- 执行迁移；
-- 切换发布链接；
-- 重启或重载服务。
-
-它会解析新源码中的三个正式 systemd 单元，并读取持久化的 `PROBE_INGRESS_MODE`，按对应的新源码模板核对活动 Nginx 全部入口、端口与路由；不会只检查旧的已安装单元。待部署的新 API 二进制还会在任何迁移或发布切换前直接使用 Go `crypto/x509` 复核当前模式的证书。`domain` 模式只能使用 80/443，三个固定证书/私钥必须分别匹配对应 DNS SAN、ServerAuth、公信根和 fullchain 中间证书，且 `certbot.timer` 必须为 enabled/active；`ip` 模式只能使用 18453/18454/18455，固定叶证书必须仅含所选 IP SAN、由固定有效私有 CA 直接签发，且 `certbot.timer` 必须为 disabled/inactive。验证不会要求另一模式的证书材料。验证全程持有与备份/恢复共用的数据库维护锁，因此不能与定时备份或恢复演练并行。
-
-依赖下载产生的 Go/npm 缓存仅存在于 Debian 构建环境。两个前端的 `node_modules` 和 `dist` 位于临时构建副本，不写回同步源码目录。
-
-## 3. 执行升级
-
-验证通过后执行：
-
-```bash
-bash probe-api/deploy/scripts/upgrade.sh \
-  --source-root /var/tmp/probe-source-20260824
-```
-
-默认必须通过四个工程的测试和检查。`--skip-tests` 只用于已经在同一份同步源码上完成等价验证的紧急维护窗口，不能作为常规流程。
-
-升级顺序固定为：
-
-1. 源码和活动配置预检；
-2. 四工程独立测试与构建，其中 Agent 同时生成 amd64/arm64 首次安装资产和 SHA256 清单；
-3. 新源码 systemd 单元、当前 ingress 模式的 Nginx 入口/路由、证书链、Certbot timer、白名单和发布产物校验；
-4. 新发布写入 `/srv/probe/releases/<release-id>/` 并生成 SHA-256 清单；
-5. `pg_dump` 写入 `/srv/probe/backups/pre-upgrade-<release-id>.dump`，再用 `pg_restore --list` 验证；
-6. 新 API 二进制执行前向迁移；
-7. 原子替换 API、Agent 下载、游客前端、管理前端和迁移清单五个活动链接；
-8. API 重启、Nginx reload-or-restart、证书与 Certbot timer 运行态复验、readiness 和监听地址验收。
-
-升级不会覆盖：
+v1.2 起，管理端生命周期入口统一为完整的 standalone 根 `install.sh`：
 
 ```text
-/srv/probe/config/probe-api.env
-/srv/probe/config/nginx/nginx.conf
-/etc/probe-panel/admin-allowlist.geo
-/etc/probe-panel/tls/
-/srv/probe/backups/
-PostgreSQL 数据目录
+install [--accept-eol]   首次安装管理端 Setup
+upgrade [--accept-eol]   升级已完成 Setup 的 v1.2+ 管理端
+validate                 只读验证已安装的管理端
+status                   查看 bootstrap/Setup 状态，不输出秘密
+uninstall                普通卸载并保留数据
 ```
 
-升级不会覆盖活动环境或 Nginx 配置，也不会重生成证书或切换 ingress 模式。比较配置时直接使用本次同步源码中的 `probe-api/config/*.example` 以及与当前模式对应的 `probe-api/deploy/nginx/nginx.conf` 或 `nginx-ip.conf`，避免把旧 `.example` 误认为当前版本契约。
+`purge` 不受支持。历史三产品整包 `v1.1.0` 不能直接使用这一管理端升级路径；必须按
+其不可变旧版本文档处理，再设计经过备份验证的独立迁移。
+
+不要从 `main`、工作树或未经校验的临时 URL 执行生产升级。正式发布后，应先把完整
+脚本保存到 root-only 路径，核对发布方给出的 SHA-256，再运行；不要把数据库密码、
+管理员密码或 Token 放进参数。下文用 `/root/probe-panel-install-v1.2.1.sh` 表示这份
+已校验脚本。
+
+## 2. 升级前检查
+
+升级只接受已经完成 Setup、且安装了 v1.2+ management lifecycle 工具的主机。先执行：
+
+```bash
+sudo bash /root/probe-panel-install-v1.2.1.sh validate
+sudo bash /root/probe-panel-install-v1.2.1.sh status
+```
+
+`validate` 调用已安装的 `/usr/local/lib/probe-panel/validate-management.sh all`，只读
+检查以下内容：
+
+- 当前主机仍精确匹配安装时记录的 ABI v2 平台 ID 和 systemd profile；
+- 活动 API、管理 SPA、迁移目录和 release 内层 SHA 清单未漂移；
+- 配置、白名单、TLS、Nginx 管理端片段和 lifecycle 工具安全且归属正确；
+- PostgreSQL、`probe-api`、Nginx、备份 timer、TLS、readiness 和监听边界健康；
+- IP 模式仍只使用管理 IP 入口，domain 模式仍遵守其独占 80/443 与 Certbot 契约。
+
+同时确认：
+
+1. 最近一次 custom-format PostgreSQL 备份及 `.sha256` 已复制到异机存储并完成恢复
+   演练；
+2. `/srv/probe/config`、`/etc/probe-panel` 和必要的 TLS/白名单材料已有离线备份；
+3. 当前没有备份、恢复、另一安装或升级任务；
+4. 已阅读目标 Release 的数据库迁移说明和失败边界；
+5. EOL candidate 已确认受管仓库和密钥仍可用，并明确接受 `--accept-eol` 风险。该参数
+   不恢复厂商安全维护；Debian/Ubuntu 只维护自己的隔离 source，不覆盖用户源，CentOS
+   在完整 Vault/EPEL 隔离链完成前不得升级。
+
+验证失败时不要绕过。`upgrade` 会再次执行同类 host 与平台检查，并持有部署锁和
+数据库维护锁。
+
+## 3. 执行 management-only 升级
+
+不可变 v1.2.0 baseline 与正式 v1.2.1 目标资产均发布后，常规候选平台执行：
+
+```bash
+sudo bash /root/probe-panel-install-v1.2.1.sh upgrade
+```
+
+账本中标记为 EOL 的候选平台必须显式执行：
+
+```bash
+sudo bash /root/probe-panel-install-v1.2.1.sh upgrade --accept-eol
+```
+
+当前 v1.2.0 baseline 与 v1.2.1 目标都未发布，因此现在运行会因缺少匹配的不可变 Release 资产而失败关闭。
+不要通过修改版本常量、替换下载地址或跳过校验来使它继续。
+
+升级流程固定为：
+
+1. 精确识别 OS、版本、架构、systemd 和 EOL 层级，验证已安装 management host；
+2. 下载该架构唯一的 management bundle 与 `SHA256SUMS`，校验外层 SHA、限制大小，
+   再用安全解包器拒绝链接、设备、路径逃逸和额外根目录；
+3. 校验 `RELEASE-MANIFEST` 的 management profile、ABI v2、精确平台集合，以及包内
+   `BUNDLE-SHA256SUMS` 白名单；目标机不会安装 Go/Node 或现场构建源码；
+4. 再次确认平台指纹未变化，调用已校验 bundle 内的 `install-release.sh`；
+5. 验证当前配置、TLS、白名单、Nginx、备份凭据和可切换链接，写入唯一的不可变
+   `/srv/probe/releases/<release-id>/`；
+6. 记录服务活动状态，先停下 API 与备份 timer，再创建并用 `pg_restore --list`
+   校验 PostgreSQL 备份，然后执行新 API 的 forward-only migration，避免旧 API 在
+   迁移窗口继续写库；
+7. 只原子切换 API、管理 SPA 和 migrations 三个 management 链接，安装对应平台的
+   service/backup/lifecycle 资产；
+8. 重启 API、恢复备份 timer、reload-or-restart Nginx，并重新验证 TLS、readiness、
+   服务和监听边界。
+
+升级不会安装或切换 Agent、访客前端，也不会改变 ingress 模式、重签证书、覆盖活动
+环境文件或清理旧 release。它保留配置、TLS、白名单、PostgreSQL 数据和既有备份。
 
 ## 4. 升级后验收
 
-```bash
-bash probe-api/deploy/scripts/validate-production.sh all \
-  --source-root /var/tmp/probe-source-20260824
+脚本成功返回后再次执行：
 
-systemctl status probe-api nginx postgresql --no-pager
-journalctl -u probe-api --since '-10 minutes' --no-pager
+```bash
+sudo bash /root/probe-panel-install-v1.2.1.sh validate
+
+systemctl status probe-api.service nginx.service \
+  probe-postgres-backup.timer --no-pager
+journalctl -u probe-api.service --since '-10 minutes' --no-pager
 ```
 
-还应实际验证：
+还应实际确认管理员登录和写操作正常、非白名单来源被拒绝、API 只监听
+`127.0.0.1:8080`、PostgreSQL 没有公网监听，并检查当前 ingress 对应的管理入口。
+Agent 与访客前端是独立产品；它们不属于本次成功条件，也不应因管理端升级被改动。
 
-- 游客 Host 无需登录即可读取允许的 Panel API，但没有登录页或管理 API；
-- 管理 Host 未登录 API 返回 401，管理员登录和写操作正常；
-- Agent 入口的注册、配置和上报路由正常，五项固定发布资产可下载且 SHA256 通过；IP 生产模式还应验证只有 Agent 入口可下载固定 `ca.pem`，且其完整文件 SHA-256 与管理面板命令指纹一致；域名模式不应公开 `ca.pem`。未知下载和浏览器管理路由返回 404；panel/admin 入口的下载路径返回 404；
-- 非白名单来源不能读取两个前端的 HTML、JS、CSS；
-- Nginx 只监听当前模式允许的 80/443 或 18453/18454/18455，API 仅监听 `127.0.0.1:8080`，PostgreSQL 未暴露公网；
-- Agent 在升级窗口后继续上报，且没有任何反向连接或远程升级行为。
+## 5. 失败和恢复边界
 
-## 5. 失败和回退
+下载、外层/内层校验、平台复核、配置、TLS、Nginx 或迁移前备份失败时，不会切换
+活动 release。数据库迁移成功后发生链接、service 资产或 runtime 验证失败，升级器
+会从 root-only 快照恢复旧的 API、管理 SPA、migrations 链接、systemd/备份/lifecycle
+资产和原服务活动状态；这仍不是数据库回滚。升级器同时保留：
 
-构建、配置、Nginx 或备份失败发生在迁移和切换之前，不会改变活动发布。迁移成功后若新服务未通过 readiness，脚本会恢复旧的 API、Agent 下载和前端链接，并重启旧 API；同时保留：
-
-- 失败的新发布目录；
+- 失败的新 release 目录；
 - 迁移前 PostgreSQL 备份；
-- 已经提交的前向数据库迁移。
+- 已提交的 forward-only 数据库迁移。
 
-数据库迁移不会自动执行 down。旧二进制是否兼容新结构必须以该版本迁移说明为准。若必须恢复数据库，应进入维护窗口，停止写入并按照[备份与恢复](backup-restore.md)使用脚本打印的 custom-format 备份；不要只恢复数据库而保留不匹配的应用发布。
+数据库不会自动执行 down migration，旧二进制也不一定兼容新结构。错误信息给出的
+备份路径必须保留；若确需恢复数据库，进入维护窗口并按[备份与恢复](backup-restore.md)
+使用安装好的 management restore coordinator。不要只恢复数据库而继续运行与其结构
+不匹配的应用 release。该 coordinator 不要求 API 在恢复前通过 readiness；API 已经
+`inactive` 或 `failed` 时，仍可在 PostgreSQL、Nginx、宿主资产和配置验证通过后进入
+受控维护窗口，恢复后再执行当前不可变 API 的 forward migration 与完整 runtime 验证。
 
-旧发布不会自动删除。确认新版本稳定并且备份保留策略满足要求后，才可人工清理不再需要且不被任何活动链接引用的旧发布目录。
+## 6. 只读验证与普通卸载
 
-## 6. 配置变更
-
-升级脚本永远不把新示例覆盖到活动配置。比较时应避免把密码打印到终端或日志：
+任意维护窗口都可运行：
 
 ```bash
-diff -u \
-  /var/tmp/probe-source-20260824/probe-api/config/probe-api.env.example \
-  /path/to/offline-redacted-active-env
+sudo bash /root/probe-panel-install-v1.2.1.sh validate
 ```
 
-修改活动配置后先执行 `upgrade.sh --validate-only`。活动 Nginx 片段只允许基于当前模式的源码模板替换三个域名或唯一 IP 占位符；`PROBE_INGRESS_MODE`、Origin、Agent URL、证书路径与监听端口必须成套一致。修改白名单时，必须先通过同一份 API 二进制的 allowlist 校验和 `nginx -t`，再重启 API、重载 Nginx，避免两个白名单层漂移。
+普通卸载前先完成并异机保存最终备份，然后执行：
+
+```bash
+sudo bash /root/probe-panel-install-v1.2.1.sh uninstall
+```
+
+根入口会委托安装好的 `uninstall-management.sh` 停止并移除 Probe 自有的 API、备份
+timer、管理 SPA 链接、Nginx include、systemd 单元和脚本；失败时会尽力恢复暂存路径
+和原服务状态。普通卸载明确保留：
+
+```text
+/srv/probe/config/
+/etc/probe-panel/
+/var/lib/probe-panel/
+/var/backups/probe-panel/
+PostgreSQL 数据库
+不可变 release 目录
+共享的 Nginx/PostgreSQL 软件包与无关站点
+```
+
+删除上述数据属于 purge，必须另行评审、核对精确目标并验证最终备份；不能把
+`uninstall` 当作数据清除命令。

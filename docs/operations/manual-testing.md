@@ -1,150 +1,120 @@
-# Debian 13 内网预览手工验收清单
+# 管理端手工验收清单
 
-> 适用环境：`192.168.33.253` 的持久化预览。生产环境由用户自行部署，本清单不把预览证书、高端口或测试数据当作生产配置。ICMP 已按范围决定延期，不属于本轮验收项。
+本文只验收独立 management 产品：`probe-admin + probe-api + PostgreSQL`。Agent 与
+访客前端不属于本清单，不要求 `18453`、`18454`、Agent 下载站或游客页面存在。
+未配置 Agent 时，`agent.status=not_configured` 以及 Agent 路由/令牌失败关闭是正确结果。
 
-## 首次安装页面
+当前 v1.2.0 是 `promotion_eligible=false` 的 candidate baseline，机器账本为
+60 candidate、0 supported。本清单通过只能形成候选证据，不能直接改写正式状态。
 
-- [ ] 全新部署的终端输出和 `/install` 页面都不出现安装码、口令输入框或“找回安装码”流程；按提示用 root SSH 把服务器私有 Unix Socket 转发到本机 `127.0.0.1:18080` 后，页面自动建立短期会话。
-- [ ] 三个域名默认全部为空，页面明确显示服务器识别的 IP，以及游客 `https://IP:18453`、Agent `https://IP:18454`、管理 `https://IP:18455`；不填写域名可以继续完成安装。
-- [ ] 只填写一个或两个域名时，前端和 Setup API 都拒绝提交；三个域名全部填写时才切换到三域名、80/443 与 ACME 模式。
-- [ ] 在 `pending/configuring` 状态刷新页面或重启 Setup 服务后能安全获得新会话，不需要安装码；进入 `finalizing/installed/recovery_required` 后不能重新打开配置。
-- [ ] 安装页在深色和浅色模式下逐步检查数据库、入口、白名单、管理员与确认页；主题切换不改变字段值、校验结果或布局结构。
-- [ ] 安装完成后私有 Socket、Setup 与 Finalizer 单元均关闭；正式游客、Agent、管理入口的 `/install` 和 `/api/v1/setup/*` 永久返回失败状态。
+## 1. 记录精确 cell
 
-## 1. 测试入口与基线
+验收前记录且不要横向外推：
 
-| 项目 | 地址或当前状态 |
-|---|---|
-| 游客前端 | `https://192.168.33.253:18453/` |
-| 管理前端 | `https://192.168.33.253:18455/login` |
-| Agent API/下载 | `https://192.168.33.253:18454/`；根路径应返回 `404`，不是网页 |
-| 管理员用户名 | `stage5-admin` |
-| 管理员密码 | 只在当前交付消息中提供，不写入源码、本文档或虚拟机配置 |
-| 在线节点 | `Stage 5 Debian VM` / hostname `debian` |
-| 现有探测目标 | `Local SSH TCP`，TCP，已启用 |
+- 精确 platform ID、`/etc/os-release` 哈希、systemd 版本与 PID 1；
+- `uname -m` 对应的 `amd64` 或 `arm64`；
+- 本 cell 唯一入口：`ip` 或 `domain`；
+- VM image ID/哈希、Release tag、source commit、外层资产 SHA-256 与内层 manifest SHA；
+- 测试开始 UTC 时间和测试人。
 
-预览证书为 CN `192.168.33.253` 的私有自签名证书，有效期至 2026-09-21。接受或导入证书前核对 SHA-256 指纹：
+一个 cell 只执行所选入口的 `fresh`。平台级正式支持必须另有
+`amd64/ip`、`amd64/domain`、`arm64/ip`、`arm64/domain` 四格完整证据。
 
-```text
-37:5B:43:2E:28:FD:A5:96:75:33:60:52:6E:38:87:76:
-B4:26:AD:2B:52:3F:8F:67:62:F3:83:D6:B8:21:96:81
-```
+## 2. 无修改预检
 
-建议先用普通窗口测试游客端，再用另一个窗口测试管理端；测试 Session 隔离时使用隐私窗口。连续输错密码可能触发登录限流，这是预期行为。
+- [ ] 未列出的发行版、错误 init、错误架构和低于下限的 systemd 在主机变更前退出。
+- [ ] 旧版/EOL/延长维护层缺少 `--accept-eol` 时退出；Debian/Ubuntu 仅创建隔离受管
+  source 且不覆盖用户源，缺 keyring/HTTPS method/目标架构 PG14 时失败关闭。
+- [ ] 缺少 Bash、Python 3、CA、安全 HTTPS 下载器或校验工具时列明缺项并退出。
+- [ ] 外层校验失败、危险 tar 成员、额外根目录、内层清单错误或平台 ABI 不匹配时退出。
+- [ ] 外露 PostgreSQL、第三方 Web 栈、归属不明 Probe 路径及入口冲突按承诺失败。
+- [ ] 失败前后比较包、账号、unit、服务状态、Nginx 配置和 Probe 永久路径，确认无修改。
+- [ ] CentOS SELinux Enforcing 当前在任何主机变更前失败关闭；Permissive/Disabled
+      结果不能成为正式支持证据。
 
-## 2. 游客前端
+## 3. 首次 Setup
 
-- [ ] 打开游客入口后无需账号、密码或 Session，自动进入 `/overview`。
-- [ ] 清除该站点的 `localStorage` 后首次打开应为原有深色；点击右上角主题按钮切到浅色，页面布局、导航、卡片位置和信息密度不变，刷新后仍保持浅色，再切回深色也应立即生效。
-- [ ] 页面只出现游客总览、节点详情和探测分析，不出现管理员登录、账号、Token、配置或审计入口。
-- [ ] 总览显示节点总数、在线/离线/异常数量，并看到 `Stage 5 Debian VM` 为在线。
-- [ ] CPU、内存、根磁盘、上下行、最后上报时间来自真实 Agent，等待 10 秒后会刷新。
-- [ ] 打开节点详情，CPU、内存、磁盘、网络和 Load 曲线只显示最近 5 分钟；等待约 5 秒可看到刷新。
-- [ ] 打开探测分析，选择 `Local SSH TCP`，确认最小/平均/最大延迟、Sent/Received、丢包率及趋势图有真实数据。
-- [ ] 分别在深色和浅色下检查节点详情与探测分析：图表坐标轴、网格、曲线、图例和提示框清晰可辨，键盘聚焦按钮或表单时有可见焦点轮廓。
-- [ ] 切换历史范围时历史图重新加载；停留页面时只有当前近 5 分钟数据按 10 秒刷新，不应每 10 秒重置整条历史图。
-- [ ] 直接访问游客入口的 `/login`、`/admin/nodes` 或 `/api/v1/auth/me`，应返回 `404`，证明游客入口没有管理能力。
+- [ ] bootstrap 只安装 management bundle，不出现 Agent/游客二进制、服务或入口。
+- [ ] 安装终端和 `/install` 都不显示或要求安装码。
+- [ ] 使用 root SSH 把 `/run/probe-panel-setup/setup.sock` 转发到本机
+      `127.0.0.1:18080`；服务器没有 TCP 18080 监听。
+- [ ] Setup 父目录是 `root:root 0700`，Socket 是 `root:root 0600`。
+- [ ] `pending/configuring` 刷新或重启后可安全重签短期会话；
+      `finalizing/installed/recovery_required` 不会重新开放配置。
+- [ ] 只配置本机 PostgreSQL、一个管理入口、TLS、白名单和首个管理员。
+- [ ] 管理员/数据库密码不会进入命令行、日志、环境转储或验收附件。
 
-## 3. 管理员登录与系统状态
+## 4. 入口专项
 
-- [ ] 打开管理入口登录页，页面显示服务端识别的来源 IP `192.168.33.253`，或显示实际通过白名单的宿主机来源地址。
-- [ ] 登录前即可在右上角独立切换深色/浅色，刷新登录页后保持选择；登录成功后的管理页面沿用同一主题，Header 中仍可切换。
-- [ ] 游客面板和管理面板分别选择不同主题并各自刷新，确认两边偏好互不影响；主题偏好不应改变登录状态。
-- [ ] 使用 `stage5-admin` 登录；错误密码只显示统一失败提示，不泄露账户是否存在。
-- [ ] 登录成功后进入“节点与凭证”，顶部只显示管理员身份及管理导航。
-- [ ] 打开“系统只读状态”，总状态、API 和数据库均应为 `ready`，API 版本为 `v1`。
-- [ ] 安全边界应显示：管理白名单、管理员 Session、管理写 CSRF 均已启用，远程操作为关闭。
-- [ ] 刷新页面后 Session 仍能恢复；点击退出后再次进入管理路由应回到登录页。
+### IP cell
 
-## 4. 节点与 Agent 配置
+- [ ] 只生成 `https://IP:18455/login`，`18453/18454` 不是成功条件。
+- [ ] 私有 CA、叶证书与私钥权限正确，叶证书只有规范 IP SAN 和 ServerAuth。
+- [ ] 显式信任 CA 后 TLS 校验成功；不使用明文 HTTP 或 `--insecure`。
+- [ ] Certbot timer 保持 disabled/inactive。
 
-先测试无破坏操作：
+### Domain cell
 
-- [ ] 打开 `Stage 5 Debian VM` 编辑页，能看到显示名、启用状态、采集/上报周期、挂载点、配置刷新周期和内存队列。
-- [ ] 只修改显示名或一个合法周期并保存，看到成功提示；真实 Agent 会在下一次配置刷新后继续上报。
-- [ ] 输入小于/大于界面允许范围的周期、空挂载点等非法值，前端应阻止提交；API 仍有独立校验。
-- [ ] 恢复原设置，确认节点继续在线、最近上报时间继续推进。
+- [ ] 只接受一个规范管理 FQDN，管理入口使用 80/443 和公信 ACME。
+- [ ] DNS、ACME、证书链、SAN、有效期和续期 timer 均通过验证。
+- [ ] 当前 domain 合同为 Probe 独占 80/443；活动 Nginx/既有站点冲突时失败关闭，
+      不伪装成共存成功。
 
-一次性安装命令可用临时节点测试：
+## 5. 管理产品功能
 
-- [ ] 创建 `manual-test-node`；节点保存成功后应自动弹出“Agent 一键安装命令”，无需再手动点一次生成按钮。
-- [ ] 弹窗明确提示 15 分钟期限、root Shell、进程参数、Shell 历史和剪贴板风险；命令应从当前明确允许的 `refs/tags/v1.0.2` GitHub Raw 不可变 Release 读取安装器，不依赖最小 Debian 预装 `sudo`，不得使用未经核验的其他标签或 `main`，也不再出现整段证书 Base64。复制按钮复制完整命令，关闭后页面不再显示，刷新页面不能恢复同一条命令。
-- [ ] 关闭后点击该节点的“安装命令”会签发新命令并使上一条未使用命令立即失效；不要期待恢复或继续使用旧命令。
-- [ ] 新建禁用节点时不自动生成命令，列表按钮也不可用；启用后才能生成。
-- [ ] 已注册节点按钮显示“重新安装命令”并先二次确认；仅生成不会影响旧 Agent，命令成功注册后旧 Agent 才会失效。
-- [ ] 刷新列表后临时节点仍存在但未注册，不应伪装成在线。
-- [ ] 删除临时节点，确认二次提示和删除成功；这只删除服务端记录，不会执行任何远程命令。
+- [ ] 管理登录成功；错误口令使用统一提示，限流和 `Retry-After` 生效。
+- [ ] Session 刷新可恢复，退出后受保护路由回到登录页。
+- [ ] 写请求同时要求同源 Origin、当前 Session 和 CSRF；缺一项均失败。
+- [ ] 管理白名单内可访问，白名单外返回 403；客户端伪造转发头不能绕过。
+- [ ] 系统状态中 API/PostgreSQL 为 ready，管理安全边界显示已启用。
+- [ ] 可创建、编辑、禁用和删除节点配置；非法周期/挂载点由前端和 API 双重拒绝。
+- [ ] 未配置 Agent 时状态明确为 `not_configured`，Agent 路由不注册，安装命令和
+      Token 签发返回失败状态且不产生秘密。
+- [ ] 管理员创建、禁用、改密、删除和“保留最后一个可用管理员”约束正确。
+- [ ] 审计记录关键管理操作，但不含密码、Cookie、CSRF、数据库凭据或 Token。
+- [ ] 页面中不存在 SSH、终端、命令执行、文件管理或远程服务控制能力。
 
-在不消费令牌的情况下可核对下载边界：
-
-```bash
-curl --fail --cacert /srv/probe-stage5-preview/tls/server.crt \
-  https://192.168.33.253:18454/downloads/probe-agent/install.sh
-curl --fail --cacert /srv/probe-stage5-preview/tls/server.crt \
-  https://192.168.33.253:18454/downloads/probe-agent/SHA256SUMS
-curl --fail --cacert /srv/probe-stage5-preview/tls/server.crt \
-  https://192.168.33.253:18454/downloads/probe-agent/ca.pem \
-  | sha256sum
-```
-
-`ca.pem` 的 SHA-256 必须与短命令 `-c` 后的 64 位值一致；同一路径从游客 `18453` 或管理 `18455` 请求应为 `404`，Agent Host 上未知文件也应为 `404`。如要实际执行命令，使用一台没有 `/var/lib/probe-agent/state.json`、`/usr/local/bin/probe-agent`、`/etc/probe-agent/probe-agent.env`、`/etc/probe-agent/private-ca.pem`、对应 systemd 单元且服务未运行的干净 Linux systemd 测试机；在可使用 `sudo` 的 Shell 粘贴即可。成功后确认服务 active、节点上线，且环境文件已无 `PROBE_AGENT_ENROLLMENT_TOKEN`。不要在当前预览 Agent 上覆盖测试。
-
-预览环境可在标准三入口安全冒烟命令后增加 `--expect-private-ca`，自动执行上述三个 `ca.pem` 路由断言；公信 TLS 的生产环境不发布 `ca.pem`，不要使用该参数。
-
-不要在前面的测试中轮换、吊销或删除 `Stage 5 Debian VM`：这些功能设计上会让当前 Agent 的旧 Token 立即失效并使节点离线。若要验证该破坏性边界，请放到最后执行，测试后需要重新注册 Agent。
-
-## 5. TCP、HTTP 与 HTTPS 探测
-
-在“探测目标配置”中使用当前在线节点：
-
-1. 现有 `Local SSH TCP` 用于验证 TCP 成功探测。
-2. 新建 `Manual HTTP 200`：类型 HTTP、主机 `127.0.0.1`、端口 `80`、路径 `/`、周期 `10` 秒、超时 `3` 秒、保留 `1` 天。等待 Agent 刷新后，游客探测页应出现数据且 HTTP 状态成功。
-3. 把路径改成 `/probe-manual-missing`。该地址固定返回 404；游客页应继续增加 Received、传输丢包保持 0，但综合失败率和 HTTP 错误增加。
-4. 把路径恢复 `/`，确认后续结果恢复成功。
-5. 新建 HTTPS 目标可使用主机 `example.com`、默认端口、路径 `/`；该虚拟机以 Agent 运行用户访问时已验证返回 200。若以后外部网络不可达，应把它判断为测试环境网络问题。
-6. 分别测试启用、停用、编辑和删除；删除会永久删除该目标历史，界面必须二次确认。
-7. 保留期滑块允许 1～90 天，不能超过 90 天；超限同时受前端、API 和 PostgreSQL 约束。
-
-ICMP 不应出现在类型选择中，向 API 提交 ICMP 也应被拒绝。
-
-## 6. 管理员账户
-
-- [ ] 创建临时管理员 `manual-admin`，使用至少 12 字节的临时密码。
-- [ ] 在隐私窗口用临时管理员登录，确认其具有相同的管理员功能。
-- [ ] 修改临时管理员用户名、密码或启用状态；旧 Session 在禁用或改密后应失效。
-- [ ] 删除临时管理员并确认其不能再次登录。
-- [ ] 在系统只剩 `stage5-admin` 时尝试禁用或删除它，服务端应以“必须保留最后一个可用管理员”拒绝。
-
-## 7. 审计与入口隔离
-
-- [ ] 打开审计日志，能看到登录成功/失败、节点、Token、探测目标和管理员变更记录。
-- [ ] 审计详情不应包含明文密码、Session、CSRF、注册令牌或 Agent Token。
-- [ ] 未登录访问管理 API 返回 `401`；登录后缺少 CSRF 的写请求应被拒绝。
-- [ ] 游客入口访问认证/管理 API 返回 `404`；管理入口访问 Agent API 返回 `404`；Agent 入口使用错误 Token 返回 `401`。
-- [ ] 产品页面中不存在终端、SSH、命令、脚本、文件管理、端口转发、远程服务控制或远程升级功能。
-
-## 8. 运维状态（可选 SSH 核对）
-
-使用虚拟机自身的 SSH 管理能力核对，不属于面板远程控制：
+## 6. 本机运行边界
 
 ```bash
-systemctl is-active \
-  probe-stage5-preview-postgresql.service \
-  probe-stage5-preview-api.service \
-  probe-stage5-preview-nginx.service \
-  probe-stage5-preview-agent.service \
-  probe-stage5-preview-backup.timer
-
-curl --fail http://127.0.0.1:18090/internal/health/live
-curl --fail http://127.0.0.1:18090/internal/health/ready
+# Debian/Ubuntu 使用 postgresql.service；CentOS 使用 postgresql-14.service。
+POSTGRES_UNIT=postgresql.service
+systemctl is-active "$POSTGRES_UNIT" probe-api.service nginx.service \
+  probe-postgres-backup.timer
+curl --fail http://127.0.0.1:8080/internal/health/live
+curl --fail http://127.0.0.1:8080/internal/health/ready
+nginx -t
+ss -H -lnt
 ```
 
-五项均应为 `active`，健康检查应分别返回 `ok` 和 `ready`。宿主机可访问 `18453/18454/18455`，但不能直接连接回环 API `18090` 或仅使用 Unix socket 的预览 PostgreSQL `55433`。
+- [ ] API 只监听 `127.0.0.1:8080`。
+- [ ] PostgreSQL 5432 只监听 `127.0.0.1` 和/或 `::1`。
+- [ ] IP cell 只有管理 `18455`；domain cell 使用其 80/443 合同。
+- [ ] Setup 与 Finalizer 完成后停用，正式入口的 `/install` 和
+      `/api/v1/setup/*` 永久失败关闭。
+- [ ] 原生 Nginx/PostgreSQL 包归属、unit 和实际运行命令与平台档案一致。
 
-## 9. 测试结束后的建议
+## 7. 生命周期和故障注入
 
-- 删除 `manual-test-node`、`manual-admin` 和手工创建的探测目标。
-- 恢复在线节点的显示名、采集周期、挂载点和启用状态。
-- 不需要保留的 Session 使用页面“退出”结束。
-- 若测试过当前在线 Agent 的 Token 轮换、吊销或节点删除，请重新注册 Agent，而不是修改数据库绕过认证。
-- 把发现的问题记录为：测试步骤、期望、实际、浏览器控制台/网络状态、发生时间；不要附带明文 Token、密码或 Cookie。
+- [ ] 真实重启前后 boot ID 不同；重启后 API、Nginx、PostgreSQL、备份 timer
+      恢复，Setup 不重开。
+- [ ] v1.2.1 及以后从同平台、同架构、同入口的不可变前序 management 版本升级。
+      v1.2.0 没有合法前序，不能用历史 full v1.1.0 伪造升级证据。
+- [ ] 在数据库备份、迁移、链接切换、服务资产安装和运行验证各阶段注入失败。
+- [ ] 失败时旧链接、精确 unit/脚本/Nginx include、enablement 和原服务活动状态恢复；
+      已完成的前向迁移及备份路径被明确报告。
+- [ ] HUP/INT/TERM 走同一事务回滚，退出码保真；二次信号不会中断回滚。
+- [ ] 生成 custom-format PostgreSQL 备份、校验 SHA 和 `pg_restore --list`，并在
+      隔离环境完成恢复和迁移后验证。
+- [ ] 普通卸载只移除九个 Probe 激活资产，保留配置、TLS、数据库、备份、release
+      目录及共享 Nginx/PostgreSQL；不提供隐式 purge。
+
+## 8. 正式证据
+
+每个场景保存原始输出、退出码、前后状态摘要和 SHA-256，至少包括 `fresh`、
+`coexistence`、`conflict`、`no_mutation`、`reboot`、`upgrade`、`fault`、
+`backup_restore`、`uninstall`；EOL cell 另有 `eol_repository`，CentOS 另有真实
+`selinux_enforcing`。证据必须来自 full-system VM 和不可变 GitHub Release 资产。
+
+容器、静态契约、一次安装成功、Actions 临时 Artifact 或相邻版本结果都不能代替
+正式证据。v1.2.0 即使通过除升级外的候选验收，也仍保持 0 supported。

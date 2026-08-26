@@ -27,7 +27,7 @@
 
       <div v-if="errorMessage" role="alert" class="p-3 bg-rose-500/10 border border-rose-500/30 rounded-xl text-xs text-rose-300">{{ errorMessage }}</div>
 
-      <section class="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <section class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
         <article class="p-4 bg-dark-900 border border-dark-700/80 rounded-xl shadow-lg">
           <div class="text-[10px] uppercase tracking-wider text-slate-500">总体状态</div>
           <div class="mt-3 flex items-center gap-2">
@@ -48,6 +48,11 @@
           <div class="text-[10px] uppercase tracking-wider text-slate-500">PostgreSQL</div>
           <div class="mt-3 text-sm font-semibold" :class="status?.database?.status === 'ready' ? 'text-emerald-400' : !status && errorMessage ? 'text-slate-400' : 'text-amber-400'">{{ databaseLabel }}</div>
           <div class="mt-2 text-[11px] text-slate-500">只展示认证成功后的连接与迁移检查；认证前数据库故障会由认证层返回通用失败。</div>
+        </article>
+        <article class="p-4 bg-dark-900 border border-dark-700/80 rounded-xl shadow-lg">
+          <div class="text-[10px] uppercase tracking-wider text-slate-500">Agent 接入</div>
+          <div class="mt-3 text-sm font-semibold" :class="status?.agent?.status === 'configured' ? 'text-emerald-400' : 'text-amber-400'">{{ agentLabel }}</div>
+          <div class="mt-2 text-[11px] text-slate-500">未配置时管理面板仍可使用并可预设节点参数，但 Agent 路由、安装命令和令牌轮换保持禁用。</div>
         </article>
       </section>
 
@@ -89,6 +94,11 @@ const headerState = computed(() => systemHeaderState(status.value, loading.value
 const overallLabel = computed(() => systemOverallLabel(status.value, loading.value, errorMessage.value))
 const overallTone = computed(() => systemOverallTone(status.value, errorMessage.value))
 const databaseLabel = computed(() => systemDatabaseLabel(status.value, loading.value, errorMessage.value))
+const agentLabel = computed(() => {
+  if (status.value?.agent?.status === 'configured') return '已配置'
+  if (status.value?.agent?.status === 'not_configured') return '待独立配置'
+  return loading.value ? '读取中' : '未知'
+})
 const checkedAt = computed(() => formatUTCDateTime(status.value?.checked_at))
 const boundaryItems = computed(() => {
   const boundary = status.value?.security_boundary || {}

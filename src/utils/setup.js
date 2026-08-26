@@ -5,7 +5,7 @@ const POSTGRES_IDENTIFIER = /^[a-z_][a-z0-9_]{0,62}$/
 const HOST_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 const RESERVED_DATABASE_NAMES = new Set(['postgres', 'template0', 'template1'])
-const DEFAULT_IP_PORTS = Object.freeze({ panel: '18453', agent: '18454', admin: '18455' })
+const DEFAULT_ADMIN_IP_PORT = '18455'
 const PRIVATE_CA_MAX_BYTES = 64 * 1024
 
 export function setupStatusValue(response) {
@@ -87,30 +87,27 @@ export function setupDefaultsValue(response) {
   if (response?.defaults == null) return null
   const defaults = response.defaults
   if (!defaults || typeof defaults !== 'object' || Array.isArray(defaults)) return null
+  if (defaults.profile !== 'management') return null
+  if (defaults.panel_url != null || defaults.agent_url != null) return null
   const serverIP = canonicalIPAddress(defaults.server_ip)
   if (!serverIP) return null
   const normalized = {
+    profile: 'management',
     server_ip: serverIP,
-    panel_url: validatedDefaultURL(defaults.panel_url, serverIP, DEFAULT_IP_PORTS.panel),
-    agent_url: validatedDefaultURL(defaults.agent_url, serverIP, DEFAULT_IP_PORTS.agent),
-    admin_url: validatedDefaultURL(defaults.admin_url, serverIP, DEFAULT_IP_PORTS.admin),
+    admin_url: validatedDefaultURL(defaults.admin_url, serverIP, DEFAULT_ADMIN_IP_PORT),
   }
-  return Object.values(normalized).every(Boolean) ? normalized : null
+  return normalized.admin_url ? normalized : null
 }
 
 export function setupUsesIPMode(payload) {
   const domains = payload?.domains || {}
-  return ['panel', 'admin', 'agent'].every((key) => !domains[key])
+  return !domains.admin
 }
 
 export function setupIPURLs(address) {
   const canonical = canonicalIPAddress(address)
   if (!canonical) return null
-  return {
-    panel_url: defaultIPURL(canonical, DEFAULT_IP_PORTS.panel),
-    agent_url: defaultIPURL(canonical, DEFAULT_IP_PORTS.agent),
-    admin_url: defaultIPURL(canonical, DEFAULT_IP_PORTS.admin),
-  }
+  return { admin_url: defaultIPURL(canonical, DEFAULT_ADMIN_IP_PORT) }
 }
 
 export function setupInstalledIPAccess(response) {
@@ -126,7 +123,7 @@ export function setupInstalledIPAccess(response) {
       || target.protocol !== 'https:'
       || target.username
       || target.password
-      || target.port !== DEFAULT_IP_PORTS.admin
+      || target.port !== DEFAULT_ADMIN_IP_PORT
       || target.pathname !== '/login'
       || target.search
       || target.hash
@@ -173,12 +170,11 @@ export function parseSetupAllowlist(value) {
 
 export function normalizeSetupPayload(form) {
   const domains = {
-    panel: String(form?.domains?.panel ?? '').trim().toLowerCase(),
     admin: String(form?.domains?.admin ?? '').trim().toLowerCase(),
-    agent: String(form?.domains?.agent ?? '').trim().toLowerCase(),
   }
-  const ipMode = Object.values(domains).every((value) => !value)
+  const ipMode = setupUsesIPMode({ domains })
   return {
+    profile: 'management',
     database: {
       mode: 'local',
       name: String(form?.database?.name ?? '').trim(),
@@ -206,6 +202,7 @@ export function normalizeSetupPayload(form) {
 }
 
 export function validateSetupStep(step, payload) {
+  if (payload?.profile !== 'management') return '管理端安装请求必须固定使用 management 发行类型'
   if (step === 1) {
     const database = payload?.database || {}
     if (database.mode !== 'local') return '首版安装仅支持服务器本机 PostgreSQL'
@@ -220,23 +217,18 @@ export function validateSetupStep(step, payload) {
 
   if (step === 2) {
     const domains = payload?.domains || {}
-    const domainValues = ['panel', 'admin', 'agent'].map((key) => domains[key] || '')
-    const populatedDomains = domainValues.filter(Boolean).length
-    if (populatedDomains > 0 && populatedDomains < 3) return '三个域名必须全部留空使用 IP 模式，或全部填写使用 ACME 模式'
-    if (populatedDomains === 0) {
+    if (
+      !Object.prototype.hasOwnProperty.call(domains, 'admin')
+      || Object.keys(domains).some((field) => field !== 'admin')
+    ) return '管理端安装请求包含不支持的入口字段'
+    if (!domains.admin) {
       const address = payload?.network?.address || ''
       if (!address || canonicalIPAddress(address) !== address) return '服务器 IP 必须填写规范的 IPv4 或 IPv6 地址'
       if (payload?.tls?.mode !== 'private_ca' || payload?.tls?.email) return 'IP 模式必须使用本机私有 CA，且不填写 ACME 邮箱'
     } else {
       if (payload?.network?.address) return '域名模式不能同时提交服务器 IP'
-      for (const [key, label] of [['panel', '游客面板'], ['admin', '管理面板'], ['agent', 'Agent API']]) {
-        if (!validHostname(domains[key])) return `${label}必须填写不含协议和路径的完整域名`
-      }
-      if (new Set([domains.panel, domains.admin, domains.agent]).size !== 3) return '游客面板、管理面板和 Agent API 必须使用三个不同域名'
-      if (domainValues.some((value, index) => domainValues.some((other, otherIndex) => index !== otherIndex && value.includes(other)))) {
-        return '三个域名不能互相包含，请使用彼此独立的完整域名'
-      }
-      if (payload?.tls?.mode !== 'acme') return '首版安装仅支持 ACME 公信证书'
+      if (!validHostname(domains.admin)) return '管理面板必须填写不含协议和路径的完整域名'
+      if (payload?.tls?.mode !== 'acme') return '域名安装仅支持 ACME 公信证书'
       if (!EMAIL_PATTERN.test(payload?.tls?.email || '') || payload.tls.email.length > 254) return '请输入有效的证书通知邮箱'
     }
     if (!Array.isArray(payload?.allowlist) || payload.allowlist.length < 1) return '至少填写一个允许访问面板的 IP 或 CIDR'

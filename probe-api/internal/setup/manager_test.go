@@ -253,4 +253,27 @@ func TestManagerFinalOutcomeUsesPersistentInstalledAsAuthority(t *testing.T) {
 			t.Fatalf("installed restart reconciliation error = %v", err)
 		}
 	})
+
+	t.Run("root preflight retry clears the in-memory finalization lock", func(t *testing.T) {
+		manager := newTestManager(newMemoryFiles(), func() time.Time { return now }, sessionTestRandom(4))
+		if err := manager.Initialize(); err != nil {
+			t.Fatal(err)
+		}
+		credentials, err := manager.CreateSession()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := manager.BeginFinalization(credentials.SessionToken, credentials.CSRFToken); err != nil {
+			t.Fatal(err)
+		}
+		if err := manager.states.Transition(StateFinalizing, StateConfiguring, now); err != nil {
+			t.Fatal(err)
+		}
+		if err := manager.FinishFinalization(false); err != nil {
+			t.Fatalf("retryable broker outcome: %v", err)
+		}
+		if _, err := manager.CreateSession(); err != nil {
+			t.Fatalf("fresh session after preflight failure: %v", err)
+		}
+	})
 }

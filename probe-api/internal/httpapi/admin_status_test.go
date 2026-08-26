@@ -107,7 +107,8 @@ func TestSystemStatusRequiresAdministratorSessionAndReturnsSafeReadiness(t *test
 	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload.Status != "ready" || payload.API.Status != "ready" || payload.API.Version != "v1" || payload.Database.Status != "ready" || payload.CheckedAt.IsZero() {
+	if payload.Status != "ready" || payload.API.Status != "ready" || payload.API.Version != "v1" ||
+		payload.Database.Status != "ready" || payload.Agent.Status != "configured" || payload.CheckedAt.IsZero() {
 		t.Fatalf("system status = %#v", payload)
 	}
 	boundary := payload.SecurityBoundary
@@ -119,6 +120,30 @@ func TestSystemStatusRequiresAdministratorSessionAndReturnsSafeReadiness(t *test
 		if strings.Contains(strings.ToLower(response.Body.String()), forbidden) {
 			t.Fatalf("status response exposes %q: %s", forbidden, response.Body.String())
 		}
+	}
+}
+
+func TestSystemStatusReportsUnconfiguredAgentWithoutDegradingManagement(t *testing.T) {
+	database := &countedStatusDatabase{}
+	authService := &fakeAuthService{identity: auth.Identity{User: testUser()}}
+	cfg := statusTestConfig(t)
+	cfg.InstallationProfile = "management"
+	cfg.AgentPublicURL = ""
+	cfg.AgentInstallerURL = ""
+	server := NewServer(cfg, statusTestLogger(), database, WithAuthService(authService))
+	request := authenticatedStatusRequest(t, http.MethodGet, "/api/v1/admin/system/status")
+	response := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status/body = %d/%s", response.Code, response.Body.String())
+	}
+	var payload systemStatusResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Status != "ready" || payload.Agent.Status != "not_configured" || database.calls != 1 {
+		t.Fatalf("system status = %#v, database_calls=%d", payload, database.calls)
 	}
 }
 

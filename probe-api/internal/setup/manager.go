@@ -200,7 +200,7 @@ func (manager *Manager) BeginFinalization(sessionToken, csrfToken string) error 
 	return nil
 }
 
-func (manager *Manager) FinishFinalization(_ bool) error {
+func (manager *Manager) FinishFinalization(success bool) error {
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 	manager.finalization = false
@@ -216,6 +216,15 @@ func (manager *Manager) FinishFinalization(_ bool) error {
 	if record.Status == StateRecoveryRequired {
 		// The privileged worker's durable recovery decision wins over any
 		// stale or malformed broker result.
+		return nil
+	}
+	if record.Status == StateConfiguring {
+		// The root worker may make this one reverse transition only when its
+		// failure was proven to be preflight-only. A claimed success without an
+		// installed commit must still fail closed.
+		if success {
+			return ErrStateConflict
+		}
 		return nil
 	}
 	if record.Status != StateFinalizing {

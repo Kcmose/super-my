@@ -268,6 +268,68 @@ func TestAdminManagementTokenResponsesAreOneTimeAndNeverCached(t *testing.T) {
 	}
 }
 
+func TestManagementProfileRejectsEnrollmentBeforeMintingToken(t *testing.T) {
+	authService := &fakeAuthService{identity: auth.Identity{User: testUser()}}
+	nodeService := &fakeNodeManagementService{enrollmentResponse: nodemanagement.EnrollmentTokenResponse{
+		NodeID: adminManagementTestNodeID, EnrollmentToken: "must-not-be-minted", ExpiresAt: time.Unix(10, 0).UTC(),
+	}}
+	cfg := adminManagementTestConfig(t)
+	cfg.InstallationProfile = "management"
+	cfg.AgentPublicURL = ""
+	cfg.AgentInstallerURL = ""
+	request := authenticatedAdminManagementRequest(t, http.MethodPost,
+		"/api/v1/admin/nodes/"+adminManagementTestNodeID+"/enrollment-token", "")
+	addAdminManagementMutationHeaders(request, false)
+
+	response := serveAdminManagementRequest(t, cfg, authService, nodeService, request)
+
+	if response.Code != http.StatusConflict || nodeService.enrollmentCalls != 0 || authService.verifyCalls != 1 {
+		t.Fatalf("status=%d enrollment_calls=%d csrf_calls=%d body=%s",
+			response.Code, nodeService.enrollmentCalls, authService.verifyCalls, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), `"error":"agent_not_configured"`) ||
+		strings.Contains(response.Body.String(), "install_command") || strings.Contains(response.Body.String(), "must-not-be-minted") {
+		t.Fatalf("unsafe unconfigured enrollment response: %s", response.Body.String())
+	}
+
+	rotateRequest := authenticatedAdminManagementRequest(t, http.MethodPost,
+		"/api/v1/admin/nodes/"+adminManagementTestNodeID+"/rotate-token", "")
+	addAdminManagementMutationHeaders(rotateRequest, false)
+	rotateResponse := serveAdminManagementRequest(t, cfg, authService, nodeService, rotateRequest)
+	if rotateResponse.Code != http.StatusConflict || nodeService.rotateCalls != 0 || authService.verifyCalls != 2 ||
+		!strings.Contains(rotateResponse.Body.String(), `"error":"agent_not_configured"`) {
+		t.Fatalf("status=%d rotate_calls=%d csrf_calls=%d body=%s",
+			rotateResponse.Code, nodeService.rotateCalls, authService.verifyCalls, rotateResponse.Body.String())
+	}
+}
+
+func TestManagementProfileStillAllowsAgentParametersToBeSaved(t *testing.T) {
+	authService := &fakeAuthService{identity: auth.Identity{User: testUser()}}
+	nodeService := &fakeNodeManagementService{createResponse: nodemanagement.Node{
+		NodeID: adminManagementTestNodeID, DisplayName: "edge-later", Enabled: true,
+	}}
+	cfg := adminManagementTestConfig(t)
+	cfg.InstallationProfile = "management"
+	cfg.AgentPublicURL = ""
+	cfg.AgentInstallerURL = ""
+	request := authenticatedAdminManagementRequest(t, http.MethodPost, "/api/v1/admin/nodes", `{
+		"display_name":"edge-later",
+		"agent_settings":{
+			"metrics":{"collect_interval_seconds":5,"report_interval_seconds":10,"mountpoints":["/"],"include_virtual_interfaces":false},
+			"agent":{"config_refresh_interval_seconds":60,"max_memory_queue_seconds":300},
+			"limits":{"max_batch_samples":120}
+		}
+	}`)
+	addAdminManagementMutationHeaders(request, true)
+
+	response := serveAdminManagementRequest(t, cfg, authService, nodeService, request)
+
+	if response.Code != http.StatusCreated || nodeService.createCalls != 1 || nodeService.lastCreate.AgentSettings == nil {
+		t.Fatalf("status=%d create_calls=%d create=%#v body=%s",
+			response.Code, nodeService.createCalls, nodeService.lastCreate, response.Body.String())
+	}
+}
+
 func adminManagementTestConfig(t *testing.T) config.Config {
 	t.Helper()
 	cfg, err := config.Load()

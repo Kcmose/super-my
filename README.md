@@ -1,135 +1,157 @@
 # Probe Panel
 
-Probe Panel 是一套面向 Linux 节点的轻量监控与网络探测面板。它由四个彼此独立的源码工程组成：Linux Agent、Go API、匿名游客前端和管理员前端。游客无需账号或密码，但游客与管理员页面仍只允许配置的 IP/CIDR 访问；Agent 可从白名单外主动上报，必须使用设备凭据。
+Probe Panel 是一套由三个独立产品组成的 Linux 监控系统。当前开发阶段只交付第一个产品：**管理端**。
 
-当前版本已实现 Linux 基础指标、最近 5 分钟曲线、节点状态、TCP/HTTP(S) 探测、最长 90 天趋势、匿名游客浏览、管理员配置、Agent 注册与 Token、新建节点自动生成一键安装命令、审计、双层管理白名单、三入口隔离，以及游客/管理面板各自独立的深浅色模式。探测分析会分别展示当前最小/平均/最大延迟、发送/接收数、传输丢包和综合失败率，并使用服务端时间校准的串行轮询；管理面板可查看服务端识别的来源 IP 与不泄露内部信息的 API/数据库粗粒度状态。ICMP 探测按项目决定暂缓，当前 API、Agent、前端和 systemd 均不开放 ICMP 或 `CAP_NET_RAW`。
+## 产品边界与安装顺序
 
-## 界面
+| 顺序 | 产品 | 内容 | 安装位置 |
+| ---: | --- | --- | --- |
+| 1 | 管理端 | `probe-admin`、`probe-api`、数据库迁移、PostgreSQL/Nginx 配置 | 管理服务器 |
+| 2 | Agent | `probe-agent` 二进制、配置和服务 | 每台被监控服务器 |
+| 3 | 访客前端 | `probe-web` 静态站点和只读 API 接入配置 | 按需选择的 Web 服务器 |
 
-两套面板首次访问均保持原有深色外观，右上角可切换浅色；选择只保存在当前浏览器中，游客和管理面板互不共享。切换主题不会改变页面布局，节点与探测图表也会同步更新配色。
+三者分别发布、安装、升级、回滚和卸载。不存在“一个脚本把三者全部装完”的新版本安装方式。
 
-## 服务端一键安装（首次初始化）
+运行时数据流固定为：
 
-干净的 Debian 13 `amd64`/`arm64` 服务器不需要安装 Go 或 npm，也不需要手工上传四个工程。先登录 root 或执行 `sudo -i` 进入 root Shell；安装命令本身不依赖最小系统预装 `sudo`。修订后的服务端版本固定为不可变的 [`v1.1.0` GitHub Release](https://github.com/Kcmose/super-my/releases/tag/v1.1.0)：
-
-```bash
-curl -fsSL --proto '=https' --tlsv1.2 \
-  https://raw.githubusercontent.com/Kcmose/super-my/refs/tags/v1.1.0/install.sh \
-  | bash
+```text
+probe-agent -> probe-api/PostgreSQL -> probe-admin
+                                  \-> probe-web（最后按需安装）
 ```
 
-脚本下载当前架构的预编译 Release 和 `SHA256SUMS`，安全解包并拒绝绝对路径、`..`、符号链接、硬链接及特殊文件。服务器只安装运行时依赖：Nginx、PostgreSQL/客户端、Certbot、`iproute2` 和 `util-linux`，不会安装 Go、Node.js 或 npm。PostgreSQL 只在确认使用本机监听配置后启动。首次安装不生成也不要求安装码：Setup 只接受 systemd 提供的 `/run/probe-panel-setup/setup.sock`，Socket 及父目录分别为 `root:root 0600/0700`，服务器没有 TCP 18080 监听。按终端提示用 root SSH 把该 Unix Socket 转发到自己电脑的 `127.0.0.1:18080`，再打开安装页面即可自动建立短期内存会话。
+管理界面与 API 属于同一个管理端产品，但仍分别构建；API 不嵌入管理前端文件。Agent 只主动上报和拉取结构化配置，不监听端口；两个前端只通过 API 取数，不连接数据库。
 
-已经运行过 `v1.0.0`、但向导仍处于 `pending/configuring` 的服务器不能用默认安装覆盖。请在 root Shell 中把上面的命令改为 `| bash -s -- migrate-bootstrap`；脚本会严格复验旧 Release 与全部活动 bootstrap 文件，拒绝任何已 Finalize、恢复态或混合安装，并且只在新 root 私有 Socket 通过 readiness 后销毁旧安装码记录。完整边界和失败回滚语义见 [安装文档](docs/operations/install.md#已安装-v100但尚未完成向导)。
+## 当前状态
 
-Setup 服务保持空 Capability 集和私有网络命名空间，不能直接修改生产配置或绑定任何 IP 端口。最终提交经严格校验后写入 root-only 的 tmpfs 请求文件，再由独立、无 HTTP 的 systemd oneshot Finalizer 处理。三个域名全部留空时自动使用服务器 IP 的 HTTPS 固定端口：游客 `18453`、Agent `18454`、管理 `18455`，并生成 IP SAN 私有 CA；三个域名全部填写时使用原三域名、80/443 和 ACME；只填写一部分域名会被拒绝。全部验证通过后才激活正式 Nginx 和 API。
+- `management v1.2.0`：当前源码正在实现的第一个管理端独立候选基线，**尚未发布 GitHub Release**。历史 full 版本不是它的合法 management 前序，因此机器账本把 `promotion_eligible` 固定为 `false`；v1.2.0 的 60 个 cell 永远保持 candidate。第一个可晋级正式支持的目标版本是 v1.2.1。
+- `full v1.1.0`：已经发布的历史全量安装包，仅保留兼容与审计用途，不代表新的产品拆分方向。当前 `v1.2.0` 根安装器不会选择、安装或迁移它；需要维护旧实例时必须使用不可变 `v1.1.0` 标签中的旧脚本。
+- 当前多系统运行时 ABI 为 `probe-linux-systemd-v2`，候选架构为 Linux `amd64`/`arm64`。安装器只接受下面 15 个精确平台 ID，不能从发行版家族名、相邻版本或包管理器推断支持：
 
-```bash
-# 查看初始化服务和私有 Socket 状态（不存在安装码）
-bash install.sh status
-
-# 普通卸载只移除 bootstrap 程序，保留配置、状态、数据库和备份
-bash install.sh uninstall
+```text
+debian-9-systemd       debian-10-systemd       debian-11-systemd
+debian-12-systemd      debian-13-systemd
+ubuntu-18.04-systemd   ubuntu-20.04-systemd     ubuntu-22.04-systemd
+ubuntu-24.04-systemd   ubuntu-26.04-systemd
+centos-linux-7-systemd centos-linux-8-systemd
+centos-stream-8-systemd centos-stream-9-systemd centos-stream-10-systemd
 ```
 
-`purge` 刻意不提供；彻底删除数据必须先完成并验证最终备份，再走单独复核流程。`Kcmose/super-my` 使用 GitHub Immutable Releases；当前脚本不会回退到 `main` 或其他可移动分支。
+- “进入 ABI 分支”只表示对应的包管理、Nginx 方言、PostgreSQL 路径和 systemd 资产已有精确适配，**不等于正式支持**。真实远端 Debian 10 已通过当前 Shell/bootstrap 契约、Go 全包测试/vet与双架构交叉构建，但完整安装、Setup、重启、升级、回滚、备份恢复与卸载 E2E 尚未完成；其余精确单元也必须分别验收。
+- 正式支持状态由 `probe-api/deploy/support/policy-v1.json` 与 `releases/v1.2.0.json` 的机器可读账本约束：15 个精确平台 × 2 架构 × IP/域名，共 60 个 cell。当前门禁结果固定为 **60 candidate / 0 supported**；没有完整证据套件和人工显式提升的 cell 不能被文档或 Release 汇总成平台级正式支持。未来包含 `supported` 的账本还必须由审核环境通过 `--release-assets`、`--source-commit` 及对应的 `--upgrade-from-*` 参数提供真实双架构目标/前序管理包和可信 tag commit；gate 会直接重算外层包及包内清单哈希，并校验 `RELEASE-MANIFEST` 的版本、架构、仓库、ref 与 commit。
+- Debian 9/10/11/12、Ubuntu 18.04/20.04、CentOS Linux 7/8 和 CentOS Stream 8 处于旧版、EOL 或延长维护层，默认拒绝安装；Debian 12 已于 2026-07-12 转入 LTS，Debian 11 LTS 将于 2026-08-31 结束，Ubuntu 20.04 已退出标准安全维护，因此尚未发布的 v1.2.0 对这些版本失败关闭。明确执行 `install --accept-eol` 后，Debian/Ubuntu 候选会创建独立的 Probe APT source，按版本选择发行版 live/archive 与 PGDG live/archive，并分别绑定发行版 keyring 和固定 PGDG key；它不读取或覆盖用户现有源。这个参数不会恢复安全更新。Debian 9 缺少安全 HTTPS method 时失败关闭，Debian 9 arm64 因官方 PGDG archive 没有 PostgreSQL 14 继续不可用。CentOS 候选现已实现隔离 `reposdir`、精确仓库 allowlist、Vault/Stream、EPEL 与 PGDG 14 映射，以及固定 key 哈希/完整指纹和已安装 RPM 来源绑定；实现这些源契约不等于已经可生产安装或有资格晋级。
+- CentOS 各单元目前仍是 candidate：真实 CentOS VM 尚未完成验收，SELinux Enforcing 下 loopback API `8080` 的共享端口类型、Nginx 反向代理权限及可回滚策略仍未闭环。仓库中的 policy/helper 只是未集成的候选，不会进入正式 management bundle。为避免半安装，根安装器检测到 Enforcing 会在包、账号、服务和永久路径变更前拒绝；关闭 SELinux 不是生产支持方案。安装器不管理 firewalld；开放、关闭端口和区域策略由服务器管理员负责。
+- Rocky Linux、AlmaLinux、Alpine Linux、OpenRC 及其他未列出的派生环境当前仅做拒绝或后续规划；检测到 `apt-get`、`dnf`、`yum`、`apk` 或 `systemctl` 不构成支持证据。
+
+推送 `v1.2.0` 标签只会在 GitHub Actions 中构建并暂存 14 天的候选 Artifact，**不会创建、编辑或公开 GitHub Release**。标签和候选包都不是发布批准。v1.2.0 可在完成首次安装、回滚、备份恢复、卸载和候选资产门禁后，由人工独立审核为不可变的 0-supported baseline；它不要求也不能伪造从历史 full 版本升级的证据。随后 v1.2.1 必须从同平台、同架构、同入口的不可变 v1.2.0 完成升级证据，才有资格逐格晋级。
+
+## 管理端独立安装契约
+
+管理端发行包名称固定为：
+
+```text
+probe-panel-management-v1.2.0-linux-amd64.tar.gz
+probe-panel-management-v1.2.0-linux-arm64.tar.gz
+```
+
+包内只允许出现：
+
+- `probe-api` 与 `probe-setup`；
+- 独立构建的 `probe-admin` 静态文件；
+- 数据库迁移；
+- 管理端 Setup、systemd、备份、Nginx，以及独立的校验、升级调用、恢复协调和普通卸载资产。
+
+包内明确禁止出现 `probe-web`、`probe-agent` 二进制、Agent systemd 单元或 Agent 下载目录。
+
+所有目标系统（尤其 Debian 9–12、Ubuntu 18.04/20.04、CentOS 7 等旧版或延长维护系统）只下载、校验并运行同一 Release 中预构建的 management bundle；目标服务器不会克隆源码，也不会安装 Go/Node 后现场编译。构建机与安装目标是两条独立边界。
+
+管理端 bootstrap 在仓库中按职责拆分：`install/common.sh` 只保存通用解析、验包、事务、回滚和 Setup 编排；`install/platforms/debian.sh`、`ubuntu.sh`、`centos.sh` 分别保存该系列的精确版本映射、包管理、原生 unit/包归属、账号和安全门禁。`install/build-standalone.sh` 按固定顺序确定性生成根 `install.sh`。对外的一键安装仍只执行这个完整的根脚本：它解析 `/etc/os-release` 后调用对应家族适配器，不在安装过程中下载或 `source` GitHub 上的活动子脚本。因此源码可以按系列维护，而公开入口仍保持单文件、同版本和截断失败关闭。
+
+bootstrap 在修改主机前要求已有 Bash、Python 3、系统 CA bundle、支持 TLS 1.2 的 `curl` 或 HTTPS `wget`（二选一），以及校验、文本处理、iproute、util-linux、procps、systemd 和原生包管理工具；旧 curl 不满足能力时会使用已有 wget，二者都不可用则列明后退出。详细清单见[管理端安装](docs/operations/install.md)。
+
+首次安装仍通过 root SSH 转发的私有 Unix Socket 打开向导，数据库密码和首个管理员密码不会进入安装命令、进程参数或公网请求。向导只配置一个管理入口：
+
+- IP 模式：`https://<服务器IP>:18455`，使用 IP SAN 私有 CA；
+- 域名模式：一个管理域名，使用 ACME；
+- 不再要求游客 `18453`、Agent `18454`、游客域名或 Agent 域名。
+
+安装完成后可以创建节点并保存每个节点的 Agent 采集参数。全局 Agent 入口尚未配置时，系统状态明确显示“待配置”，不会注册 Agent 公网路由，也不会签发安装命令或 Token；后续 Agent 阶段会通过显式配置安全启用这些能力。
+
+完成 Setup 的管理端通过同一目标版本 standalone 脚本执行 `validate`、`upgrade` 和
+普通 `uninstall`；数据库恢复使用本机
+`/usr/local/lib/probe-panel/restore-management.sh`。这些命令只管理 API、管理 SPA、
+migrations 和 Probe 自有服务/链接，普通卸载继续保留配置、数据库、备份与未激活
+发布目录，`purge` 不实现。源码存在不代表 `v1.2.0` 已经发布。
+
+## 已有业务服务器上的共存原则
+
+管理端安装器借鉴成熟脚本的“先探测、再分派”思路，但只修改 Probe 自己拥有的路径：
+
+- 已安装且配置有效的 Nginx 可以复用；管理端 IP 模式只新增自己的配置链接并占用 `18455`，失败时只移除该链接，再经 `nginx -t` 后 reload；不会停止、禁用或清理其他站点。
+- 已有 PostgreSQL 只有在本机服务可用且 `5432` 严格限制在 loopback 时才会复用；发现对外监听会拒绝安装，不会擅自修改或停止现有服务。
+- 发现既有 Probe 文件、服务、数据库名/用户冲突、目标端口占用或无法证明归属的路径时失败关闭，不覆盖猜测中的旧安装。
+- 当前域名模式仍使用独占的 standalone ACME，要求 Nginx inactive 且 `80/443` 空闲；因此暂不宣称它能与正在运行的 Web 站点共存。已有站点的服务器优先使用 IP 模式，或等待后续经验证的域名共存方案。
+- 安装器不自动调整 firewalld。管理员必须按选定入口自行管理防火墙；CentOS SELinux Enforcing 策略尚未完成真实 VM 闭环前，不能把对应 candidate 当成可生产部署平台。
+
+“非干净服务器可安装”指安全识别并保留无关服务，不代表强行覆盖任何环境。
 
 ## 工程结构
 
 ```text
-probe-agent/   Linux Agent；独立 Go 模块，只主动访问 Agent API
-probe-api/     Go API、数据库迁移、OpenAPI 与服务端部署文件
-probe-web/     匿名游客 Vue/Vite SPA，只读 Panel API
-probe-admin/   管理员 Vue/Vite SPA，登录与管理功能
-docs/          架构、权限、协议、安装、运维和验收文档
+install/       管理端 bootstrap 通用源码、三套平台适配器与单文件生成器
+install.sh     由 install/ 确定性生成的公开 standalone bootstrap
+probe-admin/   管理员 Vue/Vite SPA
+probe-api/     Go API、Setup、迁移、OpenAPI 与管理端部署资产
+probe-agent/   独立 Linux Agent；当前不进入管理端发行包
+probe-web/     独立访客前端；当前不进入管理端发行包
+docs/          架构、协议、安装、运维和验收文档
 ```
 
-四个工程拥有独立入口、依赖、测试和构建产物，不跨目录导入源码。`probe-api` 不嵌入前端文件，两个前端也不直接访问数据库。
+## 开发与验证约束
 
-## 安全边界
-
-生产入口明确二选一：有域名时使用三个独立 HTTPS Host 与公信证书；三个域名全部留空时使用同一 IP 的三个固定 HTTPS 端口与 IP SAN 私有 CA 证书。部分填写域名会被拒绝。
-
-| Host | 内容 | 访问控制 |
-|---|---|---|
-| `panel.example.com` | `probe-web` 与匿名只读 `/api/v1/panel/*` | 管理 IP/CIDR 白名单，无游客登录 |
-| `admin.example.com` | `probe-admin`、认证和管理 API | 同一白名单 + 管理员 Session + CSRF |
-| `api.example.com` | Agent 注册、配置、上报及固定白名单内的公开安装文件 | API 使用一次性注册令牌或 Agent Bearer Token；下载文件不含秘密 |
-
-IP 模式对应 `https://IP:18453`、`https://IP:18455`、`https://IP:18454`。浏览器 Cookie 不按端口隔离，因此该模式的游客与 Agent 代理会强制删除上游 Cookie 并隐藏 `Set-Cookie`；管理 Origin、CSRF、Session、路由和白名单仍按端口精确校验。IP 模式全程 HTTPS，但浏览器首次使用需要信任安装时生成的私有 CA；Agent 安装命令会自动校验证书指纹。
-
-Go API 只监听 loopback；PostgreSQL 不应暴露公网。Public API 默认关闭。系统没有 SSH、WebSSH、Shell、PTY、任意命令、文件管理、端口转发、反向隧道或远程 Agent 升级能力。
-
-## Agent 一键接入
-
-管理员在独立管理面板新建已启用节点后，面板会自动生成一条可复制的一键安装命令；禁用节点需先启用。未注册节点可重新生成，新命令会使此前未使用的命令失效；已注册节点则显示“重新安装命令”，成功在另一台主机执行会使原 Agent 凭证失效。短命令通过严格 HTTPS 从 [`Kcmose/my-agent` 的不可变 `v1.0.2` Release](https://github.com/Kcmose/my-agent/releases/tag/v1.0.2) 读取安装器，Raw 路径使用明确的 `refs/tags/v1.0.2`；安装器完整解析后才允许产生安装副作用，随后自动识别 Linux `amd64`/`arm64`，从 Agent 入口下载并校验 systemd 单元和二进制的 SHA256，安装低权限服务、完成首次注册，最后从环境文件移除一次性令牌。IP 模式命令会额外携带固定 `ca.pem` 的 64 位 SHA-256 指纹；域名模式使用系统公信根，不携带该参数。
-
-安装命令包含 15 分钟有效且只能使用一次的注册令牌，应先登录 root 或执行 `sudo -i` 进入 root Shell，再直接粘贴；生成的命令本身不依赖 `sudo`。为保持 Komari 式单行命令，令牌通过 `-t` 短参数传入，不进入下载 URL，但会短暂出现在安装进程参数，并可能留在 Shell 历史和剪贴板中，必须按敏感凭据处理。IP 模式只额外携带证书 SHA-256 指纹，不把整份证书编码进命令；校验通过前安装器不会发送令牌。这个流程仍是管理员主动执行的首次安装，不赋予面板远程命令或升级能力。完整前置条件、失败语义和手动方案见 [Agent 部署](docs/operations/agent-deployment.md)。
-
-## 构建原则
-
-Windows 工作区只保留源码与文档。依赖安装、格式化、测试、构建和部署统一在 Debian 13 环境进行。典型验证命令如下：
+Windows 工作区只保存源码和文档。普通依赖安装、格式化、单元测试、静态检查和双架构交叉构建在专用远端 Linux 测试机上低并发执行；正式候选资产仍只允许在干净、受控的 Debian 13 构建环境生成。这个构建机约束不表示安装目标只能是 Debian 13，旧目标服务器只消费预构建 management bundle。每个候选目标的安装、重启和生命周期 E2E 必须在对应的真实 systemd VM 中另外执行。管理端阶段至少需要验证：
 
 ```bash
-cd probe-agent
+cd probe-api
 find . -type f -name '*.go' -print0 | xargs -0 gofmt -w
 go test ./...
 go vet ./...
-CGO_ENABLED=0 go build -trimpath -o build/probe-agent ./cmd/probe-agent
-
-cd ../probe-api
-find . -type f -name '*.go' -print0 | xargs -0 gofmt -w
-go test ./...
-go vet ./...
-CGO_ENABLED=0 go build -trimpath -o build/probe-api ./cmd/probe-api
-
-# 提供独立 PostgreSQL 测试库时，跨包集成夹具按顺序运行
-PROBE_API_INTEGRATION_DATABASE_URL='postgres://...' go test -count=1 -p 1 ./...
-
-cd ../probe-web
-npm ci
-npm test
-npm run build
 
 cd ../probe-admin
 npm ci
 npm test
 npm run build
+
+cd ../probe-api
+bash ../install/tests/package-source-contract.sh
+bash deploy/tests/bootstrap-install-contract.sh
+bash deploy/tests/build-release-bundles-contract.sh
+bash deploy/tests/management-lifecycle-contract.sh
+bash deploy/tests/load-smoke-contract.sh
+bash deploy/tests/selinux-contract.sh
+bash deploy/tests/selinux-management-contract.sh
+go run ./cmd/probe-support-gate verify \
+  --support-root deploy/support --release v1.2.0 --require-zero-supported
 ```
 
-网络直连失败时，构建环境可临时使用项目约定的 SOCKS5 或 HTTP 代理；代理不得写入产品默认配置、源码或锁文件。
+发布构建器只接受 `--profile management`，`--profile full` 会失败，并且不得读取或构建 `probe-web`、`probe-agent`。management 包只携带运行所需部署资产；CI 构建器、历史整包入口以及含 Agent/游客构建或部署分支的 helper 都不得进入发布包。`v1.2.0` 标签工作流只上传未发布的 Actions 候选 Artifact，不自动公开 Release。一个 cell 只验证其指定的 IP 或 domain 入口；正式支持该 cell 前，必须在对应真实 systemd VM 完成该入口的全新安装、原生 Nginx/PostgreSQL 契约、冲突无修改、重启、升级、失败回滚、备份恢复和普通卸载保留数据。平台级正式支持要求 `amd64/ip`、`amd64/domain`、`arm64/ip`、`arm64/domain` 四格全部 supported；Docker 契约测试不能代替这些证据。
 
-## 部署顺序
+## 安全边界
 
-1. 选择三域名公信证书模式，或确认服务器规范 IP 与 `18453/18454/18455` 可达的私有 CA 模式；PostgreSQL `5432` 严格只监听 loopback。
-2. 配置并验证管理 IP/CIDR 白名单。
-3. 在 Debian 构建环境完成四个工程的测试与生产构建。
-4. 让安装器按已选 ingress 模式严格核对活动 Nginx 路由、端口、证书、备份凭据和新源码 systemd 单元，再安装 API、两个静态站点、Nginx 和 systemd 文件。
-5. 获取与备份/恢复共用的数据库维护锁，先备份数据库，再执行 `probe-api migrate status` 与 `probe-api migrate up`。
-6. 创建首个管理员，部署需要监控的 Agent。
-7. 执行安全冒烟、备份恢复演练和负载冒烟，再开放正式入口。
-
-不要直接把示例域名、示例密码或示例数据库连接串投入生产。详细步骤见：
-
-- [安装文档](docs/operations/install.md)
-- [升级文档](docs/operations/upgrade.md)
-- [Agent 部署](docs/operations/agent-deployment.md)
-- [备份与恢复](docs/operations/backup-restore.md)
-- [故障排查](docs/operations/troubleshooting.md)
-- [内网预览手工验收清单](docs/operations/manual-testing.md)
-- [API 使用说明](docs/api.md)
-- [OpenAPI 契约](probe-api/api/openapi.yaml)
-- [安全测试报告](docs/reports/security-test.md)
-- [负载测试报告](docs/reports/load-test.md)
-
-## 数据保留
-
-- CPU、内存、硬盘、网络基础指标最多保留 5 分钟。
-- TCP/HTTP(S) 探测原始与聚合数据按目标配置保留，最长 90 天。
-- 每日维护使用 PostgreSQL advisory lock、持久化成功水位和单一事务，统一清理过期 Session、登录限流、注册/Agent Token 与满足聚合保护条件的幂等台账；失败不推进水位。
-- 每日 PostgreSQL 备份保留最近 7 份；每周备份保留最近 4 份。
-- 缩短保留期限后，后续清理会删除过期数据；已删除数据只能从事先存在的备份恢复。
+- API 固定监听 loopback；PostgreSQL 不暴露公网。
+- 管理入口同时要求 IP/CIDR 白名单、管理员 Session；写请求还要求 Origin 和 CSRF。
+- 管理端未配置 Agent 集成时，Agent API、Token 和安装命令均失败关闭。
+- 系统禁止 SSH/WebSSH、Shell、任意命令、文件管理、端口转发、反向隧道和远程自动升级。
+- CPU、内存、硬盘和网络历史最多保留 5 分钟；探测数据最长保留 90 天。
 
 ## 文档入口
 
-架构和约束分别见 [架构说明](docs/design/architecture.md)、[权限矩阵](docs/design/permissions.md)、[Agent 协议](docs/design/agent-protocol.md) 和 [保留策略](docs/design/retention.md)。开发轨道见 `jihua.md`，长期约定见 `jiyi.md`，已实施变更见 `biandong.md`。
+- [管理端安装](docs/operations/install.md)
+- [管理端平台支持与验收矩阵](docs/operations/platform-support.md)
+- [架构与产品边界](docs/design/architecture.md)
+- [Agent 协议](docs/design/agent-protocol.md)
+- [权限矩阵](docs/design/permissions.md)
+- [Agent 部署（后续阶段）](docs/operations/agent-deployment.md)
+- [备份与恢复](docs/operations/backup-restore.md)
+- [长期约定](jiyi.md)
+- [实施计划](jihua.md)
+- [变动记录](biandong.md)

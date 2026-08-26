@@ -14,35 +14,59 @@ SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 SUPER_MY_ROOT="$(readlink -f -- "${SCRIPT_DIR}/../../..")"
 readonly SUPER_MY_ROOT
-readonly SUPER_MY_REF="refs/tags/v1.1.0"
+readonly MANAGEMENT_VERSION="v1.2.0"
+# Historical immutable-tag proof retained as a source contract; v1.2 builds management only.
+# shellcheck disable=SC2034
+readonly FULL_VERSION="v1.1.0"
+readonly MANAGEMENT_SUPER_MY_REF="refs/tags/v1.2.0"
+readonly MANAGEMENT_RUNTIME_ABI="probe-linux-systemd-v2"
+readonly MANAGEMENT_PLATFORM_IDS="debian-9-systemd,debian-10-systemd,debian-11-systemd,debian-12-systemd,debian-13-systemd,ubuntu-18.04-systemd,ubuntu-20.04-systemd,ubuntu-22.04-systemd,ubuntu-24.04-systemd,ubuntu-26.04-systemd,centos-linux-7-systemd,centos-linux-8-systemd,centos-stream-8-systemd,centos-stream-9-systemd,centos-stream-10-systemd"
+# Historical immutable-tag proof retained as a source contract; v1.2 builds management only.
+# shellcheck disable=SC2034
+readonly FULL_SUPER_MY_REF="refs/tags/v1.1.0"
 readonly WEB_REF="refs/tags/v1.0.0"
 readonly AGENT_REF="refs/tags/v1.0.2"
-readonly SUPER_MY_REMOTE="https://github.com/Kcmose/super-my.git"
+readonly SOURCE_REPOSITORY="Kcmose/super-my"
+readonly SUPER_MY_REMOTE="https://github.com/${SOURCE_REPOSITORY}.git"
 readonly WEB_REMOTE="https://github.com/Kcmose/my.git"
 readonly AGENT_REMOTE="https://github.com/Kcmose/my-agent.git"
 
 ADMIN_ROOT="$SUPER_MY_ROOT"
 WEB_ROOT="${SUPER_MY_ROOT}/../my"
 AGENT_ROOT="${SUPER_MY_ROOT}/../my-agent"
-OUTPUT_DIR="${SUPER_MY_ROOT}/../probe-panel-release-v1.1.0"
-VERSION="v1.1.0"
+OUTPUT_DIR=""
+VERSION=""
+PROFILE="management"
+SUPER_MY_REF=""
+SOURCE_COMMIT=""
+SOURCE_TAG_OBJECT=""
+WEB_SOURCE_COMMIT=""
+WEB_SOURCE_TAG_OBJECT=""
+AGENT_SOURCE_COMMIT=""
+AGENT_SOURCE_TAG_OBJECT=""
+OUTPUT_DIR_SET=false
 WORK_ROOT=""
+SOURCE_INPUT_DIGEST=""
+PRISTINE_SOURCE_DIGEST=""
+WEB_INPUT_DIGEST=""
+AGENT_INPUT_DIGEST=""
 
 usage() {
     cat <<'EOF'
 Usage: build-release-bundles.sh [options]
 
-Build both Debian 13 release bundles locally without uploading anything.
+Build both Linux architecture bundles on Debian 13 without uploading anything.
 
 Options:
   --output-dir DIR   new directory that receives both tarballs and SHA256SUMS
-  --version VERSION  release version; currently pinned to v1.1.0
+  --profile PROFILE  release profile; v1.2 accepts management only
+  --version VERSION  pinned management version; currently v1.2.0
   -h, --help         show this help
 
 Sources are fixed to the Kcmose/super-my repository containing probe-admin and
-probe-api plus its ../my and ../my-agent sibling repositories. Every repository
-must be clean and exactly at its pinned tag, and the remote tag must resolve to
-the same HEAD before any release manifest is written.
+probe-api. The repository must be clean and exactly at the pinned v1.2.0 tag,
+and the remote tag must resolve to the same HEAD before any release manifest is
+written. Historical full releases are built only by their immutable old tags.
 EOF
 }
 
@@ -71,6 +95,16 @@ require_command() {
     command -v "$1" >/dev/null 2>&1 || die "required command is missing: $1"
 }
 
+trusted_git() (
+    unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY
+    unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_REPLACE_REF_BASE GIT_NAMESPACE
+    unset GIT_CONFIG GIT_CONFIG_SYSTEM GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM
+    unset GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_ATTR_NOSYSTEM
+    export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_ATTR_NOSYSTEM=1
+    export GIT_NO_REPLACE_OBJECTS=1
+    command git --no-replace-objects "$@"
+)
+
 require_debian_13() {
     [[ -r /etc/os-release ]] || die '/etc/os-release is missing'
     local os_id='' version_id='' key value
@@ -97,9 +131,15 @@ parse_arguments() {
         case "$1" in
             --output-dir)
                 OUTPUT_DIR="$(take_value "$1" "${2-}")"
+                OUTPUT_DIR_SET=true
                 shift 2
                 ;;
-            --output-dir=*) OUTPUT_DIR="$(take_value --output-dir "${1#*=}")"; shift ;;
+            --output-dir=*) OUTPUT_DIR="$(take_value --output-dir "${1#*=}")"; OUTPUT_DIR_SET=true; shift ;;
+            --profile)
+                PROFILE="$(take_value "$1" "${2-}")"
+                shift 2
+                ;;
+            --profile=*) PROFILE="$(take_value --profile "${1#*=}")"; shift ;;
             --version)
                 VERSION="$(take_value "$1" "${2-}")"
                 shift 2
@@ -116,6 +156,18 @@ parse_arguments() {
     done
 }
 
+validate_profile() {
+    [[ "$PROFILE" == management ]] ||
+        die 'the v1.2 release builder accepts management only; use an immutable historical tag to rebuild full'
+    [[ -z "$VERSION" || "$VERSION" == "$MANAGEMENT_VERSION" ]] ||
+        die "the management profile is pinned to the unreleased $MANAGEMENT_VERSION source contract"
+    VERSION="$MANAGEMENT_VERSION"
+    SUPER_MY_REF="$MANAGEMENT_SUPER_MY_REF"
+    if [[ "$OUTPUT_DIR_SET" == false ]]; then
+        OUTPUT_DIR="${SUPER_MY_ROOT}/../probe-panel-management-release-${VERSION}"
+    fi
+}
+
 canonical_source_directory() {
     local label="$1" candidate="$2" resolved
     [[ -d "$candidate" && ! -L "$candidate" ]] || die "$label is not a real directory: $candidate"
@@ -125,37 +177,58 @@ canonical_source_directory() {
 }
 
 assert_fixed_repository() {
-    local label="$1" root="$2" expected_remote="$3" ref="$4"
-    local top_level origin_urls status_output head tag_object tag_commit remote_tags
-    local remote_oid remote_ref remote_direct='' remote_peeled='' remote_commit
+    local label="$1" root="$2" expected_remote="$3" ref="$4" commit_output="$5" tag_output="$6"
+    local top_level origin_urls status_output head tag_object tag_commit
 
-    top_level="$(git -C "$root" rev-parse --show-toplevel 2>/dev/null)" ||
+    [[ "$commit_output" =~ ^[A-Z][A-Z0-9_]*$ ]] ||
+        die "$label verified commit output variable is invalid"
+    [[ "$tag_output" =~ ^[A-Z][A-Z0-9_]*$ ]] ||
+        die "$label verified tag output variable is invalid"
+
+    top_level="$(trusted_git -C "$root" rev-parse --show-toplevel 2>/dev/null)" ||
         die "$label is not a Git repository: $root"
     top_level="$(readlink -f -- "$top_level")"
     [[ "$top_level" == "$root" ]] ||
         die "$label must be the fixed repository root: $root"
 
-    origin_urls="$(git -C "$root" remote get-url --all origin 2>/dev/null)" ||
+    origin_urls="$(trusted_git -C "$root" remote get-url --all origin 2>/dev/null)" ||
         die "$label does not have the required origin remote"
     [[ "$origin_urls" == "$expected_remote" ]] ||
         die "$label origin must be exactly $expected_remote"
 
-    status_output="$(git -C "$root" status --porcelain=v1 --untracked-files=all)" ||
+    status_output="$(
+        trusted_git -c core.fsmonitor=false -c core.untrackedCache=false \
+            -C "$root" status --porcelain=v1 --untracked-files=all
+    )" ||
         die "$label working tree status could not be verified"
     [[ -z "$status_output" ]] ||
         die "$label working tree is not clean, including untracked files"
 
-    head="$(git -C "$root" rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" ||
+    head="$(trusted_git -C "$root" rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" ||
         die "$label HEAD commit could not be verified"
-    tag_object="$(git -C "$root" rev-parse --verify "$ref" 2>/dev/null)" ||
+    tag_object="$(trusted_git -C "$root" rev-parse --verify "$ref" 2>/dev/null)" ||
         die "$label is missing the pinned local tag: $ref"
-    tag_commit="$(git -C "$root" rev-parse --verify "${ref}^{commit}" 2>/dev/null)" ||
+    tag_commit="$(trusted_git -C "$root" rev-parse --verify "${ref}^{commit}" 2>/dev/null)" ||
         die "$label is missing the pinned local tag: $ref"
     [[ "$head" == "$tag_commit" ]] ||
         die "$label HEAD does not exactly equal the pinned local tag commit: $ref"
 
-    remote_tags="$(git ls-remote --exit-code "$expected_remote" "$ref" "${ref}^{}" 2>/dev/null)" ||
-        die "$label pinned tag could not be verified at $expected_remote"
+    assert_remote_tag_binding "$label" "$expected_remote" "$ref" "$tag_object" "$head"
+    printf -v "$commit_output" '%s' "$head"
+    printf -v "$tag_output" '%s' "$tag_object"
+}
+
+assert_remote_tag_binding() {
+    local label="$1" expected_remote="$2" ref="$3" expected_tag_object="$4" expected_commit="$5"
+    local remote_tags remote_oid remote_ref remote_direct='' remote_peeled='' remote_commit
+
+    [[ "$expected_tag_object" =~ ^[0-9a-f]{40}$ ]] ||
+        die "$label expected tag object is malformed"
+    [[ "$expected_commit" =~ ^[0-9a-f]{40}$ ]] ||
+        die "$label expected tag commit is malformed"
+    remote_tags="$(
+        trusted_git -C / ls-remote --exit-code "$expected_remote" "$ref" "${ref}^{}" 2>/dev/null
+    )" || die "$label pinned tag could not be revalidated at $expected_remote"
     while IFS=$'\t' read -r remote_oid remote_ref; do
         [[ "$remote_oid" =~ ^[0-9a-f]{40}$ ]] ||
             die "$label remote tag returned a malformed object ID: $ref"
@@ -171,26 +244,41 @@ assert_fixed_repository() {
             *) die "$label remote tag lookup returned an unexpected ref: $remote_ref" ;;
         esac
     done <<< "$remote_tags"
-    [[ -n "$remote_direct" && "$remote_direct" == "$tag_object" ]] ||
+    [[ -n "$remote_direct" && "$remote_direct" == "$expected_tag_object" ]] ||
         die "$label remote tag object does not exactly equal the pinned local tag: $ref"
     remote_commit="$remote_direct"
     [[ -z "$remote_peeled" ]] || remote_commit="$remote_peeled"
-    [[ "$remote_commit" == "$head" ]] ||
-        die "$label remote tag does not exactly equal HEAD: $ref"
+    [[ "$remote_commit" == "$expected_commit" ]] ||
+        die "$label remote tag does not exactly equal the verified commit: $ref"
+}
+
+revalidate_remote_source_refs() {
+    assert_remote_tag_binding super-my "$SUPER_MY_REMOTE" "$SUPER_MY_REF" \
+        "$SOURCE_TAG_OBJECT" "$SOURCE_COMMIT"
+    if [[ "$PROFILE" == full ]]; then
+        assert_remote_tag_binding my "$WEB_REMOTE" "$WEB_REF" \
+            "$WEB_SOURCE_TAG_OBJECT" "$WEB_SOURCE_COMMIT"
+        assert_remote_tag_binding my-agent "$AGENT_REMOTE" "$AGENT_REF" \
+            "$AGENT_SOURCE_TAG_OBJECT" "$AGENT_SOURCE_COMMIT"
+    fi
 }
 
 validate_fixed_repository_sources() {
-    local expected_web expected_agent
-    expected_web="$(readlink -f -- "${SUPER_MY_ROOT}/../my")"
-    expected_agent="$(readlink -f -- "${SUPER_MY_ROOT}/../my-agent")"
     [[ "$ADMIN_ROOT" == "$SUPER_MY_ROOT" ]] ||
         die 'probe-admin and probe-api must come from the same fixed super-my repository'
-    [[ "$WEB_ROOT" == "$expected_web" ]] || die "probe-web must use the fixed repository root: $expected_web"
-    [[ "$AGENT_ROOT" == "$expected_agent" ]] || die "probe-agent must use the fixed repository root: $expected_agent"
-
-    assert_fixed_repository super-my "$SUPER_MY_ROOT" "$SUPER_MY_REMOTE" "$SUPER_MY_REF"
-    assert_fixed_repository my "$WEB_ROOT" "$WEB_REMOTE" "$WEB_REF"
-    assert_fixed_repository my-agent "$AGENT_ROOT" "$AGENT_REMOTE" "$AGENT_REF"
+    assert_fixed_repository super-my "$SUPER_MY_ROOT" "$SUPER_MY_REMOTE" "$SUPER_MY_REF" \
+        SOURCE_COMMIT SOURCE_TAG_OBJECT
+    if [[ "$PROFILE" == full ]]; then
+        local expected_web expected_agent
+        expected_web="$(readlink -f -- "${SUPER_MY_ROOT}/../my")"
+        expected_agent="$(readlink -f -- "${SUPER_MY_ROOT}/../my-agent")"
+        [[ "$WEB_ROOT" == "$expected_web" ]] || die "probe-web must use the fixed repository root: $expected_web"
+        [[ "$AGENT_ROOT" == "$expected_agent" ]] || die "probe-agent must use the fixed repository root: $expected_agent"
+        assert_fixed_repository my "$WEB_ROOT" "$WEB_REMOTE" "$WEB_REF" \
+            WEB_SOURCE_COMMIT WEB_SOURCE_TAG_OBJECT
+        assert_fixed_repository my-agent "$AGENT_ROOT" "$AGENT_REMOTE" "$AGENT_REF" \
+            AGENT_SOURCE_COMMIT AGENT_SOURCE_TAG_OBJECT
+    fi
 }
 
 assert_regular_file() {
@@ -210,70 +298,359 @@ assert_clean_source_tree() {
     done
 }
 
+source_input_digest() (
+    local root="$1" path mode content_hash hash_line kind
+    cd "$root"
+    find . \
+        \( -path ./node_modules -o -path ./dist -o -path ./build -o -path ./coverage \) -prune -o \
+        \( -type d -o -type f \) -print0 |
+        LC_ALL=C sort -z |
+        while IFS= read -r -d '' path; do
+            mode="$(stat -c '%a' -- "$path")" || exit 1
+            if [[ -d "$path" ]]; then
+                kind=directory
+                content_hash=-
+            else
+                hash_line="$(sha256sum -- "$path")" || exit 1
+                kind='file'
+                content_hash="${hash_line%% *}"
+                content_hash="${content_hash#\\}"
+            fi
+            printf '%s\0%s\0%s\0%s\0' "$kind" "$mode" "$content_hash" "$path"
+        done |
+        sha256sum |
+        awk '{ print $1 }'
+)
+
+assert_source_inputs_unchanged() {
+    local label="$1" root="$2" expected_digest="$3" actual_digest found
+    [[ "$expected_digest" =~ ^[0-9a-f]{64}$ ]] ||
+        die "$label expected source input digest is malformed"
+    found="$(
+        find "$root" \
+            \( -path "$root/node_modules" -o -path "$root/dist" -o \
+               -path "$root/build" -o -path "$root/coverage" \) -prune -o \
+            \( -type l -o -type f -name '*.map' \) -print -quit
+    )"
+    [[ -z "$found" ]] || die "$label source inputs gained a forbidden link or source map: $found"
+    actual_digest="$(source_input_digest "$root")" ||
+        die "$label source input digest could not be recomputed"
+    [[ "$actual_digest" == "$expected_digest" ]] ||
+        die "$label source inputs changed after verified snapshot validation"
+}
+
+revalidate_all_source_inputs() {
+    assert_source_inputs_unchanged super-my-work "$1" "$SOURCE_INPUT_DIGEST"
+    assert_source_inputs_unchanged super-my-pristine "$2" "$PRISTINE_SOURCE_DIGEST"
+    if [[ "$PROFILE" == full ]]; then
+        assert_source_inputs_unchanged my-work "$3" "$WEB_INPUT_DIGEST"
+        assert_source_inputs_unchanged my-agent-work "$4" "$AGENT_INPUT_DIGEST"
+    fi
+}
+
 validate_sources() {
-    local api_root="$1" required
+    local super_root="$1" api_root="$2" admin_root="$3"
+    local web_root="$4" agent_root="$5" profile="$6" required
     for required in \
         go.mod go.sum cmd/probe-api/main.go cmd/probe-setup/main.go \
+        cmd/probe-support-gate/main.go \
+        internal/supportevidence/ledger.go internal/supportevidence/ledger_test.go \
         config/probe-api.env.example config/probe-postgres-backup.env.example \
-        deploy/scripts/deploy-common.sh deploy/scripts/build-release-bundles.sh \
-        deploy/scripts/install-release.sh deploy/scripts/backup-postgres.sh \
+        deploy/support/policy-v1.json deploy/support/releases/v1.2.0.json \
+        deploy/scripts/deploy-common.sh deploy/scripts/deploy-common-management-runtime.sh \
+        deploy/scripts/build-release-bundles.sh \
+        deploy/scripts/install-release.sh deploy/scripts/validate-management.sh \
+        deploy/scripts/restore-management.sh deploy/scripts/uninstall-management.sh \
+        deploy/scripts/backup-postgres.sh \
         deploy/scripts/restore-postgres.sh \
-        deploy/nginx/nginx.conf deploy/nginx/nginx-ip.conf \
         deploy/systemd/probe-api.service deploy/systemd/probe-postgres-backup.service \
-        deploy/systemd/probe-postgres-backup.timer \
-        deploy/setup/probe-panel-setup.service deploy/setup/probe-panel-setup.socket deploy/setup/probe-panel-finalizer.service \
+        deploy/systemd/probe-postgres-backup.timer deploy/systemd/probe-api-legacy.service \
+        deploy/systemd/probe-postgres-backup-legacy.service deploy/systemd/probe-postgres-backup-legacy.timer \
+        deploy/setup/probe-panel-setup.service deploy/setup/probe-panel-setup.socket \
+        deploy/setup/probe-panel-setup-legacy.service deploy/setup/probe-panel-setup-legacy.socket \
         deploy/setup/probe-panel-finalizer.path migrations/000001_initial.up.sql; do
         assert_regular_file "$api_root/$required"
     done
-    assert_regular_file "$SUPER_MY_ROOT/install.sh"
-    assert_regular_file "$SUPER_MY_ROOT/.github/workflows/release.yml"
+    for required in \
+        install.sh install/common.sh install/build-standalone.sh \
+        install/platforms/debian.sh install/platforms/ubuntu.sh install/platforms/centos.sh; do
+        assert_regular_file "$super_root/$required"
+    done
+    bash "$super_root/install/build-standalone.sh" --check
+    assert_regular_file "$super_root/.github/workflows/release.yml"
 
     for required in package.json package-lock.json index.html vite.config.js; do
-        assert_regular_file "$ADMIN_ROOT/$required"
-        assert_regular_file "$WEB_ROOT/$required"
-    done
-    for required in go.mod cmd/probe-agent/main.go deploy/install.sh \
-        deploy/tests/install-contract.sh deploy/systemd/probe-agent.service; do
-        assert_regular_file "$AGENT_ROOT/$required"
+        assert_regular_file "$admin_root/$required"
     done
 
     assert_clean_source_tree probe-api "$api_root"
-    assert_clean_source_tree probe-admin "$ADMIN_ROOT"
-    assert_clean_source_tree probe-web "$WEB_ROOT"
-    assert_clean_source_tree probe-agent "$AGENT_ROOT"
+    assert_clean_source_tree probe-admin "$admin_root"
     [[ ! -e "$api_root/probe-api" && ! -L "$api_root/probe-api" ]] ||
         die "$api_root/probe-api is a generated API binary"
-    [[ ! -e "$AGENT_ROOT/probe-agent" && ! -L "$AGENT_ROOT/probe-agent" ]] ||
-        die "$AGENT_ROOT/probe-agent is a generated Agent binary"
+    if [[ "$profile" == full ]]; then
+        for required in deploy/nginx/nginx.conf deploy/nginx/nginx-ip.conf \
+            deploy/setup/probe-panel-finalizer.service; do
+            assert_regular_file "$api_root/$required"
+        done
+        for required in package.json package-lock.json index.html vite.config.js; do
+            assert_regular_file "$web_root/$required"
+        done
+        for required in go.mod cmd/probe-agent/main.go deploy/install.sh \
+            deploy/tests/install-contract.sh deploy/systemd/probe-agent.service; do
+            assert_regular_file "$agent_root/$required"
+        done
+        assert_clean_source_tree probe-web "$web_root"
+        assert_clean_source_tree probe-agent "$agent_root"
+        [[ ! -e "$agent_root/probe-agent" && ! -L "$agent_root/probe-agent" ]] ||
+            die "$agent_root/probe-agent is a generated Agent binary"
+    else
+        for required in deploy/nginx/nginx-management.conf deploy/nginx/nginx-management-ip.conf \
+            deploy/nginx/nginx-management-legacy.conf deploy/nginx/nginx-management-ip-legacy.conf \
+            deploy/nginx/nginx-management-classic.conf deploy/nginx/nginx-management-ip-classic.conf \
+            deploy/setup/probe-panel-finalizer-management.service \
+            deploy/setup/probe-panel-finalizer-management-legacy.service; do
+            assert_regular_file "$api_root/$required"
+        done
+    fi
 }
 
 assert_output_outside_sources() {
     local output="$1" source_root
     for source_root in "$SUPER_MY_ROOT" "$ADMIN_ROOT" "$WEB_ROOT" "$AGENT_ROOT"; do
+        [[ -n "$source_root" ]] || continue
         case "$output" in
             "$source_root"|"$source_root"/*) die "output directory must be outside source trees: $output" ;;
         esac
     done
 }
 
-copy_frontend_source() {
-    local source_root="$1" destination="$2" entry
-    install -d -m 0700 "$destination"
-    for entry in package.json package-lock.json index.html vite.config.js \
-        postcss.config.js tailwind.config.js src public test deploy; do
-        [[ -e "$source_root/$entry" ]] || die "frontend source is incomplete: $source_root/$entry"
-        cp -a -- "$source_root/$entry" "$destination/"
-    done
+stage_repository_commit() {
+    local label="$1" root="$2" commit="$3" destination="$4"
+    local snapshot_work archive_path snapshot_tree isolated_git source_object_dir
+
+    [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || die "$label verified source commit is malformed"
+    [[ ! -e "$destination" && ! -L "$destination" ]] ||
+        die "$label snapshot destination already exists: $destination"
+    snapshot_work="$(mktemp -d "${WORK_ROOT}/.probe-source-snapshot.XXXXXX")"
+    archive_path="${snapshot_work}/source.tar"
+    snapshot_tree="${snapshot_work}/tree"
+    isolated_git="${snapshot_work}/repository.git"
+
+    (
+        # Invoked indirectly by this subshell's EXIT trap.
+        # shellcheck disable=SC2329
+        cleanup_source_snapshot() {
+            local status=$?
+            trap - EXIT HUP INT TERM
+            if [[ -n "$snapshot_work" && -d "$snapshot_work" && ! -L "$snapshot_work" &&
+                "$snapshot_work" == "$WORK_ROOT"/.probe-source-snapshot.* ]]; then
+                rm -rf -- "$snapshot_work"
+            else
+                printf '[probe-release] WARNING: refusing to clean unexpected source snapshot path: %s\n' \
+                    "$snapshot_work" >&2
+            fi
+            exit "$status"
+        }
+        trap cleanup_source_snapshot EXIT
+        trap 'exit 129' HUP
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+
+        install -d -m 0700 "$snapshot_tree"
+        source_object_dir="$(
+            trusted_git -C "$root" rev-parse --git-path objects
+        )" || die "$label Git object database could not be located"
+        case "$source_object_dir" in
+            /*) ;;
+            *) source_object_dir="$root/$source_object_dir" ;;
+        esac
+        source_object_dir="$(canonical_source_directory "$label Git object database" "$source_object_dir")"
+        [[ "$source_object_dir" != *$'\n'* && "$source_object_dir" != *$'\r'* ]] ||
+            die "$label Git object database path cannot be represented as an alternate"
+        trusted_git -c core.attributesFile=/dev/null \
+            init --bare --template= \
+            "$isolated_git" >/dev/null ||
+            die "$label isolated Git object view could not be initialized"
+        printf '%s\n' "$source_object_dir" > "$isolated_git/objects/info/alternates"
+        chmod 0600 "$isolated_git/objects/info/alternates"
+        trusted_git -c core.attributesFile=/dev/null --git-dir="$isolated_git" \
+            cat-file -e "${commit}^{commit}" ||
+            die "$label verified source commit is no longer available: $commit"
+        trusted_git -c core.attributesFile=/dev/null --git-dir="$isolated_git" \
+            archive --format=tar --output="$archive_path" "$commit" ||
+            die "$label could not be archived from the verified source commit: $commit"
+        [[ -f "$archive_path" && ! -L "$archive_path" ]] ||
+            die "$label Git archive was not created as a regular file"
+        tar -xf "$archive_path" -C "$snapshot_tree" ||
+            die "$label verified source archive could not be extracted"
+        mv -T -- "$snapshot_tree" "$destination" ||
+            die "$label verified source snapshot could not be committed"
+    )
 }
 
-copy_project_source() {
-    local source_root="$1" destination="$2" entry name
-    install -d -m 0700 "$destination"
-    while IFS= read -r -d '' entry; do
-        name="${entry##*/}"
-        [[ "$name" == .git ]] && continue
-        cp -a -- "$entry" "$destination/"
-    done < <(find "$source_root" -mindepth 1 -maxdepth 1 -print0)
+copy_management_runtime_script() {
+    local common_source="$1" management_source="$2" destination="$3"
+    local runtime_functions
+    runtime_functions='log warn die require_root validate_management_platform_id parse_management_os_release_token parse_management_os_release_name management_platform_id_from_release management_platform_nginx_dialect management_platform_systemd_profile management_platform_systemd_minimum management_platform_package_family management_platform_postgres_service management_platform_certbot_timer management_platform_postgres_bin_dir assert_runtime_platform_contract initialize_runtime_platform_contract runtime_platform_id runtime_systemd_profile runtime_postgres_service runtime_certbot_timer runtime_account_family runtime_postgres_command require_runtime_postgres_commands management_platform_id_from_os_release require_supported_runtime_platform require_commands acquire_root_lock acquire_deployment_lock login_defs_number assert_probe_api_service_account prepare_probe_api_service_account run_as_probe_api_no_environment canonical_directory clear_exported_probe_environment assert_secure_file assert_private_file assert_public_root_file require_integer_between canonical_ip_from_origin validate_closed_install_routes validate_management_nginx_fragment_structure validate_management_release_platform validate_allowlist_with_binary validate_static_artifact install_example_file selected_systemd_asset_name management_service_asset_paths validate_management_service_asset_kind management_service_asset_kind_matches validate_management_service_asset_snapshot_root remove_management_service_asset_temporaries cleanup_failed_service_asset_snapshot snapshot_management_service_assets restore_management_service_assets discard_management_service_asset_snapshot management_systemd_property capture_management_unit_activity capture_management_service_activity stop_management_unit_to_inactive restore_management_service_activity restore_management_postgres_activity run_management_rollback_step install_service_assets validate_systemd_unit_source validate_backup_unit_source verify_source_systemd_units validate_backup_service_assets validate_backup_credentials acquire_database_maintenance_lock assert_switchable_path atomic_release_link current_release_target create_database_backup persist_native_nginx_service run_migrations management_installed_nginx_template management_lifecycle_asset_names validate_management_lifecycle_manifest validate_management_lifecycle_assets validate_installed_management_host'
+
+    {
+        printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            '' \
+            '# Management-only prebuilt release runtime for Probe Panel v1.2.' \
+            '# Generated from reviewed source functions; never edit the bundled copy.' \
+            ''
+        awk '
+            /^set -Eeuo pipefail$/ { copying=1 }
+            /^cleanup_deploy_work_root\(\)/ { exit }
+            copying &&
+                $0 !~ /^#/ &&
+                $0 !~ /^MANAGEMENT_ROLLBACK_(RELEASE_PROFILE|OLD_AGENT|OLD_WEB)=/ { print }
+        ' "$common_source"
+    } > "$destination"
+    awk -v wanted="$runtime_functions" '
+        BEGIN {
+            count=split(wanted, names, / +/)
+            for (position=1; position<=count; position++) required[names[position]]=1
+        }
+        /^[A-Za-z_][A-Za-z0-9_]*\(\) [({]$/ {
+            name=$0
+            sub(/\(\).*/, "", name)
+            copying=(name in required)
+            if (copying) seen[name]++
+        }
+        copying { print }
+        copying && ($0 == "}" || $0 == ")") { copying=0 }
+        END {
+            for (name in required) {
+                if (seen[name] != 1) exit 30
+            }
+        }
+    ' "$common_source" >> "$destination" || {
+        rm -f -- "$destination"
+        die "could not extract the reviewed management runtime function set"
+    }
+    # These appends deliberately surround the separately checked extractor and
+    # keep its failure cleanup distinct from the management-only source append.
+    # shellcheck disable=SC2129
+    printf '\n' >> "$destination"
+    cat "$management_source" >> "$destination"
+    printf '%s\n' \
+        '' \
+        'trap cleanup_deploy_work_root EXIT' \
+        "trap 'exit 129' HUP" \
+        "trap 'exit 130' INT" \
+        "trap 'exit 143' TERM" \
+        >> "$destination"
+
+    bash -n "$destination" || {
+        rm -f -- "$destination"
+        die "generated management runtime deploy helper has invalid syntax"
+    }
+    shellcheck "$destination" || {
+        rm -f -- "$destination"
+        die "generated management runtime deploy helper failed shellcheck"
+    }
+
+    local selftest_root="${destination}.platform-selftest"
+    install -d -m 0700 "$selftest_root/canonical" "$selftest_root/reordered" "$selftest_root/os-release"
+    printf '%s\n' \
+        "runtime_abi=$MANAGEMENT_RUNTIME_ABI" \
+        "platform_ids=$MANAGEMENT_PLATFORM_IDS" \
+        > "$selftest_root/canonical/RELEASE-MANIFEST"
+    printf '%s\n' \
+        "runtime_abi=$MANAGEMENT_RUNTIME_ABI" \
+        'platform_ids=centos-stream-10-systemd,debian-9-systemd,debian-10-systemd,debian-11-systemd,debian-12-systemd,debian-13-systemd,ubuntu-18.04-systemd,ubuntu-20.04-systemd,ubuntu-22.04-systemd,ubuntu-24.04-systemd,ubuntu-26.04-systemd,centos-linux-7-systemd,centos-linux-8-systemd,centos-stream-8-systemd,centos-stream-9-systemd' \
+        > "$selftest_root/reordered/RELEASE-MANIFEST"
+    printf '%s\n' 'ID=ubuntu' 'VERSION_ID="22.04"' \
+        > "$selftest_root/os-release/ubuntu-22.04"
+    printf '%s\n' 'NAME="CentOS Stream"' 'ID=centos' 'VERSION_ID="9"' \
+        > "$selftest_root/os-release/centos-stream-9"
+    if ! (
+        # Source the actual generated file so a missing extracted helper fails
+        # here, before any release bundle can be assembled.
+        # shellcheck disable=SC1090
+        source "$destination"
+        trap - EXIT
+        for function_name in \
+            parse_management_os_release_token \
+            parse_management_os_release_name \
+            management_platform_id_from_release \
+            management_platform_nginx_dialect \
+            management_platform_systemd_profile \
+            management_platform_systemd_minimum \
+            management_platform_package_family \
+            management_platform_postgres_service \
+            management_platform_certbot_timer \
+            management_platform_postgres_bin_dir \
+            assert_runtime_platform_contract \
+            initialize_runtime_platform_contract \
+            runtime_platform_id \
+            runtime_systemd_profile \
+            runtime_postgres_service \
+            runtime_certbot_timer \
+            runtime_account_family \
+            runtime_postgres_command \
+            management_platform_id_from_os_release \
+            validate_management_release_platform; do
+            declare -F "$function_name" >/dev/null
+        done
+        [[ "$(parse_management_os_release_token ID ubuntu)" == ubuntu ]]
+        [[ "$(management_platform_id_from_release debian 9)" == debian-9-systemd ]]
+        [[ "$(management_platform_id_from_release debian 10)" == debian-10-systemd ]]
+        [[ "$(management_platform_id_from_release debian 11)" == debian-11-systemd ]]
+        [[ "$(management_platform_id_from_release debian 12)" == debian-12-systemd ]]
+        [[ "$(management_platform_id_from_release debian 13)" == debian-13-systemd ]]
+        [[ "$(management_platform_id_from_release ubuntu 18.04)" == ubuntu-18.04-systemd ]]
+        [[ "$(management_platform_id_from_release ubuntu 20.04)" == ubuntu-20.04-systemd ]]
+        [[ "$(management_platform_id_from_release ubuntu 22.04)" == ubuntu-22.04-systemd ]]
+        [[ "$(management_platform_id_from_release ubuntu 24.04)" == ubuntu-24.04-systemd ]]
+        [[ "$(management_platform_id_from_release ubuntu 26.04)" == ubuntu-26.04-systemd ]]
+        [[ "$(management_platform_id_from_release centos 9 'CentOS Stream')" == centos-stream-9-systemd ]]
+        [[ "$(management_platform_systemd_profile centos-linux-7-systemd)" == legacy ]]
+        [[ "$(management_platform_systemd_minimum centos-linux-7-systemd)" == 219 ]]
+        [[ "$(management_platform_postgres_service centos-stream-9-systemd)" == postgresql-14.service ]]
+        [[ "$(management_platform_certbot_timer centos-stream-9-systemd)" == certbot-renew.timer ]]
+        [[ "$(management_platform_postgres_bin_dir centos-stream-9-systemd)" == /usr/pgsql-14/bin ]]
+        [[ "$(management_platform_nginx_dialect debian-13-systemd)" == modern ]]
+        [[ "$(management_platform_nginx_dialect ubuntu-24.04-systemd)" == legacy ]]
+        if uninitialized_pg_dump="$(runtime_postgres_command pg_dump 2>/dev/null)"; then
+            exit 35
+        fi
+        [[ -z "$uninitialized_pg_dump" ]]
+        initialize_runtime_platform_contract centos-stream-9-systemd
+        [[ "$(runtime_platform_id)" == centos-stream-9-systemd ]]
+        [[ "$(runtime_systemd_profile)" == modern ]]
+        [[ "$(runtime_postgres_service)" == postgresql-14.service ]]
+        [[ "$(runtime_certbot_timer)" == certbot-renew.timer ]]
+        [[ "$(runtime_account_family)" == rpm ]]
+        [[ "$(runtime_postgres_command pg_dump)" == /usr/pgsql-14/bin/pg_dump ]]
+        [[ "$(runtime_postgres_command pg_restore)" == /usr/pgsql-14/bin/pg_restore ]]
+        [[ "$(runtime_postgres_command psql)" == /usr/pgsql-14/bin/psql ]]
+        [[ "$(management_platform_id_from_os_release "$selftest_root/os-release/ubuntu-22.04")" == ubuntu-22.04-systemd ]]
+        [[ "$(management_platform_id_from_os_release "$selftest_root/os-release/centos-stream-9")" == centos-stream-9-systemd ]]
+        validate_management_release_platform "$selftest_root/canonical" debian-12-systemd
+        if ( validate_management_release_platform "$selftest_root/reordered" debian-12-systemd \
+            >/dev/null 2>&1 ); then
+            exit 31
+        fi
+        if ( management_platform_id_from_release Ubuntu 24.04 >/dev/null 2>&1 ); then
+            exit 32
+        fi
+        if ( parse_management_os_release_token ID '"ubuntu' >/dev/null 2>&1 ); then
+            exit 33
+        fi
+    ); then
+        rm -rf -- "$selftest_root"
+        rm -f -- "$destination"
+        die "generated management runtime deploy helper failed its platform contract self-test"
+    fi
+    rm -rf -- "$selftest_root"
+
+    if grep -Eiq 'MANAGEMENT_BUNDLE_EXCLUDE|build_release_artifacts|deploy_release\(\)|npm[[:space:]]+run[[:space:]]+build|[.]/cmd/probe-agent|artifacts/(agent|web)|PROBE_(AGENT|WEB)_DIR|old_(agent|web)|probe-web|/srv/probe/(agent|web)|(^|[^[:alnum:]_])full([^[:alnum:]_]|$)' "$destination"; then
+        rm -f -- "$destination"
+        die "management runtime deploy helper still contains forbidden full, Agent-artifact, visitor, or build logic"
+    fi
 }
 
 assert_no_links_or_maps() {
@@ -298,12 +675,10 @@ assert_binary_architecture() {
 
 build_frontend() {
     local label="$1" source_root="$2" artifact_root="$3"
-    log "testing, auditing, and building $label"
+    log "building $label from the verified commit snapshot"
     (
         cd "$source_root"
         npm ci --no-audit --no-fund
-        npm test
-        npm audit --omit=dev --audit-level=high
         npm run build
     )
     [[ -f "$source_root/dist/index.html" && ! -L "$source_root/dist/index.html" ]] ||
@@ -311,6 +686,21 @@ build_frontend() {
     assert_no_links_or_maps "$label production output" "$source_root/dist"
     install -d -m 0755 "$artifact_root"
     cp -a -- "$source_root/dist/." "$artifact_root/"
+    log "testing and auditing $label after capturing its build artifact"
+    (
+        cd "$source_root"
+        npm test
+        npm audit --omit=dev --audit-level=high
+    )
+}
+
+assert_management_setup_artifact() {
+    local artifact_root="$1" forbidden
+    for forbidden in panel-domain agent-domain '游客面板域名' 'Agent API 域名' '三个域名'; do
+        if grep -R -I -F -q -- "$forbidden" "$artifact_root"; then
+            die "management administrator artifact contains a historical multi-product setup control: $forbidden"
+        fi
+    done
 }
 
 assert_manifest_safe_paths() {
@@ -324,32 +714,108 @@ assert_manifest_safe_paths() {
 
 assemble_bundle() {
     local architecture="$1" api_binary="$2" setup_binary="$3"
-    local common_root="$4" api_source_root="$5" publish_root="$6"
-    local bundle_name="probe-panel-${VERSION}-linux-${architecture}"
+    local common_root="$4" api_source_root="$5" publish_root="$6" profile="$7"
+    local bundle_prefix="probe-panel"
+    [[ "$profile" == full ]] || bundle_prefix="probe-panel-management"
+    local bundle_name="${bundle_prefix}-${VERSION}-linux-${architecture}"
     local bundle_root="${WORK_ROOT}/${bundle_name}"
 
     install -d -m 0755 \
         "$bundle_root/artifacts/api" "$bundle_root/artifacts/admin" \
-        "$bundle_root/artifacts/web" "$bundle_root/artifacts/agent" \
         "$bundle_root/artifacts/migrations" "$bundle_root/setup" \
         "$bundle_root/source/probe-api"
     install -m 0755 "$api_binary" "$bundle_root/artifacts/api/probe-api"
     install -m 0755 "$setup_binary" "$bundle_root/setup/probe-setup"
     cp -a -- "$common_root/admin/." "$bundle_root/artifacts/admin/"
-    cp -a -- "$common_root/web/." "$bundle_root/artifacts/web/"
-    cp -a -- "$common_root/agent/." "$bundle_root/artifacts/agent/"
+    if [[ "$profile" == management ]]; then
+        assert_management_setup_artifact "$bundle_root/artifacts/admin"
+    fi
+    if [[ "$profile" == full ]]; then
+        install -d -m 0755 "$bundle_root/artifacts/web" "$bundle_root/artifacts/agent"
+        cp -a -- "$common_root/web/." "$bundle_root/artifacts/web/"
+        cp -a -- "$common_root/agent/." "$bundle_root/artifacts/agent/"
+    fi
     cp -a -- "$api_source_root/migrations/." "$bundle_root/artifacts/migrations/"
     cp -a -- "$api_source_root/config" "$bundle_root/source/probe-api/config"
-    cp -a -- "$api_source_root/deploy" "$bundle_root/source/probe-api/deploy"
+    if [[ "$profile" == management ]]; then
+        local relative
+        install -d -m 0755 \
+            "$bundle_root/source/probe-api/deploy/nginx" \
+            "$bundle_root/source/probe-api/deploy/scripts" \
+            "$bundle_root/source/probe-api/deploy/setup" \
+            "$bundle_root/source/probe-api/deploy/systemd"
+        for relative in \
+            nginx/nginx-management.conf \
+            nginx/nginx-management-ip.conf \
+            nginx/nginx-management-legacy.conf \
+            nginx/nginx-management-ip-legacy.conf \
+            nginx/nginx-management-classic.conf \
+            nginx/nginx-management-ip-classic.conf \
+            scripts/install-release.sh \
+            scripts/validate-management.sh \
+            scripts/restore-management.sh \
+            scripts/uninstall-management.sh \
+            scripts/backup-postgres.sh \
+            scripts/restore-postgres.sh \
+            setup/probe-panel-setup.env.example \
+            setup/probe-panel-setup.service \
+            setup/probe-panel-setup.socket \
+            setup/probe-panel-setup-legacy.service \
+            setup/probe-panel-setup-legacy.socket \
+            setup/probe-panel-finalizer-management.service \
+            setup/probe-panel-finalizer-management-legacy.service \
+            setup/probe-panel-finalizer.path \
+            systemd/probe-api.service \
+            systemd/probe-api-legacy.service \
+            systemd/probe-postgres-backup.service \
+            systemd/probe-postgres-backup.timer \
+            systemd/probe-postgres-backup-legacy.service \
+            systemd/probe-postgres-backup-legacy.timer; do
+            cp -a -- \
+                "$api_source_root/deploy/$relative" \
+                "$bundle_root/source/probe-api/deploy/$relative"
+        done
+        copy_management_runtime_script \
+            "$api_source_root/deploy/scripts/deploy-common.sh" \
+            "$api_source_root/deploy/scripts/deploy-common-management-runtime.sh" \
+            "$bundle_root/source/probe-api/deploy/scripts/deploy-common.sh"
+        for forbidden in \
+            "$bundle_root/source/probe-api/deploy/nginx/nginx.conf" \
+            "$bundle_root/source/probe-api/deploy/nginx/nginx-ip.conf" \
+            "$bundle_root/source/probe-api/deploy/setup/probe-panel-finalizer.service"; do
+            [[ ! -e "$forbidden" && ! -L "$forbidden" ]] ||
+                die "management bundle contains a historical full-profile deployment file: $forbidden"
+        done
+    else
+        cp -a -- "$api_source_root/deploy" "$bundle_root/source/probe-api/deploy"
+        rm -f -- \
+            "$bundle_root/source/probe-api/deploy/nginx/nginx-management.conf" \
+            "$bundle_root/source/probe-api/deploy/nginx/nginx-management-ip.conf" \
+            "$bundle_root/source/probe-api/deploy/nginx/nginx-management-legacy.conf" \
+            "$bundle_root/source/probe-api/deploy/nginx/nginx-management-ip-legacy.conf" \
+            "$bundle_root/source/probe-api/deploy/nginx/nginx-management-classic.conf" \
+            "$bundle_root/source/probe-api/deploy/nginx/nginx-management-ip-classic.conf" \
+            "$bundle_root/source/probe-api/deploy/setup/probe-panel-finalizer-management.service" \
+            "$bundle_root/source/probe-api/deploy/setup/probe-panel-finalizer-management-legacy.service"
+    fi
 
     cat > "$bundle_root/RELEASE-MANIFEST" <<EOF
 format=probe-panel-release-v1
 version=${VERSION}
 architecture=linux-${architecture}
+profile=${profile}
+runtime_abi=${MANAGEMENT_RUNTIME_ABI}
+platform_ids=${MANAGEMENT_PLATFORM_IDS}
+source_repository=${SOURCE_REPOSITORY}
+source_commit=${SOURCE_COMMIT}
 super_my_ref=${SUPER_MY_REF}
+EOF
+    if [[ "$profile" == full ]]; then
+        cat >> "$bundle_root/RELEASE-MANIFEST" <<EOF
 my_ref=${WEB_REF}
 my_agent_ref=${AGENT_REF}
 EOF
+    fi
 
     assert_no_links_or_maps "$bundle_name" "$bundle_root"
     assert_manifest_safe_paths "$bundle_root"
@@ -358,10 +824,16 @@ EOF
     chmod 0755 \
         "$bundle_root/artifacts/api/probe-api" \
         "$bundle_root/setup/probe-setup" \
-        "$bundle_root/artifacts/agent/downloads/probe-agent/install.sh" \
-        "$bundle_root/artifacts/agent/downloads/probe-agent/linux-amd64/probe-agent" \
-        "$bundle_root/artifacts/agent/downloads/probe-agent/linux-arm64/probe-agent" \
-        "$bundle_root/source/probe-api/deploy/scripts/install-release.sh"
+        "$bundle_root/source/probe-api/deploy/scripts/install-release.sh" \
+        "$bundle_root/source/probe-api/deploy/scripts/validate-management.sh" \
+        "$bundle_root/source/probe-api/deploy/scripts/restore-management.sh" \
+        "$bundle_root/source/probe-api/deploy/scripts/uninstall-management.sh"
+    if [[ "$profile" == full ]]; then
+        chmod 0755 \
+            "$bundle_root/artifacts/agent/downloads/probe-agent/install.sh" \
+            "$bundle_root/artifacts/agent/downloads/probe-agent/linux-amd64/probe-agent" \
+            "$bundle_root/artifacts/agent/downloads/probe-agent/linux-arm64/probe-agent"
+    fi
     (
         cd "$bundle_root"
         find artifacts setup source -type f -print0 | LC_ALL=C sort -z |
@@ -375,23 +847,35 @@ EOF
 
 main() {
     parse_arguments "$@"
-    [[ "$VERSION" == v1.1.0 ]] ||
-        die 'this release builder is pinned to the reviewed v1.1.0 server release'
+    validate_profile
     require_debian_13
     local command_name
-    for command_name in basename bash cat chmod cp dirname file find git go gzip install \
-        mktemp mv npm readlink rm sh sha256sum shellcheck sort tar xargs; do
+    for command_name in awk basename bash cat chmod cmp cp dirname file find git go grep gzip install \
+        mkdir mktemp mv npm readlink rm sh sha256sum shellcheck sort stat tar xargs; do
         require_command "$command_name"
     done
 
     ADMIN_ROOT="$(canonical_source_directory probe-admin "$ADMIN_ROOT")"
-    WEB_ROOT="$(canonical_source_directory probe-web "$WEB_ROOT")"
-    AGENT_ROOT="$(canonical_source_directory probe-agent "$AGENT_ROOT")"
+    if [[ "$PROFILE" == full ]]; then
+        WEB_ROOT="$(canonical_source_directory probe-web "$WEB_ROOT")"
+        AGENT_ROOT="$(canonical_source_directory probe-agent "$AGENT_ROOT")"
+    else
+        WEB_ROOT=""
+        AGENT_ROOT=""
+    fi
     readonly ADMIN_ROOT WEB_ROOT AGENT_ROOT
-    local api_root="${SUPER_MY_ROOT}/probe-api"
-    api_root="$(canonical_source_directory probe-api "$api_root")"
     validate_fixed_repository_sources
-    validate_sources "$api_root"
+    [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] ||
+        die 'verified super-my source commit is malformed'
+    if [[ "$PROFILE" == full ]]; then
+        [[ "$WEB_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] ||
+            die 'verified my source commit is malformed'
+        [[ "$AGENT_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] ||
+            die 'verified my-agent source commit is malformed'
+    fi
+    readonly SOURCE_COMMIT SOURCE_TAG_OBJECT
+    readonly WEB_SOURCE_COMMIT WEB_SOURCE_TAG_OBJECT
+    readonly AGENT_SOURCE_COMMIT AGENT_SOURCE_TAG_OBJECT
 
     local output_parent output_name
     output_parent="$(dirname -- "$OUTPUT_DIR")"
@@ -405,47 +889,63 @@ main() {
     [[ ! -e "$OUTPUT_DIR" && ! -L "$OUTPUT_DIR" ]] ||
         die "output directory already exists; refusing to overwrite it: $OUTPUT_DIR"
 
-    WORK_ROOT="$(mktemp -d "${output_parent}/.probe-release-build.XXXXXX")"
+    # Choose the cleanup target and install all traps before creating it.  A
+    # signal can therefore never land after directory creation but before the
+    # cleanup handler knows its exact path.
+    WORK_ROOT="${output_parent}/.probe-release-build.${BASHPID}.${RANDOM}${RANDOM}"
     trap cleanup EXIT
     trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 143' TERM
+    if ! mkdir -m 0700 -- "$WORK_ROOT"; then
+        WORK_ROOT=""
+        die "could not reserve a unique release work directory"
+    fi
 
     local source_root="${WORK_ROOT}/sources"
+    local pristine_super_source="${source_root}/pristine-super-my"
+    local pristine_api_source="${pristine_super_source}/probe-api"
     local super_source="${source_root}/super-my"
     local api_source="${super_source}/probe-api"
-    local web_source="${source_root}/my"
-    local agent_source="${source_root}/my-agent"
+    local web_source="" agent_source=""
     local binary_root="${WORK_ROOT}/binaries"
     local common_root="${WORK_ROOT}/common"
     local publish_root="${WORK_ROOT}/publish"
-    install -d -m 0700 "$source_root" "$super_source" "$binary_root/api" \
-        "$binary_root/setup" "$binary_root/agent/linux-amd64" \
-        "$binary_root/agent/linux-arm64" "$common_root/agent/downloads/probe-agent/linux-amd64" \
-        "$common_root/agent/downloads/probe-agent/linux-arm64" "$publish_root"
-    copy_frontend_source "$ADMIN_ROOT" "$super_source"
-    copy_frontend_source "$WEB_ROOT" "$web_source"
-    copy_project_source "$api_root" "$api_source"
-    copy_project_source "$AGENT_ROOT" "$agent_source"
-    install -m 0755 "$SUPER_MY_ROOT/install.sh" "$super_source/install.sh"
-    install -d -m 0755 "$super_source/.github/workflows"
-    install -m 0644 "$SUPER_MY_ROOT/.github/workflows/release.yml" \
-        "$super_source/.github/workflows/release.yml"
+    install -d -m 0700 "$source_root" "$binary_root/api" \
+        "$binary_root/setup" "$publish_root"
+    # Read the live object database exactly once.  Packaging keeps this
+    # pristine snapshot; all builds and tests use an independent work copy.
+    stage_repository_commit super-my "$SUPER_MY_ROOT" "$SOURCE_COMMIT" "$pristine_super_source"
+    cp -a -- "$pristine_super_source" "$super_source"
+    if [[ "$PROFILE" == full ]]; then
+        local pristine_web_source="${source_root}/pristine-my"
+        local pristine_agent_source="${source_root}/pristine-my-agent"
+        web_source="${source_root}/my"
+        agent_source="${source_root}/my-agent"
+        install -d -m 0700 "$binary_root/agent/linux-amd64" \
+            "$binary_root/agent/linux-arm64" \
+            "$common_root/agent/downloads/probe-agent/linux-amd64" \
+            "$common_root/agent/downloads/probe-agent/linux-arm64"
+        stage_repository_commit my "$WEB_ROOT" "$WEB_SOURCE_COMMIT" "$pristine_web_source"
+        stage_repository_commit my-agent "$AGENT_ROOT" "$AGENT_SOURCE_COMMIT" "$pristine_agent_source"
+        cp -a -- "$pristine_web_source" "$web_source"
+        cp -a -- "$pristine_agent_source" "$agent_source"
+    fi
+    validate_sources "$super_source" "$api_source" "$super_source" \
+        "$web_source" "$agent_source" "$PROFILE"
+    validate_sources "$pristine_super_source" "$pristine_api_source" "$pristine_super_source" \
+        "${pristine_web_source:-}" "${pristine_agent_source:-}" "$PROFILE"
+    SOURCE_INPUT_DIGEST="$(source_input_digest "$super_source")"
+    PRISTINE_SOURCE_DIGEST="$(source_input_digest "$pristine_super_source")"
+    if [[ "$PROFILE" == full ]]; then
+        WEB_INPUT_DIGEST="$(source_input_digest "$web_source")"
+        AGENT_INPUT_DIGEST="$(source_input_digest "$agent_source")"
+    fi
+    readonly SOURCE_INPUT_DIGEST PRISTINE_SOURCE_DIGEST WEB_INPUT_DIGEST AGENT_INPUT_DIGEST
 
-    log 'checking deployment Shell contracts'
-    shellcheck "$api_source"/deploy/scripts/*.sh "$api_source"/deploy/tests/*.sh \
-        "$agent_source/deploy/install.sh" "$agent_source"/deploy/tests/*.sh
-    (
-        cd "$super_source"
-        sh probe-api/deploy/tests/bootstrap-install-contract.sh
-        sh probe-api/deploy/tests/build-release-bundles-contract.sh
-    )
-
-    log 'testing and vetting probe-api'
+    log 'cross-building probe-api and probe-setup from the verified work snapshot'
     (
         cd "$api_source"
-        go test -count=1 ./...
-        go vet ./...
         for architecture in amd64 arm64; do
             CGO_ENABLED=0 GOOS=linux GOARCH="$architecture" \
                 go build -trimpath -ldflags='-s -w' \
@@ -455,59 +955,122 @@ main() {
                 -o "$binary_root/setup/probe-setup-$architecture" ./cmd/probe-setup
         done
     )
+    revalidate_all_source_inputs "$super_source" "$pristine_super_source" \
+        "$web_source" "$agent_source"
+    build_frontend probe-admin "$super_source" "$common_root/admin"
+    revalidate_all_source_inputs "$super_source" "$pristine_super_source" \
+        "$web_source" "$agent_source"
 
-    log 'testing, vetting, and cross-building probe-agent'
+    log 'checking deployment Shell contracts'
+    shellcheck "$super_source/install.sh" "$super_source/install/build-standalone.sh" \
+        "$super_source/install/common.sh" "$super_source"/install/platforms/*.sh \
+        "$api_source"/deploy/scripts/*.sh "$api_source"/deploy/tests/*.sh
+    if [[ "$PROFILE" == full ]]; then
+        shellcheck "$agent_source/deploy/install.sh" "$agent_source"/deploy/tests/*.sh
+    fi
     (
-        cd "$agent_source"
+        cd "$super_source"
+        sh probe-api/deploy/tests/bootstrap-install-contract.sh
+        sh probe-api/deploy/tests/build-release-bundles-contract.sh
+        sh probe-api/deploy/tests/management-lifecycle-contract.sh
+    )
+    revalidate_all_source_inputs "$super_source" "$pristine_super_source" \
+        "$web_source" "$agent_source"
+
+    log 'testing and vetting probe-api'
+    (
+        cd "$api_source"
+        if [[ "$PROFILE" == management ]]; then
+            go run ./cmd/probe-support-gate verify \
+                --support-root deploy/support --release "$VERSION" \
+                --require-zero-supported
+        fi
         go test -count=1 ./...
         go vet ./...
-        sh deploy/tests/install-contract.sh
-        for architecture in amd64 arm64; do
-            CGO_ENABLED=0 GOOS=linux GOARCH="$architecture" \
-                go build -trimpath -ldflags='-s -w' \
-                -o "$binary_root/agent/linux-$architecture/probe-agent" ./cmd/probe-agent
-        done
     )
+    revalidate_all_source_inputs "$super_source" "$pristine_super_source" \
+        "$web_source" "$agent_source"
+
+    if [[ "$PROFILE" == full ]]; then
+        log 'testing, vetting, and cross-building probe-agent'
+        (
+            cd "$agent_source"
+            go test -count=1 ./...
+            go vet ./...
+            sh deploy/tests/install-contract.sh
+            for architecture in amd64 arm64; do
+                CGO_ENABLED=0 GOOS=linux GOARCH="$architecture" \
+                    go build -trimpath -ldflags='-s -w' \
+                    -o "$binary_root/agent/linux-$architecture/probe-agent" ./cmd/probe-agent
+            done
+        )
+    fi
+    revalidate_all_source_inputs "$super_source" "$pristine_super_source" \
+        "$web_source" "$agent_source"
 
     local architecture
     for architecture in amd64 arm64; do
         assert_binary_architecture "$binary_root/api/probe-api-$architecture" "$architecture"
         assert_binary_architecture "$binary_root/setup/probe-setup-$architecture" "$architecture"
-        assert_binary_architecture "$binary_root/agent/linux-$architecture/probe-agent" "$architecture"
-        install -m 0755 "$binary_root/agent/linux-$architecture/probe-agent" \
-            "$common_root/agent/downloads/probe-agent/linux-$architecture/probe-agent"
+        if [[ "$PROFILE" == full ]]; then
+            assert_binary_architecture "$binary_root/agent/linux-$architecture/probe-agent" "$architecture"
+            install -m 0755 "$binary_root/agent/linux-$architecture/probe-agent" \
+                "$common_root/agent/downloads/probe-agent/linux-$architecture/probe-agent"
+        fi
     done
-    install -m 0755 "$agent_source/deploy/install.sh" \
-        "$common_root/agent/downloads/probe-agent/install.sh"
-    install -m 0644 "$agent_source/deploy/systemd/probe-agent.service" \
-        "$common_root/agent/downloads/probe-agent/probe-agent.service"
-    (
-        cd "$common_root/agent/downloads/probe-agent"
-        sha256sum install.sh probe-agent.service linux-amd64/probe-agent \
-            linux-arm64/probe-agent > SHA256SUMS
-        sha256sum --check --strict SHA256SUMS >/dev/null
-    )
+    if [[ "$PROFILE" == full ]]; then
+        install -m 0755 "$agent_source/deploy/install.sh" \
+            "$common_root/agent/downloads/probe-agent/install.sh"
+        install -m 0644 "$agent_source/deploy/systemd/probe-agent.service" \
+            "$common_root/agent/downloads/probe-agent/probe-agent.service"
+        (
+            cd "$common_root/agent/downloads/probe-agent"
+            sha256sum install.sh probe-agent.service linux-amd64/probe-agent \
+                linux-arm64/probe-agent > SHA256SUMS
+            sha256sum --check --strict SHA256SUMS >/dev/null
+        )
+    fi
 
-    build_frontend probe-admin "$super_source" "$common_root/admin"
-    build_frontend probe-web "$web_source" "$common_root/web"
+    if [[ "$PROFILE" == full ]]; then
+        build_frontend probe-web "$web_source" "$common_root/web"
+        revalidate_all_source_inputs "$super_source" "$pristine_super_source" \
+            "$web_source" "$agent_source"
+    fi
 
+    # Bracket RELEASE-MANIFEST creation with exact remote-ref checks.  A tag
+    # move during the build therefore fails closed instead of publishing a
+    # manifest whose named ref no longer identifies source_commit.
+    revalidate_remote_source_refs
     for architecture in amd64 arm64; do
         log "assembling linux-$architecture release bundle"
         assemble_bundle "$architecture" \
             "$binary_root/api/probe-api-$architecture" \
             "$binary_root/setup/probe-setup-$architecture" \
-            "$common_root" "$api_source" "$publish_root"
+            "$common_root" "$pristine_api_source" "$publish_root" "$PROFILE"
     done
+    revalidate_all_source_inputs "$super_source" "$pristine_super_source" \
+        "$web_source" "$agent_source"
     (
         cd "$publish_root"
+        local bundle_prefix="probe-panel"
+        [[ "$PROFILE" == full ]] || bundle_prefix="probe-panel-management"
         sha256sum \
-            "probe-panel-${VERSION}-linux-amd64.tar.gz" \
-            "probe-panel-${VERSION}-linux-arm64.tar.gz" > SHA256SUMS
+            "${bundle_prefix}-${VERSION}-linux-amd64.tar.gz" \
+            "${bundle_prefix}-${VERSION}-linux-arm64.tar.gz" > SHA256SUMS
         sha256sum --check --strict SHA256SUMS >/dev/null
     )
-    mv -T -- "$publish_root" "$OUTPUT_DIR"
+    revalidate_remote_source_refs
+    # GNU mv's no-clobber rename is the final atomic existence decision.  It
+    # reports success when it declines an overwrite, so also require that the
+    # hidden publish directory disappeared.
+    mv -T --no-clobber -- "$publish_root" "$OUTPUT_DIR" ||
+        die "release output could not be published without overwriting: $OUTPUT_DIR"
+    [[ ! -e "$publish_root" && ! -L "$publish_root" ]] ||
+        die "release output appeared concurrently; refusing to overwrite it: $OUTPUT_DIR"
     printf 'Probe Panel %s release assets created locally:\n  %s\n' "$VERSION" "$OUTPUT_DIR"
     printf 'No GitHub release was created or modified.\n'
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

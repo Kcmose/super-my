@@ -53,10 +53,13 @@ type DatabaseInput struct {
 }
 
 type DomainInput struct {
-	Panel   string `json:"panel"`
-	Admin   string `json:"admin"`
-	Agent   string `json:"agent"`
-	decoded bool
+	Panel        string `json:"panel"`
+	Admin        string `json:"admin"`
+	Agent        string `json:"agent"`
+	decoded      bool
+	panelPresent bool
+	adminPresent bool
+	agentPresent bool
 }
 
 type NetworkInput struct {
@@ -72,14 +75,32 @@ type TLSInput struct {
 
 func (input *DomainInput) UnmarshalJSON(data []byte) error {
 	var wire struct {
-		Panel *string `json:"panel"`
-		Admin *string `json:"admin"`
-		Agent *string `json:"agent"`
+		Panel json.RawMessage `json:"panel"`
+		Admin json.RawMessage `json:"admin"`
+		Agent json.RawMessage `json:"agent"`
 	}
-	if err := json.Unmarshal(data, &wire); err != nil || wire.Panel == nil || wire.Admin == nil || wire.Agent == nil {
-		return errors.New("domains must contain panel, admin, and agent")
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return errors.New("domains must be an object")
 	}
-	input.Panel, input.Admin, input.Agent = *wire.Panel, *wire.Admin, *wire.Agent
+	decode := func(raw json.RawMessage, destination *string, present *bool) error {
+		if len(raw) == 0 {
+			return nil
+		}
+		if err := json.Unmarshal(raw, destination); err != nil {
+			return errors.New("domain values must be strings")
+		}
+		*present = true
+		return nil
+	}
+	if err := decode(wire.Panel, &input.Panel, &input.panelPresent); err != nil {
+		return err
+	}
+	if err := decode(wire.Admin, &input.Admin, &input.adminPresent); err != nil {
+		return err
+	}
+	if err := decode(wire.Agent, &input.Agent, &input.agentPresent); err != nil {
+		return err
+	}
 	input.decoded = true
 	return nil
 }
@@ -115,16 +136,25 @@ type AdministratorInput struct {
 	PasswordConfirmation Secret `json:"password_confirmation"`
 }
 
+type InstallationProfile string
+
+const (
+	InstallationProfileFull       InstallationProfile = "full"
+	InstallationProfileManagement InstallationProfile = "management"
+)
+
 type CompleteRequest struct {
-	Database      DatabaseInput      `json:"database"`
-	Domains       DomainInput        `json:"domains"`
-	Network       NetworkInput       `json:"network"`
-	TLS           TLSInput           `json:"tls"`
-	Allowlist     []string           `json:"allowlist"`
-	Administrator AdministratorInput `json:"administrator"`
+	Profile       InstallationProfile `json:"profile,omitempty"`
+	Database      DatabaseInput       `json:"database"`
+	Domains       DomainInput         `json:"domains"`
+	Network       NetworkInput        `json:"network"`
+	TLS           TLSInput            `json:"tls"`
+	Allowlist     []string            `json:"allowlist"`
+	Administrator AdministratorInput  `json:"administrator"`
 }
 
 var completeRequestSchema = objectSchema{
+	"profile": nil,
 	"database": {
 		"mode": nil, "name": nil, "username": nil, "password": nil, "password_confirmation": nil,
 	},
@@ -143,9 +173,48 @@ var completeRequestSchema = objectSchema{
 	},
 }
 
+var managementCompleteRequestSchema = objectSchema{
+	"profile": nil,
+	"database": {
+		"mode": nil, "name": nil, "username": nil, "password": nil, "password_confirmation": nil,
+	},
+	"domains": {
+		"admin": nil,
+	},
+	"network": {
+		"address": nil,
+	},
+	"tls": {
+		"mode": nil, "email": nil,
+	},
+	"allowlist": nil,
+	"administrator": {
+		"username": nil, "password": nil, "password_confirmation": nil,
+	},
+}
+
 func DecodeCompleteRequest(data []byte) (CompleteRequest, error) {
+	return decodeCompleteRequest(data, "", false)
+}
+
+// DecodeCompleteRequestForProfile binds a browser submission to the profile
+// selected by the root-owned installer. The browser may omit profile or echo
+// the advertised value, but it cannot switch the privileged finalizer to a
+// different component set.
+func DecodeCompleteRequestForProfile(data []byte, profile InstallationProfile) (CompleteRequest, error) {
+	if profile != InstallationProfileFull && profile != InstallationProfileManagement {
+		return CompleteRequest{}, errors.New("fixed setup profile is invalid")
+	}
+	return decodeCompleteRequest(data, profile, true)
+}
+
+func decodeCompleteRequest(data []byte, profile InstallationProfile, fixed bool) (CompleteRequest, error) {
 	var request CompleteRequest
-	if err := decodeStrictObject(data, &request, completeRequestSchema); err != nil {
+	schema := completeRequestSchema
+	if fixed && profile == InstallationProfileManagement {
+		schema = managementCompleteRequestSchema
+	}
+	if err := decodeStrictObject(data, &request, schema); err != nil {
 		request.ClearSecrets()
 		return CompleteRequest{}, err
 	}
@@ -156,6 +225,22 @@ func DecodeCompleteRequest(data []byte) (CompleteRequest, error) {
 		request.ClearSecrets()
 		return CompleteRequest{}, errors.New("request is missing domains, network, or tls")
 	}
+	if fixed && profile == InstallationProfileManagement {
+		if !request.Domains.adminPresent || request.Domains.panelPresent || request.Domains.agentPresent {
+			request.ClearSecrets()
+			return CompleteRequest{}, errors.New("management domains must contain only admin")
+		}
+	} else if !request.Domains.panelPresent || !request.Domains.adminPresent || !request.Domains.agentPresent {
+		request.ClearSecrets()
+		return CompleteRequest{}, errors.New("domains must contain panel, admin, and agent")
+	}
+	if fixed {
+		if request.Profile != "" && request.Profile != profile {
+			request.ClearSecrets()
+			return CompleteRequest{}, errors.New("request profile does not match the fixed setup profile")
+		}
+		request.Profile = profile
+	}
 	if err := request.Validate(); err != nil {
 		request.ClearSecrets()
 		return CompleteRequest{}, err
@@ -165,6 +250,9 @@ func DecodeCompleteRequest(data []byte) (CompleteRequest, error) {
 }
 
 func (request CompleteRequest) Validate() error {
+	if _, err := request.EffectiveProfile(); err != nil {
+		return err
+	}
 	if request.Database.Mode != localPostgresMode {
 		return errors.New("database.mode must be local")
 	}
@@ -199,6 +287,29 @@ func (request CompleteRequest) Validate() error {
 		return errors.New("administrator password confirmation does not match")
 	}
 	return nil
+}
+
+// EffectiveProfile preserves the original first-install wire contract: a
+// request created before profiles existed remains a full installation. New
+// independent installers must send their explicit profile instead of relying
+// on this compatibility default.
+func (request CompleteRequest) EffectiveProfile() (InstallationProfile, error) {
+	switch request.Profile {
+	case "", InstallationProfileFull:
+		return InstallationProfileFull, nil
+	case InstallationProfileManagement:
+		return InstallationProfileManagement, nil
+	default:
+		return "", errors.New("profile must be full or management")
+	}
+}
+
+func ParseInstallationProfile(value string) (InstallationProfile, error) {
+	profile := InstallationProfile(value)
+	if profile != InstallationProfileFull && profile != InstallationProfileManagement {
+		return "", errors.New("setup profile must be full or management")
+	}
+	return profile, nil
 }
 
 func (request CompleteRequest) Clone() CompleteRequest {

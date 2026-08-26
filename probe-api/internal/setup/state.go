@@ -167,7 +167,7 @@ func allowedTransition(from, to State) bool {
 	case StateConfiguring:
 		return to == StateFinalizing
 	case StateFinalizing:
-		return to == StateInstalled
+		return to == StateInstalled || to == StateConfiguring
 	default:
 		return false
 	}

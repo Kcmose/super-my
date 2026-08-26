@@ -27,6 +27,80 @@ type blockingFinalizer struct {
 	release chan error
 }
 
+type retainingErrorReadCloser struct {
+	contents []byte
+	err      error
+	retained [][]byte
+}
+
+func (reader *retainingErrorReadCloser) Read(buffer []byte) (int, error) {
+	if len(reader.contents) == 0 {
+		if reader.err != nil {
+			err := reader.err
+			reader.err = nil
+			return 0, err
+		}
+		return 0, io.EOF
+	}
+	n := copy(buffer, reader.contents)
+	reader.contents = reader.contents[n:]
+	reader.retained = append(reader.retained, buffer[:n])
+	if reader.err != nil {
+		err := reader.err
+		reader.err = nil
+		return n, err
+	}
+	return n, nil
+}
+
+func (*retainingErrorReadCloser) Close() error { return nil }
+
+func TestReadJSONBodyClearsPartialBufferOnEveryReadFailure(t *testing.T) {
+	tests := []struct {
+		name       string
+		contents   []byte
+		readError  error
+		limit      int64
+		wantStatus int
+	}{
+		{
+			name:       "reader error",
+			contents:   []byte(`{"password":"partial-secret"}`),
+			readError:  errors.New("simulated request read failure"),
+			limit:      64 * 1024,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "body limit",
+			contents:   bytes.Repeat([]byte("secret"), 16),
+			limit:      8,
+			wantStatus: http.StatusRequestEntityTooLarge,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			reader := &retainingErrorReadCloser{contents: append([]byte(nil), test.contents...), err: test.readError}
+			request := httptest.NewRequest(http.MethodPost, "/api/v1/setup/complete", nil)
+			request.Body = reader
+			request.Header.Set("Content-Type", "application/json")
+			body, status, err := readJSONBody(httptest.NewRecorder(), request, test.limit)
+			if err == nil || status != test.wantStatus || body != nil {
+				t.Fatalf("read failure result = body:%q status:%d error:%v", body, status, err)
+			}
+			if len(reader.retained) == 0 {
+				t.Fatal("test reader did not retain the io.ReadAll destination buffer")
+			}
+			for _, retained := range reader.retained {
+				for index, value := range retained {
+					if value != 0 {
+						t.Fatalf("partial request byte %d was not cleared: %x", index, value)
+					}
+				}
+			}
+		})
+	}
+}
+
 func (finalizer *blockingFinalizer) Finalize(ctx context.Context, request CompleteRequest) error {
 	snapshot := finalizerSnapshot{
 		databasePassword: string(request.Database.Password),
@@ -380,6 +454,33 @@ func TestSetupServerRejectsRedirectedSocketPathOrMissingDefaults(t *testing.T) {
 	_, err = NewServer(ServerConfig{AdminRoot: root, Defaults: defaults, InstalledShutdownDelay: 20 * time.Second}, nil, manager, FinalizerFunc(func(context.Context, CompleteRequest) error { return nil }))
 	if err == nil {
 		t.Fatal("shutdown delay shorter than the socket finalizer grace period was accepted")
+	}
+}
+
+func TestManagementSetupServerAdvertisesFixedProfileWithoutIndependentURLs(t *testing.T) {
+	now := time.Date(2026, 8, 24, 10, 0, 0, 0, time.UTC)
+	manager := newTestManager(newMemoryFiles(), func() time.Time { return now }, sessionTestRandom(4))
+	if err := manager.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+	defaults := &SetupDefaults{
+		Profile:  InstallationProfileManagement,
+		ServerIP: "192.0.2.10", AdminURL: "https://192.0.2.10:18455",
+	}
+	server := newTestServer(t, manager, FinalizerFunc(func(context.Context, CompleteRequest) error { return nil }), defaults)
+	for _, request := range []*http.Request{
+		validSetupRequest(http.MethodGet, "/api/v1/setup/status", ""),
+		validSetupRequest(http.MethodPost, "/api/v1/setup/session", `{}`),
+	} {
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, request)
+		body := response.Body.String()
+		if response.Code != http.StatusOK || !strings.Contains(body, `"profile":"management"`) || !strings.Contains(body, `"admin_url":"https://192.0.2.10:18455"`) {
+			t.Fatalf("management setup response = %d %s", response.Code, body)
+		}
+		if strings.Contains(body, `"panel_url"`) || strings.Contains(body, `"agent_url"`) {
+			t.Fatalf("management setup leaked independent URL defaults: %s", body)
+		}
 	}
 }
 

@@ -42,10 +42,11 @@ type ServerConfig struct {
 }
 
 type SetupDefaults struct {
-	ServerIP string `json:"server_ip"`
-	PanelURL string `json:"panel_url"`
-	AgentURL string `json:"agent_url"`
-	AdminURL string `json:"admin_url"`
+	Profile  InstallationProfile `json:"profile"`
+	ServerIP string              `json:"server_ip"`
+	PanelURL string              `json:"panel_url,omitempty"`
+	AgentURL string              `json:"agent_url,omitempty"`
+	AdminURL string              `json:"admin_url"`
 }
 
 type Server struct {
@@ -78,8 +79,19 @@ func NewServer(config ServerConfig, logger *slog.Logger, manager *Manager, final
 	if config.SocketPath != DefaultSocketPath {
 		return nil, errors.New("setup server must use the fixed private Unix socket")
 	}
-	if config.Defaults == nil || strings.TrimSpace(config.Defaults.ServerIP) == "" || strings.TrimSpace(config.Defaults.PanelURL) == "" || strings.TrimSpace(config.Defaults.AgentURL) == "" || strings.TrimSpace(config.Defaults.AdminURL) == "" {
+	if config.Defaults == nil {
 		return nil, errors.New("setup network defaults are required")
+	}
+	profile := config.Defaults.Profile
+	if profile == "" {
+		profile = InstallationProfileFull
+		config.Defaults.Profile = profile
+	}
+	if strings.TrimSpace(config.Defaults.ServerIP) == "" || strings.TrimSpace(config.Defaults.AdminURL) == "" ||
+		(profile == InstallationProfileFull && (strings.TrimSpace(config.Defaults.PanelURL) == "" || strings.TrimSpace(config.Defaults.AgentURL) == "")) ||
+		(profile == InstallationProfileManagement && (config.Defaults.PanelURL != "" || config.Defaults.AgentURL != "")) ||
+		(profile != InstallationProfileFull && profile != InstallationProfileManagement) {
+		return nil, errors.New("setup network defaults are invalid for the fixed profile")
 	}
 	if config.MaxBodyBytes == 0 {
 		config.MaxBodyBytes = DefaultMaxBodyBytes
@@ -294,7 +306,7 @@ func (server *Server) complete(writer http.ResponseWriter, request *http.Request
 		httpError(writer, status, "invalid_request", err.Error())
 		return
 	}
-	decoded, err := DecodeCompleteRequest(body)
+	decoded, err := DecodeCompleteRequestForProfile(body, server.defaults.Profile)
 	clear(body)
 	if err != nil {
 		httpError(writer, http.StatusBadRequest, "invalid_request", err.Error())
@@ -495,6 +507,10 @@ func readJSONBody(writer http.ResponseWriter, request *http.Request, limit int64
 	request.Body = http.MaxBytesReader(writer, request.Body, limit)
 	body, err := io.ReadAll(request.Body)
 	if err != nil {
+		// MaxBytesReader may consume one sentinel byte beyond the count it
+		// returns with MaxBytesError. Wipe the complete allocation, not only
+		// the visible length, so that byte cannot retain request secret data.
+		clear(body[:cap(body)])
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
 			return nil, http.StatusRequestEntityTooLarge, errors.New("request body exceeds 64 KiB")

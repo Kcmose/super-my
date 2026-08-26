@@ -5,6 +5,8 @@ umask 077
 
 readonly BACKUP_MARKER_VALUE='probe-postgres-backup-v1'
 readonly DEFAULT_BACKUP_ROOT='/var/backups/probe-panel/postgres'
+readonly PG_DUMP_BINARY='@PROBE_PG_DUMP@'
+readonly PG_RESTORE_BINARY='@PROBE_PG_RESTORE@'
 
 backup_root=''
 daily_dir=''
@@ -162,8 +164,12 @@ rotate_archives() {
   done
 }
 
-for command_name in pg_dump pg_restore sha256sum realpath flock find sort date mktemp stat; do
+for command_name in sha256sum realpath flock find sort date mktemp stat; do
   require_command "$command_name"
+done
+for postgres_binary in "$PG_DUMP_BINARY" "$PG_RESTORE_BINARY"; do
+  [[ $postgres_binary == /* && $postgres_binary != *@* && -x $postgres_binary ]] ||
+    die "PostgreSQL command path was not rendered to an executable: $postgres_binary"
 done
 
 daily_keep=${PROBE_POSTGRES_DAILY_KEEP:-7}
@@ -182,14 +188,14 @@ daily_output="$daily_dir/$archive_name"
 [[ ! -e $daily_output && ! -e $daily_output.sha256 ]] || die "backup archive already exists: $daily_output"
 
 temp_dump=$(mktemp "$daily_dir/.probe-backup.XXXXXX.dump")
-pg_dump \
+"$PG_DUMP_BINARY" \
   --format=custom \
   --compress=6 \
   --no-owner \
   --no-privileges \
   --no-password \
   --file="$temp_dump"
-pg_restore --list "$temp_dump" >/dev/null || die 'pg_restore could not read the new archive'
+"$PG_RESTORE_BINARY" --list "$temp_dump" >/dev/null || die 'pg_restore could not read the new archive'
 chmod 0600 -- "$temp_dump"
 mv -- "$temp_dump" "$daily_output"
 temp_dump=''
@@ -203,7 +209,7 @@ if [[ $(date '+%u') == "$weekly_day" ]]; then
   weekly_temp=$(mktemp "$weekly_dir/.probe-weekly.XXXXXX.dump")
   cp --reflink=auto -- "$daily_output" "$weekly_temp"
   chmod 0600 -- "$weekly_temp"
-  pg_restore --list "$weekly_temp" >/dev/null || die 'pg_restore could not read the weekly archive copy'
+  "$PG_RESTORE_BINARY" --list "$weekly_temp" >/dev/null || die 'pg_restore could not read the weekly archive copy'
   mv -- "$weekly_temp" "$weekly_output"
   weekly_temp=''
   weekly_created=1

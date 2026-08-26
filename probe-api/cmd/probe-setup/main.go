@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strconv"
 	"strings"
@@ -28,7 +29,10 @@ const (
 	// durable terminal-state reconciliation, and result publication.
 	privilegedFinalizeTimeout       = 25 * time.Minute
 	privilegedFinalizeCleanupBudget = time.Minute
+	terminalSetupCleanupDelay       = 30 * time.Second
 )
+
+var newSetupRootFiles = func() setup.SecureFiles { return setup.NewRootFileStore() }
 
 func main() {
 	if err := run(os.Args[1:], nil); err != nil {
@@ -38,15 +42,21 @@ func main() {
 }
 
 func run(args []string, finalizer setup.Finalizer) error {
-	if len(args) != 1 || (args[0] != "init" && args[0] != "serve" && args[0] != "finalize") {
-		return errors.New("usage: probe-setup <init|serve|finalize>")
+	if len(args) != 1 || (args[0] != "init" && args[0] != "serve" && args[0] != "finalize" && args[0] != "finalize-cleanup") {
+		return errors.New("usage: probe-setup <init|serve|finalize|finalize-cleanup>")
 	}
-	if args[0] == "finalize" {
+	if _, err := requiredManagementSetupProfile(); err != nil {
+		return err
+	}
+	if args[0] == "finalize" || args[0] == "finalize-cleanup" {
 		finalizeContext, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 		defer stopSignals()
+		if args[0] == "finalize-cleanup" {
+			return runFinalizerCleanup(finalizeContext)
+		}
 		return runPrivilegedFinalizer(finalizeContext)
 	}
-	files := setup.NewRootFileStore()
+	files := newSetupRootFiles()
 	statePath := envString("PROBE_SETUP_STATE_FILE", defaultStateFile)
 	states, err := setup.NewStateStore(files, statePath)
 	if err != nil {
@@ -83,7 +93,11 @@ func run(args []string, finalizer setup.Finalizer) error {
 	if err != nil {
 		return err
 	}
-	listener, err := activatedSystemdListener()
+	platformID, err := requiredSetupPlatformID()
+	if err != nil {
+		return err
+	}
+	listener, err := activatedSystemdListener(platformID)
 	if err != nil {
 		return err
 	}
@@ -109,8 +123,71 @@ func run(args []string, finalizer setup.Finalizer) error {
 	return nil
 }
 
-func activatedSystemdListener() (net.Listener, error) {
-	if err := validateSystemdActivation(os.Getpid(), os.Getenv("LISTEN_PID"), os.Getenv("LISTEN_FDS"), os.Getenv("LISTEN_FDNAMES")); err != nil {
+type setupStateLoader interface {
+	Load() (setup.StateRecord, error)
+}
+
+type cleanupCommand func(context.Context, string, ...string) error
+
+func runFinalizerCleanup(ctx context.Context) error {
+	if os.Geteuid() != 0 {
+		return errors.New("setup finalizer cleanup must run as root")
+	}
+	statePath, err := fixedIPCPath("PROBE_SETUP_STATE_FILE", defaultStateFile)
+	if err != nil {
+		return err
+	}
+	states, err := setup.NewStateStore(setup.NewRootFileStore(), statePath)
+	if err != nil {
+		return err
+	}
+	runCommand := func(commandContext context.Context, name string, arguments ...string) error {
+		return exec.CommandContext(commandContext, name, arguments...).Run()
+	}
+	return cleanupTerminalSetup(ctx, states, terminalSetupCleanupDelay, runCommand)
+}
+
+func cleanupTerminalSetup(ctx context.Context, states setupStateLoader, delay time.Duration, runCommand cleanupCommand) error {
+	if ctx == nil || states == nil || runCommand == nil {
+		return errors.New("setup finalizer cleanup is not configured")
+	}
+	record, err := states.Load()
+	if err != nil {
+		return fmt.Errorf("inspect setup state before finalizer cleanup: %w", err)
+	}
+	if !terminalSetupState(record.Status) {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	record, err = states.Load()
+	if err != nil {
+		return fmt.Errorf("recheck setup state before finalizer cleanup: %w", err)
+	}
+	if !terminalSetupState(record.Status) {
+		return nil
+	}
+	var failures []error
+	if err := runCommand(ctx, "/usr/bin/systemctl", "stop", "probe-panel-setup.socket"); err != nil {
+		failures = append(failures, fmt.Errorf("stop terminal setup socket: %w", err))
+	}
+	if err := runCommand(ctx, "/usr/bin/systemctl", "--no-block", "stop", "probe-panel-setup.service"); err != nil {
+		failures = append(failures, fmt.Errorf("stop terminal setup service: %w", err))
+	}
+	return errors.Join(failures...)
+}
+
+func terminalSetupState(state setup.State) bool {
+	return state == setup.StateInstalled || state == setup.StateRecoveryRequired
+}
+
+func activatedSystemdListener(platformID string) (net.Listener, error) {
+	if err := validateSystemdActivation(os.Getpid(), os.Getenv("LISTEN_PID"), os.Getenv("LISTEN_FDS"), os.Getenv("LISTEN_FDNAMES"), platformID); err != nil {
 		return nil, err
 	}
 	for _, name := range []string{"LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES"} {
@@ -135,7 +212,7 @@ func activatedSystemdListener() (net.Listener, error) {
 	return listener, nil
 }
 
-func validateSystemdActivation(processID int, listenPIDValue, listenFDsValue, listenFDNames string) error {
+func validateSystemdActivation(processID int, listenPIDValue, listenFDsValue, listenFDNames, platformID string) error {
 	listenPID, err := strconv.Atoi(strings.TrimSpace(listenPIDValue))
 	if err != nil || listenPID != processID {
 		return errors.New("setup service requires a systemd socket for this process")
@@ -144,7 +221,11 @@ func validateSystemdActivation(processID int, listenPIDValue, listenFDsValue, li
 	if err != nil || listenFDs != 1 {
 		return errors.New("setup service requires exactly one systemd socket")
 	}
-	if listenFDNames != setupFDName {
+	unitProfile, err := setupfinalize.UnitProfileForPlatformID(platformID)
+	if err != nil {
+		return errors.New("setup service received an unsupported platform contract")
+	}
+	if listenFDNames != setupFDName && !(unitProfile == setupfinalize.SystemdUnitProfileLegacy && listenFDNames == "") {
 		return errors.New("setup service received an unexpected systemd socket")
 	}
 	return nil
@@ -159,12 +240,38 @@ func setupDefaultsFromServerIP(value string) (*setup.SetupDefaults, error) {
 	origin := func(port int) string {
 		return "https://" + net.JoinHostPort(address.String(), strconv.Itoa(port))
 	}
-	return &setup.SetupDefaults{
+	defaults := &setup.SetupDefaults{
+		Profile:  setup.InstallationProfileManagement,
 		ServerIP: address.String(),
-		PanelURL: origin(setup.PanelHTTPSPort),
-		AgentURL: origin(setup.AgentHTTPSPort),
 		AdminURL: origin(setup.AdminHTTPSPort),
-	}, nil
+	}
+	return defaults, nil
+}
+
+func requiredManagementSetupProfile() (setup.InstallationProfile, error) {
+	value := os.Getenv("PROBE_SETUP_PROFILE")
+	if value != string(setup.InstallationProfileManagement) {
+		return "", errors.New("PROBE_SETUP_PROFILE must be exactly management")
+	}
+	return setup.InstallationProfileManagement, nil
+}
+
+func requiredSetupPlatformID() (string, error) {
+	value := os.Getenv("PROBE_SETUP_PLATFORM_ID")
+	if value == "" {
+		return "", errors.New("PROBE_SETUP_PLATFORM_ID is required")
+	}
+	if err := setupfinalize.ValidatePlatformID(value); err != nil {
+		return "", fmt.Errorf("PROBE_SETUP_PLATFORM_ID is invalid: %w", err)
+	}
+	return value, nil
+}
+
+func validatePrivilegedManagementRequest(request setup.CompleteRequest) error {
+	if request.Profile != setup.InstallationProfileManagement {
+		return errors.New("privileged setup request must be exactly management")
+	}
+	return nil
 }
 
 func runPrivilegedFinalizer(parentContext context.Context) error {
@@ -185,6 +292,13 @@ func runPrivilegedFinalizer(parentContext context.Context) error {
 	resultPath := setupipc.DefaultResultPath
 	fail := func(cause error) error {
 		return publishPrivilegedFinalizerOutcome(states, resultPath, cause)
+	}
+	if _, err := requiredManagementSetupProfile(); err != nil {
+		return fail(err)
+	}
+	platformID, err := requiredSetupPlatformID()
+	if err != nil {
+		return fail(err)
 	}
 	requestPath, err := fixedIPCPath("PROBE_SETUP_FINALIZE_REQUEST_FILE", setupipc.DefaultRequestPath)
 	if err != nil {
@@ -209,10 +323,14 @@ func runPrivilegedFinalizer(parentContext context.Context) error {
 		return fail(errors.New("consume privileged setup request: setup IPC is unavailable"))
 	}
 	defer request.ClearSecrets()
+	if err := validatePrivilegedManagementRequest(request); err != nil {
+		return fail(err)
+	}
 
 	finalizer, err := setupfinalize.New(setupfinalize.Config{
 		BundleRoot:  bundleRoot,
 		ReleaseID:   releaseID,
+		PlatformID:  platformID,
 		RequireRoot: true,
 		CommitInstalled: func(now time.Time) error {
 			return states.Transition(setup.StateFinalizing, setup.StateInstalled, now.UTC())
@@ -279,6 +397,19 @@ func reconcilePrivilegedFinalizerState(states *setup.StateStore, finalizeErr err
 	if record.Status == setup.StateInstalled {
 		return setupipc.Result{Success: true}, nil
 	}
+	var retryTransitionErr error
+	if errors.Is(finalizeErr, setupfinalize.ErrPreflight) {
+		if record.Status == setup.StateConfiguring {
+			return setupipc.Result{Success: false, ErrorCode: setupipc.ErrorCodePreflightFailed}, nil
+		}
+		if record.Status == setup.StateFinalizing {
+			if err := states.Transition(setup.StateFinalizing, setup.StateConfiguring, now.UTC()); err == nil {
+				return setupipc.Result{Success: false, ErrorCode: setupipc.ErrorCodePreflightFailed}, nil
+			} else {
+				retryTransitionErr = fmt.Errorf("restore configuring state after preflight failure: %w", err)
+			}
+		}
+	}
 	if record.Status != setup.StateRecoveryRequired {
 		if err := states.MarkRecovery(now.UTC()); err != nil {
 			latest, loadErr := states.Load()
@@ -291,7 +422,7 @@ func reconcilePrivilegedFinalizerState(states *setup.StateStore, finalizeErr err
 	if finalizeErr == nil {
 		return failure, errors.New("privileged finalizer returned without an installed commit")
 	}
-	return failure, nil
+	return failure, retryTransitionErr
 }
 
 func fixedIPCPath(name, expected string) (string, error) {

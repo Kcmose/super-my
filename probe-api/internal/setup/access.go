@@ -24,6 +24,7 @@ const (
 // fields because IPv6 literals require bracketed host:port formatting.
 type AccessConfiguration struct {
 	Mode        IngressMode
+	Profile     InstallationProfile
 	Address     netip.Addr
 	PanelOrigin string
 	AgentOrigin string
@@ -31,6 +32,14 @@ type AccessConfiguration struct {
 }
 
 func (request CompleteRequest) AccessConfiguration() (AccessConfiguration, error) {
+	profile, err := request.EffectiveProfile()
+	if err != nil {
+		return AccessConfiguration{}, err
+	}
+	if profile == InstallationProfileManagement {
+		return request.managementAccessConfiguration()
+	}
+
 	domains := []string{request.Domains.Panel, request.Domains.Admin, request.Domains.Agent}
 	nonEmpty := 0
 	for _, domain := range domains {
@@ -53,6 +62,7 @@ func (request CompleteRequest) AccessConfiguration() (AccessConfiguration, error
 		}
 		return AccessConfiguration{
 			Mode:        IngressModeIP,
+			Profile:     InstallationProfileFull,
 			Address:     address,
 			PanelOrigin: ipOrigin(address, PanelHTTPSPort),
 			AgentOrigin: ipOrigin(address, AgentHTTPSPort),
@@ -85,6 +95,7 @@ func (request CompleteRequest) AccessConfiguration() (AccessConfiguration, error
 		}
 		return AccessConfiguration{
 			Mode:        IngressModeDomain,
+			Profile:     InstallationProfileFull,
 			PanelOrigin: "https://" + panelHost,
 			AgentOrigin: "https://" + agentHost,
 			AdminOrigin: "https://" + adminHost,
@@ -92,6 +103,48 @@ func (request CompleteRequest) AccessConfiguration() (AccessConfiguration, error
 	default:
 		return AccessConfiguration{}, errors.New("panel, admin, and agent domains must be either all empty or all configured")
 	}
+}
+
+func (request CompleteRequest) managementAccessConfiguration() (AccessConfiguration, error) {
+	if request.Domains.Panel != "" || request.Domains.Agent != "" {
+		return AccessConfiguration{}, errors.New("management profile must not configure panel or agent domains")
+	}
+	if request.Domains.Admin == "" {
+		address, err := validateNetworkAddress(request.Network.Address)
+		if err != nil {
+			return AccessConfiguration{}, err
+		}
+		if request.TLS.Mode != "private_ca" {
+			return AccessConfiguration{}, errors.New("tls.mode must be private_ca when the management domain is empty")
+		}
+		if request.TLS.Email != "" {
+			return AccessConfiguration{}, errors.New("tls.email must be empty in private_ca mode")
+		}
+		return AccessConfiguration{
+			Mode:        IngressModeIP,
+			Profile:     InstallationProfileManagement,
+			Address:     address,
+			AdminOrigin: ipOrigin(address, AdminHTTPSPort),
+		}, nil
+	}
+	if request.Network.Address != "" {
+		return AccessConfiguration{}, errors.New("network.address must be empty when the management domain is configured")
+	}
+	adminHost, err := validateDomain(request.Domains.Admin, "domains.admin")
+	if err != nil {
+		return AccessConfiguration{}, err
+	}
+	if request.TLS.Mode != "acme" {
+		return AccessConfiguration{}, errors.New("tls.mode must be acme when the management domain is configured")
+	}
+	if err := validateEmail(request.TLS.Email); err != nil {
+		return AccessConfiguration{}, err
+	}
+	return AccessConfiguration{
+		Mode:        IngressModeDomain,
+		Profile:     InstallationProfileManagement,
+		AdminOrigin: "https://" + adminHost,
+	}, nil
 }
 
 func validateNetworkAddress(value string) (netip.Addr, error) {

@@ -205,17 +205,30 @@ printf '  thresholds: error_rate<=%s%% p95<=%sms\n\n' \
 
 started_epoch="$(date +%s)"
 active=0
+request_pid_head=0
+request_pid_tail=0
+request_pids=()
+
+wait_for_oldest_request() {
+    local oldest_pid="${request_pids[request_pid_head]}"
+
+    wait "$oldest_pid" || true
+    unset "request_pids[request_pid_head]"
+    request_pid_head=$((request_pid_head + 1))
+    active=$((active - 1))
+}
+
 for ((request_number = 1; request_number <= REQUESTS; request_number++)); do
     run_request "$request_number" &
+    request_pids[request_pid_tail]="$!"
+    request_pid_tail=$((request_pid_tail + 1))
     active=$((active + 1))
     if ((active >= CONCURRENCY)); then
-        wait -n || true
-        active=$((active - 1))
+        wait_for_oldest_request
     fi
 done
 while ((active > 0)); do
-    wait -n || true
-    active=$((active - 1))
+    wait_for_oldest_request
 done
 finished_epoch="$(date +%s)"
 

@@ -1,0 +1,29 @@
+[Unit]
+Description=Probe Panel PostgreSQL verified backup (systemd 219 profile)
+After=network-online.target postgresql.service
+Wants=network-online.target postgresql.service
+RequiresMountsFor=/var/backups/probe-panel/postgres
+
+[Service]
+Type=oneshot
+User=probe-api
+Group=probe-api
+EnvironmentFile=/srv/probe/config/probe-postgres-backup.env
+Environment=PATH=/usr/pgsql-14/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/srv/probe/api/scripts/backup-postgres.sh
+UMask=0077
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=2h
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+PrivateDevices=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadOnlyPaths=/srv/probe/config
+ReadWritePaths=/var/backups/probe-panel/postgres
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native

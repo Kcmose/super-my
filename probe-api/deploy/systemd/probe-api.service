@@ -1,7 +1,7 @@
 [Unit]
 Description=Probe Panel Go API
 After=network-online.target postgresql.service
-Wants=network-online.target
+Wants=network-online.target postgresql.service
 
 [Service]
 Type=simple

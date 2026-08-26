@@ -1,266 +1,199 @@
-# Probe Panel 故障排查
+# 管理端故障排查
 
-本文适用于 Debian 13 上的 Probe Panel V1。排查时始终区分三个入口：游客面板、管理面板和 Agent API。不要把管理员口令、Session Cookie、CSRF Token、Agent Token、数据库连接串或包含这些值的完整环境文件写入工单和测试报告。
+本文只排查独立 management 产品。IP 模式只有管理入口 `18455`；domain 模式只有
+一个管理域名。游客 `18453`、Agent `18454`、Agent 下载站和三域名 full 配置不是
+管理安装健康条件。未配置 Agent 时 `agent.status=not_configured` 是正常状态。
 
-## 1. 先确认故障边界
+不要把管理员口令、Session Cookie、CSRF、数据库连接串、备份凭据或 Token 写入
+工单、终端转储和聊天记录。
 
-准备三个不含路径的入口地址：
+## 1. 先确认平台与发布边界
 
 ```bash
-export PANEL_URL='https://panel.example.invalid'
-export ADMIN_URL='https://admin.example.invalid'
-export AGENT_URL='https://api.example.invalid'
+cat /etc/os-release
+ps -p 1 -o comm=
+systemctl --version | head -n 1
+uname -m
+bash /root/probe-panel-install.sh status
 ```
 
-`.invalid` 只是占位符，执行前必须替换为部署的真实地址。然后从预期位于管理白名单内的测试机执行：
+- 主机必须精确映射到 ABI v2 的 15 个 platform ID 之一，不能靠 `ID_LIKE`、
+  包管理器或相邻版本猜测。
+- Debian 9/10/11/12、Ubuntu 18.04/20.04、CentOS Linux 7/8、Stream 8 需要显式
+  `--accept-eol`。Debian/Ubuntu 使用隔离的受管 live/archive 源，不覆盖用户源；
+  Debian 9 缺 HTTPS method 或 arm64 PG14 包时失败关闭。CentOS 使用安装器专用
+  `reposdir` 和精确 allowlist 读取 Vault/Stream、EPEL、PGDG 14，不会使用主机既有
+  仓库或插件；若受管源、固定 key 或 RPM 签名来源校验失败，应修复精确候选契约，
+  不能用任意第三方源绕过。
+- CentOS SELinux Enforcing 当前应在主机变更前失败关闭。仓库中的 policy/helper
+  未集成；关闭 SELinux 不是修复。
+- v1.2.0 是 0-supported candidate baseline。分支存在或契约通过不代表正式支持。
+
+## 2. 只读验证与服务状态
+
+已完成 Setup 的主机先运行：
 
 ```bash
-bash probe-api/deploy/scripts/security-smoke.sh \
-  --panel-url "$PANEL_URL" \
-  --admin-url "$ADMIN_URL" \
-  --agent-url "$AGENT_URL"
-```
-
-域名模式直接使用系统公信根校验 TLS。IP 模式是正式生产入口，应通过 `--cacert /absolute/path/to/ca.pem` 显式信任安装时生成的固定私有 CA，并增加 `--expect-private-ca`；脚本会额外验证游客/管理入口下载 `ca.pem` 为 `404`、Agent 入口为 `200`。`--insecure` 只能用于临时定位问题，不得作为任一生产模式的验收或修复方案。脚本不发送管理员凭据或有效 Agent Token，其输出可以直接作为第 6 阶段安全验收的原始证据。
-
-三个入口的正常边界如下：
-
-| 请求 | 游客入口 | 管理入口 | Agent 入口 |
-|---|---:|---:|---:|
-| 静态根 `/` | `200` | `200` | `404` |
-| `/api/v1/panel/nodes?limit=1` | `200`，匿名 | `200`，只读 | `404` |
-| `/api/v1/auth/me`（无 Session） | `404` | `401` | `404` |
-| `/api/v1/admin/users`（无 Session） | `404` | `401` | `404` |
-| `/api/v1/agent/config?version=0`（错误 Token） | `404` | `404` | `401` |
-
-如果整个游客入口或管理入口返回 `403`，先查 IP/CIDR 白名单；如果跨入口路径意外返回 `200`、SPA HTML 或应用层 `401`，优先查 Nginx 是否装载了错误的 server 配置或静态根。
-
-## 2. 服务和本机健康检查
-
-在 API 所在的 Debian 主机上执行：
-
-```bash
-sudo systemctl is-active probe-api nginx postgresql
-sudo systemctl status probe-api nginx postgresql --no-pager
-curl --disable --silent --show-error \
-  --write-out '\nHTTP %{http_code}\n' \
+bash /root/probe-panel-install.sh validate
+# Debian/Ubuntu 使用 postgresql.service；CentOS 使用 postgresql-14.service。
+POSTGRES_UNIT=postgresql.service
+systemctl is-active "$POSTGRES_UNIT" probe-api.service nginx.service \
+  probe-postgres-backup.timer
+systemctl status "$POSTGRES_UNIT" probe-api.service nginx.service \
+  probe-postgres-backup.timer --no-pager
+nginx -t
+ss -H -lnt
+curl --disable --silent --show-error --write-out '\nHTTP %{http_code}\n' \
   http://127.0.0.1:8080/internal/health/live
-curl --disable --silent --show-error \
-  --write-out '\nHTTP %{http_code}\n' \
+curl --disable --silent --show-error --write-out '\nHTTP %{http_code}\n' \
   http://127.0.0.1:8080/internal/health/ready
-sudo nginx -t
-sudo ss -ltnp
 ```
 
-预期结果：
+预期：
 
-- `live` 返回 `200` 和 `{"status":"ok"}`。
-- `ready` 返回 `200` 和 `{"status":"ready"}`；`503` 表示数据库不可用或迁移状态未就绪。
-- API 只监听 `127.0.0.1:8080`（或明确配置的内部地址）。
-- PostgreSQL `5432` 严格只监听 `127.0.0.1` 和/或 `::1`；出现公网、内网或通配地址都是错误。
-- `PROBE_INGRESS_MODE=domain` 时 Nginx 只监听 `80/443`；`PROBE_INGRESS_MODE=ip` 时只监听 `18453/18454/18455`。
+- live/ready 为 200；ready 503 通常表示数据库或迁移未就绪；
+- API 只监听 `127.0.0.1:8080`；
+- PostgreSQL 5432 只监听 `127.0.0.1` 和/或 `::1`；
+- IP 模式监听管理 `18455`，domain 模式遵守 80/443 合同；
+- Setup/Finalizer 完成后不再 active，正式入口不重新开放 `/install`。
 
-查看最近日志时控制时间范围，避免无关信息和敏感数据扩散：
+日志只取最小时间窗，并使用 request ID 关联：
 
 ```bash
-sudo journalctl -u probe-api --since '-15 minutes' --no-pager
-sudo journalctl -u nginx --since '-15 minutes' --no-pager
-sudo journalctl -u postgresql --since '-15 minutes' --no-pager
+journalctl -u probe-api.service --since '-15 minutes' --no-pager
+journalctl -u nginx.service --since '-15 minutes' --no-pager
+journalctl -u "$POSTGRES_UNIT" --since '-15 minutes' --no-pager
 ```
 
-API 使用结构化日志。用 `request_id` 关联 Nginx 请求、API 错误和审计记录，不要通过打印完整请求头来排查认证问题。
+不同平台的 PostgreSQL unit 由安装时记录的平台合同决定；RPM 为
+`postgresql-14.service`，不要把 Debian unit 名硬套到 CentOS。
 
-## 3. DNS、代理和 TLS
+## 3. 管理入口无法访问
 
-### 地址无法连接
+先设定唯一入口：
 
 ```bash
-getent ahosts panel.example.invalid
+export ADMIN_URL='https://admin.example.invalid'
+curl --disable --verbose --output /dev/null "$ADMIN_URL/"
+```
+
+### IP 模式
+
+`ADMIN_URL` 应为 `https://IP:18455`（IPv6 使用方括号）。用安装生成的固定私有 CA：
+
+```bash
+curl --disable --fail --cacert /etc/probe-panel/tls/private-ca/ca.pem \
+  "$ADMIN_URL/"
+/srv/probe/api/probe-api config validate-ingress-tls ip '<规范IP>'
+```
+
+证书必须有唯一规范 IP SAN、ServerAuth 和正确签发关系。Certbot timer 应为
+disabled/inactive。不要用 HTTP 或 `--insecure` 作为修复。
+
+### Domain 模式
+
+检查一个管理域名的 DNS、证书链、SAN、有效期和 ACME 续期：
+
+```bash
 getent ahosts admin.example.invalid
-getent ahosts api.example.invalid
-curl --disable --verbose --output /dev/null "$PANEL_URL/"
-```
-
-域名模式把占位域名替换为实际域名，检查 DNS 是否指向预期主机。IP 模式则把三个 URL 分别设为同一 IP 的 `https://IP:18453`、`https://IP:18455`、`https://IP:18454`（IPv6 URL 使用 `[]`），不做 DNS 检查。两种模式都要确认防火墙只开放当前模式约定端口，并确认 Nginx 绑定了正确的 IPv4/IPv6 地址。
-
-curl 会读取标准代理环境变量。测试内网或 IP 入口时，代理可能改变 Nginx 看到的来源地址并触发 `403`；为目标主机正确设置 `NO_PROXY`，不要在报告中抄录含认证信息的代理 URL。测试公网入口时则按部署网络策略决定是否使用代理。
-
-### TLS 校验失败
-
-域名模式检查公信证书链、域名和有效期：
-
-```bash
-openssl s_client -connect panel.example.invalid:443 \
-  -servername panel.example.invalid -verify_return_error </dev/null
-```
-
-生产 Nginx 模板分别读取：
-
-```text
-/etc/probe-panel/tls/panel/fullchain.pem
-/etc/probe-panel/tls/admin/fullchain.pem
-/etc/probe-panel/tls/api/fullchain.pem
-```
-
-可先用当前 API 二进制执行与部署器完全相同的只读校验（把域名替换为活动 Nginx 片段中的三个规范域名）：
-
-```bash
-sudo /srv/probe/api/probe-api config validate-ingress-tls domain \
-  panel.example.invalid admin.example.invalid api.example.invalid
+openssl s_client -connect admin.example.invalid:443 \
+  -servername admin.example.invalid -verify_return_error </dev/null
 systemctl is-enabled certbot.timer
 systemctl is-active certbot.timer
 ```
 
-两条 timer 命令在域名模式应分别返回 `enabled`、`active`。证书修复后先执行 `sudo nginx -t`，成功后再 reload。不要把 `--insecure` 当作生产修复方案。
+当前 domain 模式独占 80/443，不支持与活动既有 Nginx 站点共存。若安装器因冲突
+失败，不要手工停业务绕过；选择 IP 模式或另行评审停机/共存方案。
 
-IP 模式可执行 `sudo /srv/probe/api/probe-api config validate-ingress-tls ip <规范IP>`，检查固定 `ca.pem`、叶证书/私钥、唯一 IP SAN、ServerAuth、有效期及直接签发关系；IPv6 参数不加 URL 方括号。`systemctl is-enabled certbot.timer` 和 `systemctl is-active certbot.timer` 应分别返回 `disabled`、`inactive`。浏览器需要显式信任该 CA；Agent Host 的 `/downloads/probe-agent/ca.pem` 必须与同一文件一致，管理面板生成命令中的 `-c` 指纹也必须匹配。IP 模式不要用明文 HTTP 规避证书提示。
+curl 会读取代理环境变量。内网/IP 排查时正确设置 `NO_PROXY`，避免代理改变 Nginx
+看到的来源地址；不要在报告中复制带认证信息的代理 URL。
 
-## 4. IP/CIDR 白名单返回 403
+## 4. 403、401、404 与 429
 
-生产环境的单一白名单源是：
-
-```text
-/etc/probe-panel/admin-allowlist.geo
-```
-
-每一行只能是经过确认的显式 IP/CIDR 和值 `1;`；空文件会有意拒绝所有游客及管理员浏览器请求。修改后的安全顺序是：
-
-```bash
-sudo /srv/probe/api/probe-api \
-  config validate-admin-allowlist /etc/probe-panel/admin-allowlist.geo
-sudo systemctl restart probe-api
-curl --disable --silent --show-error --fail \
-  http://127.0.0.1:8080/internal/health/ready
-sudo nginx -t
-sudo systemctl reload nginx
-```
-
-任一步失败都停止，不继续 reload。Nginx 和 API 必须读取同一份已验证文件。入口依据直接连接到 Nginx 的来源地址做判断，客户端提供的 `X-Forwarded-For` 等请求头会被清空，不能用这些头“修复”白名单。
-
-还要确认测试流量没有经过未列入白名单的反向代理或出口 NAT。确实存在可信前置代理时，应先更新并重新评审整体信任边界，不能临时放宽为全网 CIDR。
-
-## 5. 游客面板问题
-
-### 页面能打开，但列表请求失败
-
-直接请求匿名只读接口：
-
-```bash
-curl --disable --silent --show-error \
-  --header 'Cookie:' \
-  --write-out '\nHTTP %{http_code}\n' \
-  "$PANEL_URL/api/v1/panel/nodes?limit=1"
-```
-
-- `200`：入口和 API 正常，继续检查浏览器控制台中的静态资源路径或响应结构。
-- `403`：来源不在白名单，或 API 收到的可信来源地址与 Nginx 不一致。
-- `404`：访问了错误域名、错误端口，或 Nginx 没有载入游客入口配置。
-- `5xx`：结合 `request_id` 检查 API 和 PostgreSQL。
-
-游客没有账号、口令、Cookie 或 Session。页面出现登录入口、访问 `/auth/me`，或匿名读取产生 `Set-Cookie`，都说明部署了错误的前端产物或出现了入口混用。生产静态根应严格分开：游客为 `/srv/probe/web`，管理端为 `/srv/probe/admin`。
-
-### 页面刷新后落到错误内容
-
-检查游客 server 的 SPA fallback 只使用 `/srv/probe/web`，并确认 `/api/`、`/internal/`、`/login` 和 `/admin` 在 fallback 之前显式拒绝。不要通过把未知 API 路径回退到 `index.html` 来掩盖 404。
-
-## 6. 管理面板问题
-
-管理入口常见状态码含义：
+管理入口常见状态：
 
 | 状态 | 含义 | 优先检查 |
-|---:|---|---|
-| `401` | 凭据错误，或 Session 缺失、过期、被撤销 | 登录状态、Session 生命周期、账户是否启用 |
-| `403` | IP/CIDR、Origin 或 CSRF 校验失败 | 白名单、`PROBE_ADMIN_ORIGIN`、浏览器来源和 CSRF Token |
-| `404` | 路由不属于该入口 | 域名、端口、Nginx server 配置 |
-| `429` | 登录限流触发 | 停止重试，等待 `Retry-After`，再查失败原因 |
+| ---: | --- | --- |
+| 401 | 凭据错误，或 Session 缺失/过期/撤销 | 登录、账户启用、Session 生命周期 |
+| 403 | 白名单、Origin 或 CSRF 失败 | 来源 IP、`PROBE_ADMIN_ORIGIN`、CSRF |
+| 404 | 路由不属于管理入口，或配置未加载 | URL、Nginx include、Setup 是否关闭 |
+| 429 | 登录限流 | 停止重试，等待 `Retry-After` |
 
-不带 Cookie 请求 `/api/v1/auth/me` 和 `/api/v1/admin/users` 应返回 `401`，这能证明管理命名空间已暴露但仍受认证保护。写操作还要求同源 `Origin` 和与当前 Session 绑定的 CSRF Token；不要用关闭这些校验的方式处理 `403`。
-
-`PROBE_ADMIN_ORIGIN` 必须与浏览器实际使用的协议、主机和端口完全一致。修改配置后重启 API，再检查 readiness 和安全冒烟结果。
-
-## 7. Agent API 问题
-
-用一个明确无效且不属于部署的值检查认证边界：
+白名单真源是 `/etc/probe-panel/admin-allowlist.geo`。先让 API 验证，再测试 Nginx：
 
 ```bash
-INVALID_AGENT_TOKEN="diagnostic-invalid-$(date -u +%s)-$$"
-curl --disable --silent --show-error \
-  --header "Authorization: Bearer $INVALID_AGENT_TOKEN" \
-  --write-out '\nHTTP %{http_code}\n' \
-  "$AGENT_URL/api/v1/agent/config?version=0"
-unset INVALID_AGENT_TOKEN
+/srv/probe/api/probe-api \
+  config validate-admin-allowlist /etc/probe-panel/admin-allowlist.geo
+nginx -t
+systemctl reload nginx.service
 ```
 
-预期为 `401`。不要在诊断输出中使用或回显真实 Token。
+空白名单会有意拒绝浏览器请求。Nginx/API 依据直接连接来源，客户端伪造
+`X-Forwarded-For` 不能绕过。存在可信前置代理时必须重新评审整体信任边界，不能
+临时放宽为 `/0`。
 
-| 状态 | 含义 |
-|---:|---|
-| `400` | 请求参数、JSON 或可信来源头无效 |
-| `401` | 注册令牌或 Agent Token 缺失、错误、过期或被撤销 |
-| `409` | 配置版本超前、批次键复用或序列过旧 |
-| `413` | 压缩前/解压后请求体超过限制 |
-| `422` | 上报结构有效，但字段或采样规则不满足协议 |
-| `429` | 单 IP 或单节点速率限制触发 |
+无 Cookie 的 `/api/v1/auth/me` 与 `/api/v1/admin/users` 应返回 401。写请求还要求
+完全匹配的同源 Origin 和 Session 绑定 CSRF；不要关闭这些校验来处理 403。
 
-Agent 入口上的 `/panel/*`、`/auth/*`、`/admin/*` 和根路径都应返回 `404`；只有 `/downloads/probe-agent/` 下五项固定发布资产可下载。IP 模式还且只在 Agent 入口公开固定 `ca.pem`；域名模式不应公开该文件。Agent 无需进入管理 IP 白名单；若错误 Token 得到 `403`，说明请求误入浏览器入口或代理规则不符合设计。
+## 5. 数据库、迁移与备份
 
-一键安装失败时先不要重新粘贴同一条命令。按错误阶段检查：
+readiness 为 503 时检查 PostgreSQL/API 最近日志和平台精确客户端路径。部署器使用：
 
-- 提示必须使用 root：先登录 root 或执行 `sudo -i` 进入 root Shell，再重新签发并粘贴命令。生成的命令只依赖 `bash`，不会要求最小 Debian 预装 `sudo`；不要把 URL 改成未固定的分支。
-- 初始 GitHub Raw `curl` 失败：核对目标机 DNS、时间、系统 CA 和外网访问；不能手工加 `-k/--insecure`。网络恢复后重新执行仍未过期的命令，或重新签发。
-- `private CA SHA256 verification failed`：Agent Host 的固定 `ca.pem` 与 API 启动时读取的证书不一致，必须修复发布文件并重新签发；禁止删除 `-c` 或跳过校验。
-- `SHA256 verification failed` 或清单项不唯一：可能正好遇到发布切换或文件不一致；等待发布完成，在管理面板重新签发命令，不要跳过校验。
-- 提示 `state.json`、二进制、环境文件、CA、systemd 单元已存在，或服务正在运行：目标机已有完整/部分 Agent 安装，首次安装器故意拒绝覆盖；按手动升级或恢复流程处理，不能删除状态文件来强装。
-- 等待注册超时或服务失败：令牌会从环境文件清理且服务被停止/禁用；用 `journalctl -u probe-agent.service -n 50 --no-pager` 查看不含凭据的错误，再为该节点签发新命令。
-- 安装成功但面板未上线：确认服务 active、环境文件中已无一次性令牌、状态文件为 `probe-agent:probe-agent 0600`，再检查 Agent API 网络和服务端审计；不要把状态文件内容贴到工单。
+```text
+probe-api migrate status
+probe-api migrate up
+probe-api migrate status
+```
 
-## 8. 数据库和迁移
+不要在交互历史或报告中展开数据库 URL，也不要手工改写 `schema_migrations`。
 
-readiness 为 `503` 时先检查：
+恢复只能用安装的 root 协调器，并先复制备份到异机：
 
 ```bash
-sudo systemctl status postgresql --no-pager
-sudo journalctl -u postgresql --since '-15 minutes' --no-pager
-sudo journalctl -u probe-api --since '-15 minutes' --no-pager
+/usr/local/lib/probe-panel/restore-management.sh \
+  --confirm-database '<数据库名>' \
+  /absolute/path/to/probe-TIMESTAMP.dump
 ```
 
-部署流程必须在启动新 API 前执行 `probe-api migrate status` 和 `probe-api migrate up`。这两个子命令需要与服务相同的数据库环境，但不要在交互历史、进程参数或报告中展开 `PROBE_DATABASE_URL`。迁移失败时保留错误、迁移版本和数据库版本证据；不要直接手工改写 `schema_migrations`。
+恢复开始后失败会让 API 和备份 timer 保持 stopped/disabled，等待人工检查；不要
+反复启动部分迁移的 API。归档必须有匹配 SHA、`pg_restore --list` 可读且属于受管
+daily/weekly 路径。
 
-如果 API 可连接数据库但面板为空，分别确认是否已有节点、Agent 是否成功注册、最近上报是否被接受，以及服务器 UTC 时间是否正确。节点在线状态以服务端 `received_at` 为准。
+## 6. 升级失败与事务恢复
 
-## 9. 负载冒烟失败
+升级在数据库备份前后会报告保留路径。迁移是 forward-only：即使链接/服务资产
+回滚，已成功的数据库迁移不会自动降级。
 
-只对游客只读 API 执行负载检查：
+安装器按阶段恢复：
+
+- 备份/迁移前后但未切应用时，只恢复 PostgreSQL 原活动状态；
+- 链接或服务资产失败时，恢复旧 API/admin/migrations 链接、精确 unit/脚本、
+  Nginx include 和 enablement；
+- API/timer/Nginx 已开始切换后，还恢复原服务活动状态；
+- HUP/INT/TERM 走相同 EXIT journal，原退出码保留。
+
+若看到“snapshot cleanup requires manual removal”，运行态已经提交成功；按消息中的
+root-only `/var/tmp/probe-service-assets.*` 路径人工审查，不要把它当成需自动回滚的
+失败。若回滚步骤本身告警，保留路径、unit、链接、`systemctl status` 和最小日志，
+停止再次升级，先比对备份和旧 release。
+
+## 7. 卸载问题
+
+普通卸载：
 
 ```bash
-export LOAD_URL="$PANEL_URL/api/v1/panel/nodes?limit=50"
-bash probe-api/deploy/scripts/load-smoke.sh \
-  --url "$LOAD_URL" \
-  --requests 100 \
-  --concurrency 10 \
-  --max-error-rate 1 \
-  --max-p95-ms 1000
+bash /root/probe-panel-install.sh uninstall
 ```
 
-失败时按输出区分：
+它只停用/移除 Probe 管理端的九个激活资产，保留配置、TLS、数据库、备份、inactive
+release、probe-api 账号以及共享 Nginx/PostgreSQL。`purge` 未实现。遇到未知
+enablement 状态或无法证明资产归属时会在变更前失败；不要用递归删除代替。
 
-- curl failure：DNS、TLS、代理、连接或超时问题。
-- unexpected status：先看状态计数；`403` 多为白名单，`429` 表示入口限流或测试参数过激，`5xx` 需查 API/数据库。
-- P95 超阈值：同时采集 CPU、内存、连接数、PostgreSQL 活跃会话和慢查询证据，再用相同参数复测。
-- invalid measurement：脚本运行环境或 curl 输出异常，该次结果不可作为验收证据。
+## 8. 交付证据
 
-该脚本是小规模回归冒烟，不等同于容量规划。不要用它压测写接口、登录接口或 Agent 上报接口。
+问题报告至少包含：UTC 时间、精确 platform/架构/入口、Release/tag/commit、外层与
+内层 SHA、`validate` 退出码、`nginx -t`、live/ready、最小监听摘要、故障窗口日志和
+变更前后状态。不得包含秘密。
 
-## 10. 交付证据清单
-
-在关闭故障或完成验收前，至少保存：
-
-- UTC 时间、源码版本/提交标识、Debian、Nginx、Go API、PostgreSQL 版本。
-- 当前 `PROBE_INGRESS_MODE` 与三个入口地址（域名模式可脱敏域名，IP 模式保留端口但可脱敏地址；都不包含 URL 凭据）。
-- `security-smoke.sh` 完整输出和退出码。
-- `load-smoke.sh` 参数、完整输出和退出码。
-- `nginx -t` 结果、API live/ready 结果。
-- 故障时间窗内按 `request_id` 筛选的最小日志片段。
-- 变更前后配置摘要，但不包含口令、Token、Cookie、CSRF 值或数据库连接串。
-
-安全测试和负载测试分别回填到 `docs/reports/security-test.md` 与 `docs/reports/load-test.md`。没有实际执行证据时保持“待回填”，不得把模板当作已通过报告。
+静态契约、容器结果和临时 Actions Artifact 只可作为回归信息。正式 cell 证据必须
+来自 full-system VM、真实 reboot 以及不可变 Release；当前账本仍是 60/0。

@@ -414,8 +414,8 @@ paths:
     get:
       tags: [admin]
       operationId: getSystemStatus
-      summary: Return a safe, read-only administrator view of API and database readiness.
-      description: Returns only coarse readiness, the V1 API contract version, server UTC check time, and security facts enforced or defined by this API process. It never claims to verify Nginx host separation and never returns credentials, connection strings, environment variables, host details, controls, or readiness error text. Administrator session authentication is database-backed and runs before this handler, so a database outage during authentication can produce the generic authentication/internal failure instead of this response. `degraded` describes only the readiness check performed after successful session authentication.
+      summary: Return a safe, read-only administrator view of management readiness and Agent configuration state.
+      description: Returns only coarse readiness, the V1 API contract version, server UTC check time, whether the independently installed Agent ingress is configured, and security facts enforced or defined by this API process. An unconfigured Agent does not degrade management readiness and does not expose its URL or installer. It never claims to verify Nginx host separation and never returns credentials, connection strings, environment variables, host details, controls, or readiness error text. Administrator session authentication is database-backed and runs before this handler, so a database outage during authentication can produce the generic authentication/internal failure instead of this response. `degraded` describes only the readiness check performed after successful session authentication.
       x-access-boundary: management-ip-session
       x-required-role: admin
       security:
@@ -517,6 +517,7 @@ paths:
       tags: [admin]
       operationId: createEnrollmentToken
       summary: Create a short-lived, one-use enrollment token and bootstrap command.
+      description: Returns `agent_not_configured` without minting a token when a standalone management installation has not yet configured its independent Agent ingress and immutable installer.
       x-required-role: admin
       x-audit-event: enrollment_token.create
       security:
@@ -565,6 +566,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
   /api/v1/admin/nodes/{node_id}/revoke-token:
     servers:
       - url: https://admin.example.com
@@ -1296,11 +1298,15 @@ components:
           schema: { $ref: '#/components/schemas/ErrorResponse' }
   schemas:
     SetupDefaults:
+      $ref: '#/components/schemas/SetupManagementDefaults'
+    SetupManagementDefaults:
       type: object
       additionalProperties: false
-      required: [server_ip, panel_url, agent_url, admin_url]
-      description: Detected private-CA IP-mode defaults returned before the user submits configuration.
+      required: [profile, server_ip, admin_url]
       properties:
+        profile:
+          type: string
+          const: management
         server_ip:
           oneOf:
             - type: string
@@ -1308,27 +1314,18 @@ components:
             - type: string
               format: ipv6
           description: Canonical routable server address; private IPv4 and IPv6 ULA values are allowed.
-        panel_url:
-          type: string
-          format: uri
-          pattern: '^https://(?:[0-9]{1,3}(?:\.[0-9]{1,3}){3}|\[[0-9a-f:]+\]):18453$'
-          description: Suggested visitor-panel origin on the fixed IP-mode port.
-        agent_url:
-          type: string
-          format: uri
-          pattern: '^https://(?:[0-9]{1,3}(?:\.[0-9]{1,3}){3}|\[[0-9a-f:]+\]):18454$'
-          description: Suggested Agent origin on the fixed IP-mode port.
         admin_url:
           type: string
           format: uri
           pattern: '^https://(?:[0-9]{1,3}(?:\.[0-9]{1,3}){3}|\[[0-9a-f:]+\]):18455$'
-          description: Suggested administrator-panel origin on the fixed IP-mode port.
+          description: Suggested management-panel and API origin on the fixed IP-mode port.
     SetupStatusResponse:
       description: |
         `pending` is ready to mint a setup session; `configuring` holds the one currently valid
-        in-memory session; `finalizing` means the privileged asynchronous finalizer is running;
-        `installed` is terminal success; `recovery_required` is fail-closed terminal failure
-        requiring operator recovery rather than reopening first-run setup.
+        in-memory session or indicates that a side-effect-free privileged preflight was rejected and
+        a new session may be created; `finalizing` means the privileged asynchronous finalizer is
+        running; `installed` is terminal success; `recovery_required` is reserved for a failure after
+        production ownership/mutation and requires operator recovery rather than reopening setup.
       oneOf:
         - type: object
           additionalProperties: false
@@ -1358,9 +1355,8 @@ components:
       example:
         status: installed
         defaults:
+          profile: management
           server_ip: 192.0.2.10
-          panel_url: https://192.0.2.10:18453
-          agent_url: https://192.0.2.10:18454
           admin_url: https://192.0.2.10:18455
         admin_url: https://192.0.2.10:18455/login
         private_ca:
@@ -1374,8 +1370,7 @@ components:
       description: |
         Ephemeral, public trust-bootstrap metadata returned only by the temporary no-store setup
         status response after a successful IP-mode installation. `sha256` is the lowercase SHA-256
-        of every byte in `pem` (including its exact line endings), matching the Agent install
-        command fingerprint. When `available` is false the installation remains successful, but
+        of every byte in `pem` (including its exact line endings). When `available` is false the installation remains successful, but
         the UI must use the documented root SSH/scp fallback and must not guess or bypass TLS.
       oneOf:
         - type: object
@@ -1429,14 +1424,16 @@ components:
     SetupCompleteRequest:
       type: object
       additionalProperties: false
-      required: [database, domains, network, tls, allowlist, administrator]
+      required: [profile, database, domains, network, tls, allowlist, administrator]
       description: |
-        Selects exactly one ingress mode. In domain mode all three domain values are non-empty,
-        `network.address` is empty, `tls.mode` is `acme`, and `tls.email` is a valid address. In
-        private-CA IP mode all three domain values and `tls.email` are empty, `network.address`
-        is one canonical routable IPv4/IPv6 address, and `tls.mode` is `private_ca`. IP mode uses
-        fixed HTTPS ports 18453 (visitor panel), 18454 (Agent), and 18455 (administrator panel).
+        The v1.2 management installer requires an explicit immutable `management` profile. Domain
+        mode uses only `domains.admin`, ACME, and an empty `network.address`; IP mode leaves every
+        domain empty and uses a private CA on HTTPS port 18455.
       properties:
+        profile:
+          type: string
+          const: management
+          description: Immutable management-product setup profile.
         database: { $ref: '#/components/schemas/SetupDatabaseInput' }
         domains: { $ref: '#/components/schemas/SetupDomainsInput' }
         network: { $ref: '#/components/schemas/SetupNetworkInput' }
@@ -1447,15 +1444,16 @@ components:
           maxItems: 128
           uniqueItems: true
           description: |
-            Shared visitor/admin management allowlist. Each item is one canonical non-default IPv4
-            or IPv6 CIDR, or one bare IP that the server normalizes to `/32` or `/128`. `0.0.0.0/0`,
-            `::/0`, host bits in a CIDR, scoped addresses, IPv4-mapped IPv6, and duplicates are rejected.
+            Management access allowlist. Each item is one canonical non-default IPv4 or IPv6 CIDR, or one bare IP that
+            the server normalizes to `/32` or `/128`. Default routes, host bits in a CIDR, scoped
+            addresses, IPv4-mapped IPv6, and duplicates are rejected.
           items:
             type: string
             minLength: 2
             maxLength: 49
         administrator: { $ref: '#/components/schemas/SetupAdministratorInput' }
       example:
+        profile: management
         database:
           mode: local
           name: probe
@@ -1463,9 +1461,7 @@ components:
           password: change-this-database-password
           password_confirmation: change-this-database-password
         domains:
-          panel: panel.monitor.example.net
           admin: admin.monitor.example.net
-          agent: agent.monitor.example.net
         network:
           address: ''
         tls:
@@ -1516,16 +1512,13 @@ components:
     SetupDomainsInput:
       type: object
       additionalProperties: false
-      required: [panel, admin, agent]
+      required: [admin]
       description: |
-        Either all three values are empty for private-CA IP mode, or all three are distinct
-        lowercase bare FQDNs for ACME mode. Partial input is rejected. Configured values may not
-        contain one another; schemes, ports, paths, IP literals, trailing dots, and reserved
-        example.com names are rejected.
+        The management installer accepts one lowercase bare `admin` FQDN for ACME mode or an empty
+        `admin` value for private-CA IP mode. This management-only request has no visitor or Agent
+        ingress fields.
       properties:
-        panel: { $ref: '#/components/schemas/SetupOptionalBareFQDN' }
         admin: { $ref: '#/components/schemas/SetupOptionalBareFQDN' }
-        agent: { $ref: '#/components/schemas/SetupOptionalBareFQDN' }
     SetupOptionalBareFQDN:
       oneOf:
         - const: ''
@@ -1556,7 +1549,7 @@ components:
       type: object
       additionalProperties: false
       required: [mode, email]
-      description: ACME requires a valid email; private_ca requires an empty email.
+      description: ACME requires a valid email; private_ca requires an empty email. The allowed mode is also bound to the selected profile's domain/IP choice.
       properties:
         mode:
           type: string
@@ -1649,7 +1642,7 @@ components:
     SystemStatus:
       type: object
       additionalProperties: false
-      required: [status, checked_at, api, database, security_boundary]
+      required: [status, checked_at, api, database, agent, security_boundary]
       properties:
         status:
           type: string
@@ -1668,6 +1661,12 @@ components:
           required: [status]
           properties:
             status: { type: string, enum: [ready, unavailable] }
+        agent:
+          type: object
+          additionalProperties: false
+          required: [status]
+          properties:
+            status: { type: string, enum: [configured, not_configured] }
         security_boundary:
           type: object
           additionalProperties: false

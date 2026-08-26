@@ -1,0 +1,141 @@
+{
+  "schema": "probe-support-policy-v1",
+  "runtime_abi": "probe-linux-systemd-v2",
+  "source_repository": "Kcmose/super-my",
+  "first_promotable_release": "v1.2.1",
+  "promotion_lineage": [
+    {
+      "release": "v1.2.1",
+      "upgrade_from_release": "v1.2.0"
+    }
+  ],
+  "architectures": [
+    "amd64",
+    "arm64"
+  ],
+  "ingress_modes": [
+    "ip",
+    "domain"
+  ],
+  "base_scenarios": [
+    "fresh",
+    "coexistence",
+    "conflict",
+    "no_mutation",
+    "reboot",
+    "upgrade",
+    "fault",
+    "backup_restore",
+    "uninstall"
+  ],
+  "mode_profiles": {
+    "ip": {
+      "coexistence": "ip-active-native-nginx-loopback-postgres-v1",
+      "conflict": "ip-owned-listener-conflict-v1",
+      "no_mutation": "ip-conflict-no-mutation-v1"
+    },
+    "domain": {
+      "coexistence": "domain-exclusive-probe-nginx-loopback-postgres-v1",
+      "conflict": "domain-active-native-nginx-80-443-conflict-v1",
+      "no_mutation": "domain-active-native-nginx-no-mutation-v1"
+    }
+  },
+  "centos_additional_scenarios": [
+    "selinux_enforcing"
+  ],
+  "eol_additional_scenarios": [
+    "eol_repository"
+  ],
+  "platforms": [
+    {
+      "id": "debian-9-systemd",
+      "family": "debian",
+      "eol": true,
+      "requires_selinux_enforcing": false
+    },
+    {
+      "id": "debian-10-systemd",
+      "family": "debian",
+      "eol": true,
+      "requires_selinux_enforcing": false
+    },
+    {
+      "id": "debian-11-systemd",
+      "family": "debian",
+      "eol": true,
+      "requires_selinux_enforcing": false
+    },
+    {
+      "id": "debian-12-systemd",
+      "family": "debian",
+      "eol": true,
+      "requires_selinux_enforcing": false
+    },
+    {
+      "id": "debian-13-systemd",
+      "family": "debian",
+      "eol": false,
+      "requires_selinux_enforcing": false
+    },
+    {
+      "id": "ubuntu-18.04-systemd",
+      "family": "ubuntu",
+      "eol": true,
+      "requires_selinux_enforcing": false
+    },
+    {
+      "id": "ubuntu-20.04-systemd",
+      "family": "ubuntu",
+      "eol": true,
+      "requires_selinux_enforcing": false
+    },
+    {
+      "id": "ubuntu-22.04-systemd",
+      "family": "ubuntu",
+      "eol": false,
+      "requires_selinux_enforcing": false
+    },
+    {
+      "id": "ubuntu-24.04-systemd",
+      "family": "ubuntu",
+      "eol": false,
+      "requires_selinux_enforcing": false
+    },
+    {
+      "id": "ubuntu-26.04-systemd",
+      "family": "ubuntu",
+      "eol": false,
+      "requires_selinux_enforcing": false
+    },
+    {
+      "id": "centos-linux-7-systemd",
+      "family": "centos",
+      "eol": true,
+      "requires_selinux_enforcing": true
+    },
+    {
+      "id": "centos-linux-8-systemd",
+      "family": "centos",
+      "eol": true,
+      "requires_selinux_enforcing": true
+    },
+    {
+      "id": "centos-stream-8-systemd",
+      "family": "centos",
+      "eol": true,
+      "requires_selinux_enforcing": true
+    },
+    {
+      "id": "centos-stream-9-systemd",
+      "family": "centos",
+      "eol": false,
+      "requires_selinux_enforcing": true
+    },
+    {
+      "id": "centos-stream-10-systemd",
+      "family": "centos",
+      "eol": false,
+      "requires_selinux_enforcing": true
+    }
+  ]
+}

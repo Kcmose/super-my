@@ -1,0 +1,40 @@
+[Unit]
+Description=Probe Panel one-time privileged setup finalizer (systemd 219 profile)
+After=probe-panel-setup.service postgresql.service
+ConditionPathExists=/run/probe-panel-setup/finalize.json
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+EnvironmentFile=/etc/probe-panel/setup.env
+ExecStart=/usr/local/lib/probe-panel/probe-setup finalize
+ExecStopPost=/usr/bin/sleep 20
+ExecStopPost=/usr/bin/systemctl stop probe-panel-setup.socket
+ExecStopPost=/usr/bin/systemctl --no-block stop probe-panel-setup.service
+TimeoutStartSec=30min
+UMask=0077
+
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_NET_BIND_SERVICE CAP_SETGID CAP_SETUID
+PrivateDevices=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadOnlyPaths=/srv/probe/setup-ui
+ReadWritePaths=/etc/probe-panel
+ReadWritePaths=/var/lib/probe-panel/setup
+ReadWritePaths=/etc/nginx/conf.d
+ReadWritePaths=/etc/nginx/sites-enabled
+ReadWritePaths=/etc/systemd/system
+ReadWritePaths=/etc/letsencrypt
+ReadWritePaths=/var/lib/letsencrypt
+ReadWritePaths=/var/log/letsencrypt
+ReadWritePaths=/var/log/nginx
+ReadWritePaths=/var/lib/nginx
+ReadWritePaths=/srv/probe
+ReadWritePaths=/var/backups/probe-panel
+ReadWritePaths=/run/lock
+ReadWritePaths=/run/probe-panel-setup
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native

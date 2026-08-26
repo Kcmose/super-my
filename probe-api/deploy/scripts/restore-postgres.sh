@@ -5,6 +5,8 @@ umask 077
 
 readonly BACKUP_MARKER_VALUE='probe-postgres-backup-v1'
 readonly DEFAULT_BACKUP_ROOT='/var/backups/probe-panel/postgres'
+readonly PSQL_BINARY='@PROBE_PSQL@'
+readonly PG_RESTORE_BINARY='@PROBE_PG_RESTORE@'
 
 die() {
   printf 'probe-postgres-restore: %s\n' "$*" >&2
@@ -88,8 +90,12 @@ done
 [[ -n $archive_argument && $archive_argument == /* ]] || die 'backup archive must be an absolute path'
 [[ $archive_argument != *$'\n'* && $archive_argument != *$'\r'* ]] || die 'backup archive path contains a control character'
 
-for command_name in psql pg_restore sha256sum realpath flock find stat dirname basename wc; do
+for command_name in sha256sum realpath flock find stat dirname basename wc; do
   require_command "$command_name"
+done
+for postgres_binary in "$PSQL_BINARY" "$PG_RESTORE_BINARY"; do
+  [[ $postgres_binary == /* && $postgres_binary != *@* && -x $postgres_binary ]] ||
+    die "PostgreSQL command path was not rendered to an executable: $postgres_binary"
 done
 
 configured_root=${PROBE_POSTGRES_BACKUP_DIR:-$DEFAULT_BACKUP_ROOT}
@@ -143,11 +149,11 @@ read -r expected_hash checksum_name extra <"$checksum_path"
 checksum_name=${checksum_name#\*}
 [[ $expected_hash =~ ^[[:xdigit:]]{64}$ && $checksum_name == "$archive_name" && -z ${extra:-} ]] || die 'checksum entry does not name exactly the selected archive'
 (cd -- "$archive_directory" && sha256sum --check --strict --status "$archive_name.sha256") || die 'backup checksum verification failed'
-pg_restore --list "$archive_path" >/dev/null || die 'pg_restore could not read the selected archive'
+"$PG_RESTORE_BINARY" --list "$archive_path" >/dev/null || die 'pg_restore could not read the selected archive'
 
 configure_database_environment
 
-current_database=$(psql -X --no-password --tuples-only --no-align --set=ON_ERROR_STOP=1 --command='SELECT current_database()')
+current_database=$("$PSQL_BINARY" -X --no-password --tuples-only --no-align --set=ON_ERROR_STOP=1 --command='SELECT current_database()')
 current_database=${current_database//$'\r'/}
 current_database=${current_database//$'\n'/}
 [[ -n $current_database ]] || die 'could not determine the target database'
@@ -156,14 +162,14 @@ case "$current_database" in
 esac
 [[ $confirmed_database == "$current_database" ]] || die "confirmation does not match target database '$current_database'"
 
-active_sessions=$(psql -X --no-password --tuples-only --no-align --set=ON_ERROR_STOP=1 \
+active_sessions=$("$PSQL_BINARY" -X --no-password --tuples-only --no-align --set=ON_ERROR_STOP=1 \
   --command='SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid()')
 active_sessions=${active_sessions//[[:space:]]/}
 [[ $active_sessions =~ ^[0-9]+$ ]] || die 'could not verify active database sessions'
 (( active_sessions == 0 )) || die "target database still has $active_sessions other session(s); stop probe-api and all clients first"
 
 printf 'Restoring verified archive %s into database %s...\n' "$archive_path" "$current_database"
-pg_restore \
+"$PG_RESTORE_BINARY" \
   --clean \
   --if-exists \
   --exit-on-error \
@@ -171,12 +177,12 @@ pg_restore \
   --no-privileges \
   --file=- \
   "$archive_path" \
-  | psql \
+  | "$PSQL_BINARY" \
       -X \
       --no-password \
       --quiet \
       --single-transaction \
       --set=ON_ERROR_STOP=1
 
-psql -X --no-password --tuples-only --no-align --set=ON_ERROR_STOP=1 --command='SELECT 1' >/dev/null
+"$PSQL_BINARY" -X --no-password --tuples-only --no-align --set=ON_ERROR_STOP=1 --command='SELECT 1' >/dev/null
 printf 'PostgreSQL restore completed: database=%s archive=%s\n' "$current_database" "$archive_path"

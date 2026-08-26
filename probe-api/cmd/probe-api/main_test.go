@@ -10,6 +10,9 @@ func TestIngressTLSCommandRequiresAnExactModeShape(t *testing.T) {
 		{"config", "validate-ingress-tls"},
 		{"config", "validate-ingress-tls", "domain", "panel.example.net"},
 		{"config", "validate-ingress-tls", "ip"},
+		{"config", "validate-ingress-tls", "admin-domain"},
+		{"config", "validate-ingress-tls", "admin-domain", "admin.example.net", "extra"},
+		{"config", "validate-ingress-tls", "admin-ip"},
 		{"config", "validate-ingress-tls", "other", "value"},
 	} {
 		err := runConfigCommand(arguments)

@@ -88,16 +88,17 @@ func NewServer(cfg config.Config, logger *slog.Logger, db Database, options ...O
 		apply(&settings)
 	}
 	mux := http.NewServeMux()
+	agentRuntimeEnabled := cfg.AgentRuntimeEnabled()
 	health := healthHandler{db: db, pingTimeout: cfg.DatabasePingTimeout}
 	mux.HandleFunc("/internal/health/live", exactMethod(http.MethodGet, health.live))
 	mux.HandleFunc("/internal/health/ready", exactMethod(http.MethodGet, health.ready))
 	registerManagementAccessStatusRoute(mux, cfg.AdminAllowlist)
-	if settings.agentService != nil {
+	if agentRuntimeEnabled && settings.agentService != nil {
 		registerAgentRoutes(mux, logger, settings.agentService, cfg.MaxAgentBodyBytes, newAgentRateLimiters(cfg))
 	}
 	if settings.authService != nil {
 		RegisterAuthRoutes(mux, logger, settings.authService, cfg.MaxPanelBodyBytes, cfg.AdminOrigin)
-		registerSystemStatusRoute(mux, logger, db, settings.authService, cfg.DatabasePingTimeout)
+		registerSystemStatusRoute(mux, logger, db, settings.authService, cfg.DatabasePingTimeout, agentRuntimeEnabled)
 	}
 	if settings.panelService != nil {
 		registerPanelRoutes(mux, logger, settings.panelService)
@@ -113,7 +114,7 @@ func NewServer(cfg config.Config, logger *slog.Logger, db Database, options ...O
 		installCommandGenerator := agentbootstrap.New(cfg.AgentPublicURL, cfg.AgentInstallerURL, cfg.AgentInstallCAPEM)
 		RegisterAdminManagementRoutes(mux, logger,
 			settings.nodeManagementService, settings.userManagementService, settings.auditLogService,
-			settings.authService, cfg.MaxPanelBodyBytes, cfg.AdminOrigin, installCommandGenerator)
+			settings.authService, cfg.MaxPanelBodyBytes, cfg.AdminOrigin, installCommandGenerator, agentRuntimeEnabled)
 	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		respond.Error(w, http.StatusNotFound, "not_found", "route not found", requestIDFromContext(r.Context()))

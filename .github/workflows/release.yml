@@ -1,6 +1,9 @@
-name: Verify immutable Probe Panel release
+name: Build management candidate and verify immutable legacy release
 
 on:
+  push:
+    tags:
+      - v1.2.0
   release:
     types: [published]
   workflow_dispatch:
@@ -16,10 +19,143 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: probe-release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  verify:
-    name: Verify published v1.1.0 assets
+  build_management:
+    name: Build management v1.2.0 candidate
+    if: github.event_name == 'push' && github.ref == 'refs/tags/v1.2.0'
     runs-on: ubuntu-24.04
+    container:
+      image: debian:13-slim
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: v1.2.0
+      RELEASE_OUTPUT: ${{ runner.temp }}/probe-panel-management-release-v1.2.0
+    steps:
+      - name: Install Debian 13 build prerequisites
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl file git gzip shellcheck tar xz-utils
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Check out the exact management tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: refs/tags/v1.2.0
+
+      - name: Set up Go 1.23
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache-dependency-path: probe-api/go.sum
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.12.0'
+
+      - name: Require the exact clean remote tag
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ "$GITHUB_REPOSITORY" == Kcmose/super-my ]]
+          [[ "$GITHUB_REF" == refs/tags/v1.2.0 ]]
+          [[ "$GITHUB_REF_TYPE" == tag ]]
+          git remote set-url origin https://github.com/Kcmose/super-my.git
+          [[ "$(git remote get-url origin)" == https://github.com/Kcmose/super-my.git ]]
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
+
+          local_tag_object="$(git rev-parse --verify refs/tags/v1.2.0)"
+          local_tag_commit="$(git rev-parse --verify 'refs/tags/v1.2.0^{commit}')"
+          [[ "$(git rev-parse --verify 'HEAD^{commit}')" == "$local_tag_commit" ]]
+          remote_tags="$(git ls-remote --exit-code origin \
+            refs/tags/v1.2.0 'refs/tags/v1.2.0^{}')"
+          [[ "$(awk '$2 == "refs/tags/v1.2.0" { count++ } END { print count + 0 }' \
+            <<<"$remote_tags")" -eq 1 ]]
+          [[ "$(awk '$2 == "refs/tags/v1.2.0^{}" { count++ } END { print count + 0 }' \
+            <<<"$remote_tags")" -le 1 ]]
+          remote_tag_object="$(awk '$2 == "refs/tags/v1.2.0" { print $1 }' \
+            <<<"$remote_tags")"
+          remote_tag_commit="$(awk '$2 == "refs/tags/v1.2.0^{}" { print $1 }' \
+            <<<"$remote_tags")"
+          [[ "$remote_tag_object" == "$local_tag_object" ]]
+          [[ "${remote_tag_commit:-$remote_tag_object}" == "$local_tag_commit" ]]
+
+      - name: Build management-only release assets
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          bash probe-api/deploy/scripts/build-release-bundles.sh \
+            --profile management \
+            --version v1.2.0 \
+            --output-dir "$RELEASE_OUTPUT"
+
+      - name: Require exactly the three management assets
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          expected_assets="$(printf '%s\n' \
+            SHA256SUMS \
+            probe-panel-management-v1.2.0-linux-amd64.tar.gz \
+            probe-panel-management-v1.2.0-linux-arm64.tar.gz | LC_ALL=C sort)"
+          actual_assets="$(find "$RELEASE_OUTPUT" -mindepth 1 -maxdepth 1 \
+            -type f -printf '%f\n' | LC_ALL=C sort)"
+          [[ "$actual_assets" == "$expected_assets" ]]
+          [[ "$(find "$RELEASE_OUTPUT" -mindepth 1 -maxdepth 1 | wc -l)" -eq 3 ]]
+          [[ -z "$(find "$RELEASE_OUTPUT" -mindepth 1 -maxdepth 1 ! -type f -print -quit)" ]]
+          [[ "$(wc -l < "$RELEASE_OUTPUT/SHA256SUMS")" -eq 2 ]]
+          full_bundle_prefix="probe-panel-${RELEASE_TAG}-linux-"
+          ! grep -Fq "$full_bundle_prefix" "$RELEASE_OUTPUT/SHA256SUMS"
+          (
+            cd "$RELEASE_OUTPUT"
+            sha256sum --check --strict SHA256SUMS
+          )
+
+      - name: Bind candidate tarballs to the verified tag commit
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source_commit="$(git rev-parse --verify 'refs/tags/v1.2.0^{commit}')"
+          [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]]
+          cd probe-api
+          go run ./cmd/probe-support-gate verify \
+            --support-root deploy/support \
+            --release v1.2.0 \
+            --require-zero-supported \
+            --release-assets "$RELEASE_OUTPUT" \
+            --source-commit "$source_commit"
+
+      - name: Upload the unpublished management candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-panel-management-v1.2.0-candidate
+          path: |
+            ${{ runner.temp }}/probe-panel-management-release-v1.2.0/SHA256SUMS
+            ${{ runner.temp }}/probe-panel-management-release-v1.2.0/probe-panel-management-v1.2.0-linux-amd64.tar.gz
+            ${{ runner.temp }}/probe-panel-management-release-v1.2.0/probe-panel-management-v1.2.0-linux-arm64.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+          overwrite: false
+
+  verify_legacy:
+    name: Verify published v1.1.0 assets
+    if: >-
+      (github.event_name == 'release' &&
+      github.event.release.tag_name == 'v1.1.0') ||
+      (github.event_name == 'workflow_dispatch' && inputs.version == 'v1.1.0')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     env:
       RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.version }}
       GH_TOKEN: ${{ github.token }}

@@ -83,6 +83,21 @@ function requireSetupSession() {
   throw error
 }
 
+function requireManagementSetupPayload(payload) {
+  const domainFields = payload?.domains && typeof payload.domains === 'object' && !Array.isArray(payload.domains)
+    ? Object.keys(payload.domains)
+    : []
+  if (
+    payload?.profile !== 'management'
+    || domainFields.length !== 1
+    || domainFields[0] !== 'admin'
+  ) {
+    const error = new Error('管理端安装向导只允许提交 management 配置')
+    error.code = 'setup_profile_forbidden'
+    throw error
+  }
+}
+
 export function clearSetupSecrets() {
   setupSessionToken = ''
   setupCsrfToken = ''
@@ -133,6 +148,7 @@ export const setupApi = {
 
   async complete(payload) {
     requireSetupSession()
+    requireManagementSetupPayload(payload)
     try {
       const response = await setupRequest(setupEndpoints.complete, {
         method: 'POST',

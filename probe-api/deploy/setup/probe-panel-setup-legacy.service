@@ -1,0 +1,34 @@
+[Unit]
+Description=Probe Panel first-run setup (root-only Unix socket, systemd 219 profile)
+Wants=probe-panel-setup.socket
+After=probe-panel-setup.socket
+ConditionPathExists=/var/lib/probe-panel/setup/state.json
+ConditionPathExists=/srv/probe/setup-ui/index.html
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=/etc/probe-panel/setup.env
+ExecStart=/usr/local/lib/probe-panel/probe-setup serve
+Sockets=probe-panel-setup.socket
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=10s
+UMask=0077
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+PrivateDevices=true
+PrivateTmp=true
+PrivateNetwork=true
+ProtectSystem=full
+ProtectHome=true
+ReadOnlyPaths=/srv/probe/setup-ui
+ReadWritePaths=/var/lib/probe-panel/setup
+ReadWritePaths=/run/probe-panel-setup
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

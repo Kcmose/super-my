@@ -55,6 +55,62 @@ func TestCompleteRequestAcceptsPrivateCAIPIngressAndBuildsCanonicalOrigins(t *te
 	}
 }
 
+func TestManagementProfileBuildsOnlyAdministratorOrigins(t *testing.T) {
+	for name, input := range map[string]string{
+		"domain": managementCompleteJSON("admin.monitor.test", ""),
+		"IPv4":   managementCompleteJSON("", "10.20.30.40"),
+		"IPv6":   managementCompleteJSON("", "2001:db8::25"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			request, err := DecodeCompleteRequestForProfile([]byte(input), InstallationProfileManagement)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer request.ClearSecrets()
+			access, err := request.AccessConfiguration()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if access.Profile != InstallationProfileManagement || access.PanelOrigin != "" || access.AgentOrigin != "" {
+				t.Fatalf("management access = %#v", access)
+			}
+			if name == "domain" && (access.Mode != IngressModeDomain || access.AdminOrigin != "https://admin.monitor.test") {
+				t.Fatalf("domain management access = %#v", access)
+			}
+			if name == "IPv4" && access.AdminOrigin != "https://10.20.30.40:18455" {
+				t.Fatalf("IPv4 management origin = %q", access.AdminOrigin)
+			}
+			if name == "IPv6" && access.AdminOrigin != "https://[2001:db8::25]:18455" {
+				t.Fatalf("IPv6 management origin = %q", access.AdminOrigin)
+			}
+		})
+	}
+}
+
+func TestFixedSetupProfileCannotBeChangedByBrowser(t *testing.T) {
+	management := managementCompleteJSON("admin.monitor.test", "")
+	conflicting := strings.Replace(management, `"database":`, `"profile":"full","database":`, 1)
+	request, err := DecodeCompleteRequestForProfile([]byte(conflicting), InstallationProfileManagement)
+	request.ClearSecrets()
+	if err == nil || !strings.Contains(err.Error(), "fixed setup profile") {
+		t.Fatalf("conflicting browser profile error = %v", err)
+	}
+
+	unsafeDomains := strings.Replace(management, `"domains":{"admin":`, `"domains":{"panel":"panel.monitor.test","admin":`, 1)
+	request, err = DecodeCompleteRequestForProfile([]byte(unsafeDomains), InstallationProfileManagement)
+	request.ClearSecrets()
+	if err == nil || !strings.Contains(err.Error(), `unknown field "panel"`) {
+		t.Fatalf("management visitor domain error = %v", err)
+	}
+
+	missingAdmin := strings.Replace(management, `"domains":{"admin":"admin.monitor.test"}`, `"domains":{}`, 1)
+	request, err = DecodeCompleteRequestForProfile([]byte(missingAdmin), InstallationProfileManagement)
+	request.ClearSecrets()
+	if err == nil || !strings.Contains(err.Error(), "must contain only admin") {
+		t.Fatalf("management missing admin error = %v", err)
+	}
+}
+
 func TestCompleteRequestRejectsAmbiguousOrUnsafeIngress(t *testing.T) {
 	ipBase := privateCACompleteJSON("10.20.30.40")
 	tests := map[string]string{
@@ -97,6 +153,17 @@ func privateCACompleteJSON(address string) string {
 		`"domains":{"panel":"","admin":"","agent":""}`, 1)
 	input = strings.Replace(input, `"network":{"address":""}`, `"network":{"address":"`+address+`"}`, 1)
 	return strings.Replace(input, `"tls":{"mode":"acme","email":"admin@example.com"}`, `"tls":{"mode":"private_ca","email":""}`, 1)
+}
+
+func managementCompleteJSON(adminDomain, address string) string {
+	input := strings.Replace(validCompleteJSON,
+		`"domains":{"panel":"panel.monitor.test","admin":"admin.monitor.test","agent":"api.monitor.test"}`,
+		`"domains":{"admin":"`+adminDomain+`"}`, 1)
+	if address != "" {
+		input = strings.Replace(input, `"network":{"address":""}`, `"network":{"address":"`+address+`"}`, 1)
+		input = strings.Replace(input, `"tls":{"mode":"acme","email":"admin@example.com"}`, `"tls":{"mode":"private_ca","email":""}`, 1)
+	}
+	return input
 }
 
 func TestDecodeCompleteRequestRejectsUnknownDuplicateAndLegacyShape(t *testing.T) {

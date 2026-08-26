@@ -170,6 +170,27 @@ func TestReadAgentBodyEnforcesGzipLimitsAndSingleMember(t *testing.T) {
 	})
 }
 
+func TestManagementProfileDoesNotRegisterAgentRuntimeRoutes(t *testing.T) {
+	service := &stubAgentService{}
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("config.Load() error = %v", err)
+	}
+	cfg.InstallationProfile = "management"
+	cfg.AgentPublicURL = ""
+	cfg.AgentInstallerURL = ""
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := NewServer(cfg, logger, fakeDatabase{}, WithAgentService(service))
+
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/agent/report", strings.NewReader(`{}`))
+	response := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusNotFound || service.reportCalls != 0 {
+		t.Fatalf("status=%d report_calls=%d body=%s", response.Code, service.reportCalls, response.Body.String())
+	}
+}
+
 func newAgentTestServer(t *testing.T, service AgentService) *Server {
 	t.Helper()
 	cfg, err := config.Load()

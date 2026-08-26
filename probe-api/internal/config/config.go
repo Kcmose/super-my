@@ -21,9 +21,12 @@ import (
 const (
 	verifiedAgentInstallerReleaseRevision = "refs/tags/v1.0.2"
 	defaultAgentInstallerURL              = "https://raw.githubusercontent.com/Kcmose/my-agent/" + verifiedAgentInstallerReleaseRevision + "/deploy/install.sh"
+	installationProfileManagement         = "management"
 )
 
 type Config struct {
+	InstallationProfile       string
+	IngressMode               string
 	ListenAddress             string
 	DatabaseURL               string
 	LogLevel                  string
@@ -61,7 +64,21 @@ type Config struct {
 }
 
 func Load() (Config, error) {
+	installationProfile := strings.ToLower(strings.TrimSpace(os.Getenv("PROBE_INSTALLATION_PROFILE")))
+	switch installationProfile {
+	case "", "full", installationProfileManagement:
+	default:
+		return Config{}, errors.New("PROBE_INSTALLATION_PROFILE must be full or management")
+	}
+	agentPublicURLFallback := "https://api.example.com"
+	agentInstallerURLFallback := defaultAgentInstallerURL
+	if installationProfile == installationProfileManagement {
+		agentPublicURLFallback = ""
+		agentInstallerURLFallback = ""
+	}
 	cfg := Config{
+		InstallationProfile:       installationProfile,
+		IngressMode:               strings.ToLower(strings.TrimSpace(os.Getenv("PROBE_INGRESS_MODE"))),
 		ListenAddress:             envString("PROBE_API_LISTEN_ADDR", "127.0.0.1:8080"),
 		DatabaseURL:               strings.TrimSpace(os.Getenv("PROBE_DATABASE_URL")),
 		LogLevel:                  strings.ToLower(envString("PROBE_LOG_LEVEL", "info")),
@@ -76,8 +93,8 @@ func Load() (Config, error) {
 		MaxAgentBodyBytes:         256 * 1024,
 		MaxPanelBodyBytes:         64 * 1024,
 		AdminOrigin:               envString("PROBE_ADMIN_ORIGIN", "https://admin.example.com"),
-		AgentPublicURL:            envString("PROBE_AGENT_PUBLIC_URL", "https://api.example.com"),
-		AgentInstallerURL:         envString("PROBE_AGENT_INSTALLER_URL", defaultAgentInstallerURL),
+		AgentPublicURL:            envString("PROBE_AGENT_PUBLIC_URL", agentPublicURLFallback),
+		AgentInstallerURL:         envString("PROBE_AGENT_INSTALLER_URL", agentInstallerURLFallback),
 		AgentInstallCAFile:        strings.TrimSpace(os.Getenv("PROBE_AGENT_INSTALL_CA_FILE")),
 		AdminAllowlistFile:        strings.TrimSpace(os.Getenv("PROBE_ADMIN_ALLOWLIST_FILE")),
 		SessionTTL:                12 * time.Hour,
@@ -183,11 +200,38 @@ func Load() (Config, error) {
 	if err := validateAdminOrigin(cfg.AdminOrigin); err != nil {
 		return Config{}, err
 	}
-	if err := validateHTTPSOrigin("PROBE_AGENT_PUBLIC_URL", cfg.AgentPublicURL); err != nil {
-		return Config{}, err
+	if cfg.IngressMode != "" && cfg.IngressMode != "domain" && cfg.IngressMode != "ip" {
+		return Config{}, errors.New("PROBE_INGRESS_MODE must be domain or ip")
 	}
-	if err := validateAgentInstallerURL(cfg.AgentInstallerURL); err != nil {
-		return Config{}, err
+	if (cfg.AgentPublicURL == "") != (cfg.AgentInstallerURL == "") {
+		return Config{}, errors.New("PROBE_AGENT_PUBLIC_URL and PROBE_AGENT_INSTALLER_URL must either both be set or both be empty")
+	}
+	if cfg.AgentPublicURL != "" {
+		if err := validateHTTPSOrigin("PROBE_AGENT_PUBLIC_URL", cfg.AgentPublicURL); err != nil {
+			return Config{}, err
+		}
+		if installationProfile == installationProfileManagement && cfg.AgentPublicURL != cfg.AdminOrigin {
+			return Config{}, errors.New("management PROBE_AGENT_PUBLIC_URL must equal PROBE_ADMIN_ORIGIN")
+		}
+		if installationProfile == installationProfileManagement {
+			switch cfg.IngressMode {
+			case "domain":
+				if cfg.AgentInstallCAFile != "" {
+					return Config{}, errors.New("management domain Agent integration must use public PKI without PROBE_AGENT_INSTALL_CA_FILE")
+				}
+			case "ip":
+				if cfg.AgentInstallCAFile != "/etc/probe-panel/tls/private-ca/ca.pem" {
+					return Config{}, errors.New("management IP Agent integration must use the management private CA")
+				}
+			default:
+				return Config{}, errors.New("management Agent integration requires PROBE_INGRESS_MODE")
+			}
+		}
+		if err := validateAgentInstallerURL(cfg.AgentInstallerURL); err != nil {
+			return Config{}, err
+		}
+	} else if cfg.AgentInstallCAFile != "" {
+		return Config{}, errors.New("PROBE_AGENT_INSTALL_CA_FILE requires Agent bootstrap configuration")
 	}
 	if cfg.AgentInstallCAFile != "" {
 		cfg.AgentInstallCAPEM, err = loadPublicCABundle(cfg.AgentInstallCAFile)
@@ -352,6 +396,9 @@ func (c Config) ValidateDatabase() error {
 }
 
 func (c Config) ValidateServe() error {
+	if !c.AgentRuntimeEnabled() {
+		return nil
+	}
 	if c.AgentPublicURL == "" || c.AgentPublicURL == "https://api.example.com" {
 		return errors.New("PROBE_AGENT_PUBLIC_URL must be set to the deployed Agent HTTPS origin before serving")
 	}
@@ -359,6 +406,17 @@ func (c Config) ValidateServe() error {
 		return errors.New("PROBE_AGENT_INSTALLER_URL must name the published Agent installer before serving")
 	}
 	return nil
+}
+
+// AgentRuntimeEnabled reports whether Agent ingress and bootstrap operations
+// may be exposed. An unset/full profile preserves the original all-in-one
+// contract. The management profile is fail-closed until both public bootstrap
+// URLs are configured explicitly.
+func (c Config) AgentRuntimeEnabled() bool {
+	if c.InstallationProfile != installationProfileManagement {
+		return true
+	}
+	return c.AgentPublicURL != "" && c.AgentInstallerURL != ""
 }
 
 func envString(name, fallback string) string {

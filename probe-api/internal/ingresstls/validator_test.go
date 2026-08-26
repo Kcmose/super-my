@@ -63,6 +63,30 @@ func TestValidateDomainUsesExpectedSANServerAuthAndPublicChain(t *testing.T) {
 	})
 }
 
+func TestValidateAdminDomainDoesNotRequireIndependentSurfaceCertificates(t *testing.T) {
+	now := time.Date(2026, 8, 24, 10, 0, 0, 0, time.UTC)
+	full := newDomainFixture(t, now, nil)
+	for _, pair := range []CertificatePair{full.Paths.Panel, full.Paths.Agent} {
+		if err := os.Remove(pair.Certificate); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(pair.PrivateKey); err != nil {
+			t.Fatal(err)
+		}
+	}
+	config := AdminDomainConfig{
+		Paths: full.Paths, AdminHost: full.AdminHost,
+		Roots: full.Roots, CurrentTime: full.CurrentTime,
+	}
+	if err := ValidateAdminDomain(config); err != nil {
+		t.Fatalf("ValidateAdminDomain() error = %v", err)
+	}
+	config.AdminHost = "other.example.net"
+	if err := ValidateAdminDomain(config); err == nil {
+		t.Fatal("ValidateAdminDomain() accepted a mismatched hostname")
+	}
+}
+
 func TestValidateIPRequiresExactSANAndFixedDirectCA(t *testing.T) {
 	now := time.Date(2026, 8, 24, 10, 0, 0, 0, time.UTC)
 	config := newIPFixture(t, now, nil, nil)

@@ -6,7 +6,7 @@
           <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
           <span>{{ nodes.length }} 个节点</span>
           <span class="text-slate-600">•</span>
-          <span>安装命令与凭证明文仅显示一次</span>
+          <span>{{ agentRuntimeEnabled ? 'Agent 接入已配置' : 'Agent 接入待配置' }}</span>
         </div>
       </template>
       <template #actions>
@@ -18,13 +18,17 @@
       <section class="p-4 bg-dark-900 border border-dark-700/80 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-4 shadow-lg">
         <div>
           <h1 class="text-sm font-semibold text-slate-100">节点接入与 Agent 凭证管理</h1>
-          <p class="text-xs text-slate-400 mt-1">新建节点后自动生成可复制的一键安装命令，并可按需轮换或吊销 Agent Token。安装仍由你在目标机主动执行，不会向 Agent 远程下发命令。</p>
+          <p class="text-xs text-slate-400 mt-1">先创建节点并保存 Agent 参数；独立的 Agent 接入配置完成后，才生成安装命令并由你在目标机主动执行。</p>
         </div>
         <div class="flex items-center gap-2">
-          <button type="button" :disabled="loading" class="px-3 py-2 bg-dark-800 border border-dark-700 text-slate-300 hover:text-emerald-400 rounded-lg text-xs transition disabled:opacity-50" @click="loadNodes">刷新</button>
+          <button type="button" :disabled="loading || agentStatusLoading" class="px-3 py-2 bg-dark-800 border border-dark-700 text-slate-300 hover:text-emerald-400 rounded-lg text-xs transition disabled:opacity-50" @click="refreshPage">刷新</button>
           <button type="button" :disabled="loading || isBusy()" class="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-medium transition disabled:opacity-50" @click="openCreate">+ 新建节点</button>
         </div>
       </section>
+
+      <div v-if="!agentRuntimeEnabled" role="status" class="p-3 bg-amber-500/10 border border-amber-500/30 rounded-xl text-xs text-amber-200">
+        {{ agentStatusError ? 'Agent 接入状态暂时无法确认，安装与令牌轮换已安全禁用。' : 'Agent 接入尚未配置。你可以先创建节点并保存采集参数；完成独立的 Agent 接入配置后，才可生成安装命令。' }}
+      </div>
 
       <div v-if="errorMessage" role="alert" class="p-3 bg-rose-500/10 border border-rose-500/30 rounded-xl text-xs text-rose-300">{{ errorMessage }}</div>
       <div v-if="successMessage" role="status" class="p-3 bg-emerald-500/10 border border-emerald-500/30 rounded-xl text-xs text-emerald-300">{{ successMessage }}</div>
@@ -48,7 +52,7 @@
               <tr v-else-if="nodes.length === 0">
                 <td colspan="7" class="py-14 px-4 text-center">
                   <div class="text-slate-300 font-sans font-semibold">暂无节点</div>
-                  <div class="mt-1 text-[11px] text-slate-500 font-sans">新建节点后会立即生成一条仅显示一次的 Agent 安装命令。</div>
+                  <div class="mt-1 text-[11px] text-slate-500 font-sans">可先创建节点并保存 Agent 参数，安装命令将在 Agent 接入配置完成后提供。</div>
                 </td>
               </tr>
               <template v-else>
@@ -70,8 +74,8 @@
                 </td>
                 <td class="py-3 px-4 text-right font-sans whitespace-nowrap">
                   <button type="button" :disabled="isBusy(node)" class="text-slate-300 hover:text-emerald-400 disabled:opacity-40" @click="openEdit(node)">编辑</button>
-                  <button type="button" :disabled="isBusy(node) || !node.enabled" :title="node.enabled ? '' : '请先启用节点'" class="ml-3 text-emerald-400 hover:text-emerald-300 disabled:opacity-40" @click="createEnrollment(node)">{{ node.enrolled_at ? '重新安装命令' : '安装命令' }}</button>
-                  <button type="button" :disabled="isBusy(node)" class="ml-3 text-amber-400 hover:text-amber-300 disabled:opacity-40" @click="rotateAgentToken(node)">轮换</button>
+                  <button type="button" :disabled="isBusy(node) || !node.enabled || !agentRuntimeEnabled" :title="installActionTitle(node)" class="ml-3 text-emerald-400 hover:text-emerald-300 disabled:opacity-40" @click="createEnrollment(node)">{{ node.enrolled_at ? '重新安装命令' : '安装命令' }}</button>
+                  <button type="button" :disabled="isBusy(node) || !agentRuntimeEnabled" :title="agentRuntimeEnabled ? '' : '请先完成 Agent 接入配置'" class="ml-3 text-amber-400 hover:text-amber-300 disabled:opacity-40" @click="rotateAgentToken(node)">轮换</button>
                   <button type="button" :disabled="isBusy(node)" class="ml-3 text-orange-400 hover:text-orange-300 disabled:opacity-40" @click="revokeAgentToken(node)">吊销</button>
                   <button type="button" :disabled="isBusy(node)" class="ml-3 text-rose-400 hover:text-rose-300 disabled:opacity-40" @click="removeNode(node)">删除</button>
                 </td>
@@ -117,7 +121,7 @@
           </div>
           <fieldset class="p-3 bg-dark-900 border border-dark-700 rounded-lg space-y-3">
             <legend class="px-1 text-slate-200 font-semibold">Agent 采集设置</legend>
-            <p class="text-[11px] text-slate-500">保存后 Agent 会在下次配置刷新时获取完整结构化设置。</p>
+            <p class="text-[11px] text-slate-500">参数可在安装 Agent 前预先保存；接入完成后，Agent 会在配置刷新时获取完整结构化设置。</p>
             <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
                 <label for="node-collect-interval" class="block text-slate-300 mb-1">采集周期（秒）</label>
@@ -154,7 +158,7 @@
           </fieldset>
           <label class="flex items-center gap-2 p-3 bg-dark-900 border border-dark-700 rounded-lg text-slate-300 cursor-pointer">
             <input v-model="nodeForm.enabled" type="checkbox" class="accent-emerald-500">
-            <span>允许该节点使用有效 Agent 凭证接入</span>
+            <span>允许该节点在 Agent 接入配置完成后使用有效凭证接入</span>
           </label>
           <div class="flex justify-end gap-2 pt-2">
             <button type="button" :disabled="savingNode" class="px-3 py-2 bg-dark-700 hover:bg-dark-600 rounded-lg disabled:opacity-50" @click="closeNodeModal">取消</button>
@@ -216,6 +220,9 @@ const savingNode = ref(false)
 const busyNodeId = ref('')
 const secretDialog = ref(null)
 const copyStatus = ref('')
+const agentRuntimeEnabled = ref(false)
+const agentStatusLoading = ref(true)
+const agentStatusError = ref('')
 
 let mounted = false
 let loadGeneration = 0
@@ -242,6 +249,11 @@ function emptyNodeForm() {
 
 function isBusy() {
   return Boolean(busyNodeId.value)
+}
+
+function installActionTitle(node) {
+  if (!agentRuntimeEnabled.value) return '请先完成 Agent 接入配置'
+  return node.enabled ? '' : '请先启用节点'
 }
 
 function statusClass(status) {
@@ -271,6 +283,29 @@ async function loadNodes() {
   } finally {
     if (mounted && generation === loadGeneration) loading.value = false
   }
+}
+
+async function loadAgentStatus() {
+  agentStatusLoading.value = true
+  agentStatusError.value = ''
+  try {
+    const response = await adminApi.getSystemStatus()
+    const state = response?.agent?.status
+    if (!['configured', 'not_configured'].includes(state)) throw new Error('服务端未返回有效的 Agent 接入状态')
+    if (!mounted) return
+    agentRuntimeEnabled.value = state === 'configured'
+  } catch (error) {
+    if (!mounted) return
+    agentRuntimeEnabled.value = false
+    agentStatusError.value = error?.message || 'Agent 接入状态读取失败'
+  } finally {
+    if (mounted) agentStatusLoading.value = false
+  }
+}
+
+function refreshPage() {
+  void loadNodes()
+  void loadAgentStatus()
 }
 
 function openCreate() {
@@ -327,10 +362,12 @@ async function saveNode() {
     showNodeModal.value = false
     editingNode.value = null
     nodeForm.value = emptyNodeForm()
-    successMessage.value = payload.enabled ? '节点已创建，正在生成一次性安装命令。' : '节点已创建但当前处于禁用状态；启用后才能生成安装命令。'
+    successMessage.value = agentRuntimeEnabled.value
+      ? (payload.enabled ? '节点已创建，正在生成一次性安装命令。' : '节点已创建但当前处于禁用状态；启用后才能生成安装命令。')
+      : '节点及 Agent 参数已保存；Agent 接入尚未配置，暂不生成安装命令。'
     await loadNodes()
 
-    if (!payload.enabled) return
+    if (!payload.enabled || !agentRuntimeEnabled.value) return
 
     if (typeof createdNode?.node_id !== 'string' || !createdNode.node_id) {
       errorMessage.value = '节点已经创建，但服务端未返回节点 ID，无法自动生成安装命令。请刷新列表后点击“安装命令”重试。'
@@ -343,6 +380,10 @@ async function saveNode() {
       showInstallCommand(response)
       successMessage.value = '节点已创建，请复制命令并在目标 Debian/Linux 主机上主动执行。'
     } catch (error) {
+		if (error?.code === 'agent_not_configured') {
+			agentRuntimeEnabled.value = false
+			agentStatusError.value = ''
+		}
       errorMessage.value = `节点已经创建，但安装命令生成失败：${error?.message || '未知错误'}。请点击该节点的“安装命令”重试。`
     } finally {
       busyNodeId.value = ''
@@ -390,6 +431,10 @@ async function copySecret() {
 }
 
 async function createEnrollment(node) {
+	if (!agentRuntimeEnabled.value) {
+		errorMessage.value = 'Agent 接入尚未配置，请先完成独立的 Agent 接入配置。'
+		return
+	}
 	if (!node.enabled) {
 		errorMessage.value = '节点当前已禁用，请先编辑并启用节点，再生成安装命令。'
 		return
@@ -404,6 +449,10 @@ async function createEnrollment(node) {
     if (!mounted) return
     showInstallCommand(response, { reinstallation: Boolean(node.enrolled_at) })
   } catch (error) {
+	if (error?.code === 'agent_not_configured') {
+		agentRuntimeEnabled.value = false
+		agentStatusError.value = ''
+	}
     errorMessage.value = error?.message || '安装命令生成失败'
   } finally {
     busyNodeId.value = ''
@@ -411,6 +460,10 @@ async function createEnrollment(node) {
 }
 
 async function rotateAgentToken(node) {
+  if (!agentRuntimeEnabled.value) {
+    errorMessage.value = 'Agent 接入尚未配置，请先完成独立的 Agent 接入配置。'
+    return
+  }
   if (!window.confirm(`确认轮换节点“${node.display_name}”的 Agent Token？旧 Token 将立即失效。`)) return
   busyNodeId.value = node.node_id
   errorMessage.value = ''
@@ -464,7 +517,7 @@ async function removeNode(node) {
 
 onMounted(() => {
   mounted = true
-  void loadNodes()
+  refreshPage()
 })
 
 onUnmounted(() => {

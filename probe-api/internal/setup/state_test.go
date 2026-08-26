@@ -66,6 +66,27 @@ func TestStateMachineRejectsSkipsAndCanFailClosed(t *testing.T) {
 	}
 }
 
+func TestStateMachineAllowsOnlyFinalizingPreflightRetry(t *testing.T) {
+	files := newMemoryFiles()
+	store, _ := NewStateStore(files, "/state.json")
+	now := time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC)
+	if err := store.Initialize(now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Transition(StatePending, StateConfiguring, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Transition(StateConfiguring, StateFinalizing, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Transition(StateFinalizing, StateConfiguring, now); err != nil {
+		t.Fatalf("preflight retry transition: %v", err)
+	}
+	if err := store.Transition(StateConfiguring, StatePending, now); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("unreviewed reverse transition error = %v", err)
+	}
+}
+
 func TestStateStoreRejectsMalformedPersistentState(t *testing.T) {
 	for name, contents := range map[string]string{
 		"unknown state": `{"version":1,"status":"other","updated_at":"2026-08-24T10:00:00Z"}`,

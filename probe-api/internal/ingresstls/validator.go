@@ -41,10 +41,23 @@ type DomainConfig struct {
 	CurrentTime time.Time
 }
 
+type AdminDomainConfig struct {
+	Paths       Paths
+	AdminHost   string
+	Roots       *x509.CertPool
+	CurrentTime time.Time
+}
+
 type IPConfig struct {
 	Paths       Paths
 	Address     string
 	CurrentTime time.Time
+}
+
+type domainEntry struct {
+	name string
+	host string
+	pair CertificatePair
 }
 
 func ProductionPaths() Paths {
@@ -71,23 +84,28 @@ func ProductionPaths() Paths {
 
 func ValidateDomain(config DomainConfig) error {
 	now := currentTime(config.CurrentTime)
-	roots := config.Roots
+	entries := []domainEntry{
+		{name: "panel", host: config.PanelHost, pair: config.Paths.Panel},
+		{name: "admin", host: config.AdminHost, pair: config.Paths.Admin},
+		{name: "agent", host: config.AgentHost, pair: config.Paths.Agent},
+	}
+	return validateDomainEntries(entries, config.Roots, now)
+}
+
+func ValidateAdminDomain(config AdminDomainConfig) error {
+	entries := []domainEntry{
+		{name: "admin", host: config.AdminHost, pair: config.Paths.Admin},
+	}
+	return validateDomainEntries(entries, config.Roots, currentTime(config.CurrentTime))
+}
+
+func validateDomainEntries(entries []domainEntry, roots *x509.CertPool, now time.Time) error {
 	if roots == nil {
 		var err error
 		roots, err = x509.SystemCertPool()
 		if err != nil || roots == nil {
 			return errors.New("load system certificate roots")
 		}
-	}
-
-	entries := []struct {
-		name string
-		host string
-		pair CertificatePair
-	}{
-		{name: "panel", host: config.PanelHost, pair: config.Paths.Panel},
-		{name: "admin", host: config.AdminHost, pair: config.Paths.Admin},
-		{name: "agent", host: config.AgentHost, pair: config.Paths.Agent},
 	}
 	for _, entry := range entries {
 		if err := validateCanonicalHostname(entry.host); err != nil {

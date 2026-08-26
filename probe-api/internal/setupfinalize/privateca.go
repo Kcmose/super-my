@@ -24,12 +24,19 @@ func (finalizer *Finalizer) validateAvailableIPPorts(ctx context.Context) error 
 	return finalizer.validateAvailableIngressPorts(ctx, "IP ingress", []string{"18453", "18454", "18455"})
 }
 
+func (finalizer *Finalizer) validateAvailableIPPortsForProfile(ctx context.Context, profile setup.InstallationProfile) error {
+	if profile == setup.InstallationProfileManagement {
+		return finalizer.validateAvailableIngressPorts(ctx, "management IP ingress", []string{"18455"})
+	}
+	return finalizer.validateAvailableIPPorts(ctx)
+}
+
 func (finalizer *Finalizer) validateAvailableACMEPorts(ctx context.Context) error {
 	return finalizer.validateAvailableIngressPorts(ctx, "ACME", []string{"80", "443"})
 }
 
 func (finalizer *Finalizer) validateAvailableIngressPorts(ctx context.Context, purpose string, ports []string) error {
-	listeners, err := finalizer.config.Runner.Output(ctx, "/usr/bin/ss", "-H", "-lnt")
+	listeners, err := finalizer.config.Runner.Output(ctx, finalizer.platform.ssPath, "-H", "-lnt")
 	if err != nil {
 		return fmt.Errorf("inspect %s ports: %w", purpose, err)
 	}
@@ -128,7 +135,11 @@ func (finalizer *Finalizer) issuePrivateCertificate(access setup.AccessConfigura
 	if err := validatePrivateCertificate(finalizer.config.Paths, access, now); err != nil {
 		return err
 	}
-	for _, surface := range []string{"panel", "admin", "api"} {
+	surfaces := []string{"panel", "admin", "api"}
+	if access.Profile == setup.InstallationProfileManagement {
+		surfaces = []string{"admin"}
+	}
+	for _, surface := range surfaces {
 		if err := createAbsoluteSymlink(finalizer.config.Paths.PrivateCertificate, filepath.Join(finalizer.config.Paths.TLSRoot, surface, "fullchain.pem")); err != nil {
 			return err
 		}

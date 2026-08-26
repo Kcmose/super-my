@@ -1,0 +1,15 @@
+module probe_panel_nginx 1.1;
+
+require {
+    type httpd_t;
+    attribute port_type;
+    class tcp_socket name_bind;
+}
+
+# TCP 18455 is the only Probe-owned network type. TCP 8080 keeps the vendor
+# http_cache_port_t/http_port_t mapping and is reached through the reviewed
+# httpd_can_network_relay boolean managed by the installation helper.
+type probe_panel_ingress_port_t;
+typeattribute probe_panel_ingress_port_t port_type;
+
+allow httpd_t probe_panel_ingress_port_t:tcp_socket name_bind;

@@ -39,12 +39,13 @@ type AuditLogService interface {
 }
 
 type adminManagementHandler struct {
-	logger       *slog.Logger
-	nodes        NodeManagementService
-	users        UserManagementService
-	audit        AuditLogService
-	installer    agentbootstrap.Generator
-	maxBodyBytes int64
+	logger              *slog.Logger
+	nodes               NodeManagementService
+	users               UserManagementService
+	audit               AuditLogService
+	installer           agentbootstrap.Generator
+	agentRuntimeEnabled bool
+	maxBodyBytes        int64
 }
 
 // RegisterAdminManagementRoutes registers the frozen Stage 5 node, user, and
@@ -60,11 +61,15 @@ func RegisterAdminManagementRoutes(
 	maxBodyBytes int64,
 	adminOrigin string,
 	installer agentbootstrap.Generator,
+	agentRuntimeEnabled bool,
 ) {
 	if mux == nil || logger == nil || authService == nil {
 		return
 	}
-	handler := adminManagementHandler{logger: logger, nodes: nodes, users: users, audit: audit, installer: installer, maxBodyBytes: maxBodyBytes}
+	handler := adminManagementHandler{
+		logger: logger, nodes: nodes, users: users, audit: audit, installer: installer,
+		agentRuntimeEnabled: agentRuntimeEnabled, maxBodyBytes: maxBodyBytes,
+	}
 	protect := func(next http.HandlerFunc) http.HandlerFunc {
 		csrfProtected := csrfProtectionMiddleware(logger, authService, adminOrigin, http.HandlerFunc(next))
 		dispatch := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -209,6 +214,11 @@ func (handler adminManagementHandler) deleteNode(writer http.ResponseWriter, req
 }
 
 func (handler adminManagementHandler) createEnrollmentToken(writer http.ResponseWriter, request *http.Request, nodeID string) {
+	if !handler.agentRuntimeEnabled {
+		respond.Error(writer, http.StatusConflict, "agent_not_configured",
+			"Agent integration is not configured", requestIDFromContext(request.Context()))
+		return
+	}
 	createRequest := nodemanagement.CreateEnrollmentTokenRequest{ExpiresInSeconds: 900}
 	if !managementBodyAbsent(request) {
 		body, bodyError := readAuthJSONBody(writer, request, handler.maxBodyBytes)
@@ -237,6 +247,11 @@ func (handler adminManagementHandler) createEnrollmentToken(writer http.Response
 }
 
 func (handler adminManagementHandler) rotateAgentToken(writer http.ResponseWriter, request *http.Request, nodeID string) {
+	if !handler.agentRuntimeEnabled {
+		respond.Error(writer, http.StatusConflict, "agent_not_configured",
+			"Agent integration is not configured", requestIDFromContext(request.Context()))
+		return
+	}
 	if !managementBodyAbsent(request) {
 		writeManagementBodyNotAllowed(writer, request)
 		return

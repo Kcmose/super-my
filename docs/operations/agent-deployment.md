@@ -1,5 +1,7 @@
 # Agent 部署与升级
 
+> 阶段边界：Agent 是第二个独立产品，本轮不随管理端安装。只有管理端已经显式配置 Agent 入口、系统状态不再是 `not_configured`，并能安全签发一次性安装命令后，才执行本文流程；不能从管理端 Release 中寻找 Agent 二进制或下载目录。
+
 Agent 是独立的 Go 工程和 systemd 服务。它只主动访问 `https://<api-host>/api/v1/agent`，不监听端口，不接受服务端反连，也不包含命令、Shell、文件管理、隧道或远程自动升级能力。
 
 ## 1. 支持范围
@@ -24,7 +26,7 @@ systemd：probe-agent.service
 从新的同步源码目录执行：
 
 ```bash
-cd /var/tmp/probe-source-20260823/probe-agent
+cd <source-root>/probe-agent
 go test ./...
 go vet ./...
 CGO_ENABLED=0 go build -trimpath \

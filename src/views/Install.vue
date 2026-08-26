@@ -12,7 +12,7 @@
               </svg>
             </div>
             <div>
-              <h1 class="theme-heading text-xl font-extrabold text-white tracking-tight">PROBE 安全安装向导</h1>
+              <h1 class="theme-heading text-xl font-extrabold text-white tracking-tight">PROBE 管理端安全安装向导</h1>
               <p class="mt-1 text-xs text-slate-400">仅通过 root SSH 转发的服务器私有 Unix Socket 完成首次初始化</p>
             </div>
           </div>
@@ -52,15 +52,7 @@
               </div>
             </div>
 
-            <dl v-if="installedIPResult.confirmed && installedIPResult.access" class="mt-5 grid gap-3 text-xs sm:grid-cols-3">
-              <div class="rounded-lg border border-dark-700 bg-dark-900/80 p-3">
-                <dt class="text-slate-500">游客面板</dt>
-                <dd class="mt-1 break-all font-mono text-slate-300">{{ installedIPResult.access.panel_url }}</dd>
-              </div>
-              <div class="rounded-lg border border-dark-700 bg-dark-900/80 p-3">
-                <dt class="text-slate-500">Agent API</dt>
-                <dd class="mt-1 break-all font-mono text-slate-300">{{ installedIPResult.access.agent_url }}</dd>
-              </div>
+            <dl v-if="installedIPResult.confirmed && installedIPResult.access" class="mt-5 grid gap-3 text-xs sm:grid-cols-1">
               <div class="rounded-lg border border-dark-700 bg-dark-900/80 p-3">
                 <dt class="text-slate-500">管理面板</dt>
                 <dd class="mt-1 break-all font-mono text-slate-300">{{ installedIPResult.access.admin_url }}</dd>
@@ -101,7 +93,7 @@
             <div v-else class="mt-5 rounded-lg border border-dark-700 bg-dark-900/80 p-4 text-[11px] leading-5 text-slate-400">
               <div class="font-medium text-slate-300">root SSH 安全回退</div>
               <p class="mt-1">登录服务器后只筛选公开入口字段，避免显示包含数据库密码的完整环境文件：</p>
-              <code class="mt-2 block overflow-x-auto whitespace-nowrap rounded bg-dark-950 p-2 text-slate-300">grep -E '^PROBE_(INGRESS_MODE|ADMIN_ORIGIN|AGENT_PUBLIC_URL|AGENT_INSTALL_CA_FILE)=' /srv/probe/config/probe-api.env</code>
+              <code class="mt-2 block overflow-x-auto whitespace-nowrap rounded bg-dark-950 p-2 text-slate-300">grep -E '^PROBE_(INGRESS_MODE|ADMIN_ORIGIN)=' /srv/probe/config/probe-api.env</code>
               <code class="mt-2 block overflow-x-auto whitespace-nowrap rounded bg-dark-950 p-2 text-slate-300">systemctl status probe-api nginx --no-pager</code>
             </div>
           </div>
@@ -116,7 +108,7 @@
           <div v-else-if="finishing" class="rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-7 text-center" aria-live="polite">
             <div class="mx-auto h-3 w-3 rounded-full bg-emerald-500 animate-pulse"></div>
             <h2 class="mt-4 text-sm font-bold text-emerald-400">正在完成服务器配置</h2>
-            <p class="mt-2 text-xs leading-5 text-slate-300">系统正在创建数据库、配置安全入口、执行迁移并验证正式服务。请保持此页面打开；域名模式完成后进入登录页，IP 模式会先显示私有 CA 下载与核验步骤。</p>
+              <p class="mt-2 text-xs leading-5 text-slate-300">系统正在创建数据库、配置管理入口、执行迁移并验证正式服务。请保持此页面打开；域名模式完成后进入登录页，IP 模式会先显示私有 CA 下载与核验步骤。</p>
             <p v-if="pollMessage" class="mt-3 text-[11px] text-amber-400">{{ pollMessage }}</p>
           </div>
 
@@ -155,40 +147,32 @@
 
             <section v-else-if="step === 2" aria-labelledby="network-title">
               <h2 id="network-title" class="theme-heading text-base font-bold text-white">配置域名、证书与访问白名单</h2>
-              <p class="mt-1 text-xs leading-5 text-slate-400">三个域名全部留空时使用服务器 IP、固定 HTTPS 端口和本机私有 CA；全部填写时使用三个域名和 ACME 公信证书。</p>
+              <p class="mt-1 text-xs leading-5 text-slate-400">管理域名留空时使用服务器 IP、18455 HTTPS 和本机私有 CA；填写管理域名时使用 ACME 公信证书。</p>
               <div class="mt-5 grid gap-4 sm:grid-cols-2">
                 <div v-if="isIPMode" class="sm:col-span-2">
                   <label for="server-address" class="mb-1 block text-xs font-medium text-slate-300">服务器 IP</label>
                   <input id="server-address" v-model.trim="form.network.address" type="text" autocomplete="off" maxlength="45" class="form-control font-mono" placeholder="服务器自动检测的 IPv4 或 IPv6" @input="networkAddressOverridden = true" />
-                  <p class="mt-1 text-[11px] text-slate-500">默认由服务器检测；使用 NAT 时可覆盖为用户和 Agent 实际访问的规范 IPv4 或 IPv6。端口固定为 18453 / 18454 / 18455。</p>
-                </div>
-                <div>
-                  <label for="panel-domain" class="mb-1 block text-xs font-medium text-slate-300">游客面板域名</label>
-                  <input id="panel-domain" v-model.trim="form.domains.panel" type="text" autocomplete="url" maxlength="253" class="form-control" placeholder="留空使用 IP，或填写 panel.example.com" />
+                  <p class="mt-1 text-[11px] text-slate-500">默认由服务器检测；使用 NAT 时可覆盖为管理员实际访问的规范 IPv4 或 IPv6。管理端口固定为 18455。</p>
                 </div>
                 <div>
                   <label for="admin-domain" class="mb-1 block text-xs font-medium text-slate-300">管理面板域名</label>
                   <input id="admin-domain" v-model.trim="form.domains.admin" type="text" autocomplete="url" maxlength="253" class="form-control" placeholder="留空使用 IP，或填写 admin.example.com" />
                 </div>
                 <div>
-                  <label for="agent-domain" class="mb-1 block text-xs font-medium text-slate-300">Agent API 域名</label>
-                  <input id="agent-domain" v-model.trim="form.domains.agent" type="text" autocomplete="url" maxlength="253" class="form-control" placeholder="留空使用 IP，或填写 api.example.com" />
-                </div>
-                <div>
                   <label for="acme-email" class="mb-1 block text-xs font-medium text-slate-300">ACME 证书通知邮箱</label>
                   <input id="acme-email" v-model.trim="form.tls.email" type="email" autocomplete="email" maxlength="254" class="form-control disabled:cursor-not-allowed disabled:opacity-50" :disabled="isIPMode" :placeholder="isIPMode ? 'IP 模式不需要 ACME 邮箱' : 'admin@example.com'" />
                 </div>
                 <div class="sm:col-span-2">
-                  <label for="allowlist" class="mb-1 block text-xs font-medium text-slate-300">游客与管理面板访问白名单</label>
+                  <label for="allowlist" class="mb-1 block text-xs font-medium text-slate-300">管理面板访问白名单</label>
                   <textarea id="allowlist" v-model="allowlistText" rows="5" spellcheck="false" class="form-control font-mono" placeholder="203.0.113.25/32&#10;2001:db8:1234::/48"></textarea>
-                  <p class="mt-1 text-[11px] text-slate-500">每行一个 IPv4、IPv6 或 CIDR。禁止使用 0.0.0.0/0 和 ::/0；Agent API 不受此白名单限制。</p>
+                  <p class="mt-1 text-[11px] text-slate-500">每行一个 IPv4、IPv6 或 CIDR。禁止使用 0.0.0.0/0 和 ::/0。本向导只配置管理面板入口。</p>
                 </div>
               </div>
             </section>
 
             <section v-else-if="step === 3" aria-labelledby="administrator-title">
               <h2 id="administrator-title" class="theme-heading text-base font-bold text-white">创建首个管理员</h2>
-              <p class="mt-1 text-xs leading-5 text-slate-400">系统只创建管理员账户。游客打开独立前端即可查看，不需要账号或密码。</p>
+              <p class="mt-1 text-xs leading-5 text-slate-400">本次只创建管理端的首个管理员。</p>
               <div class="mt-5 grid gap-4 sm:grid-cols-2">
                 <div class="sm:col-span-2">
                   <label for="administrator-username" class="mb-1 block text-xs font-medium text-slate-300">管理员用户名</label>
@@ -218,11 +202,9 @@
                   <dd class="mt-1 font-mono text-slate-300">{{ payload.administrator.username }}</dd>
                 </div>
                 <div class="rounded-lg border border-dark-700 bg-dark-900/80 p-3 sm:col-span-2">
-                  <dt class="text-slate-500">{{ isIPMode ? '默认 IP HTTPS 入口' : '三个域名 HTTPS 入口' }}</dt>
+                  <dt class="text-slate-500">{{ isIPMode ? '默认 IP HTTPS 入口' : '管理域名 HTTPS 入口' }}</dt>
                   <dd class="mt-1 space-y-1 font-mono text-slate-300">
-                    <div>{{ effectiveURLs.panel_url }}</div>
                     <div>{{ effectiveURLs.admin_url }}</div>
-                    <div>{{ effectiveURLs.agent_url }}</div>
                   </dd>
                 </div>
                 <div class="rounded-lg border border-dark-700 bg-dark-900/80 p-3">
@@ -235,7 +217,7 @@
                 </div>
               </dl>
               <div class="mt-4 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-[11px] leading-5 text-amber-300">
-                {{ isIPMode ? '提交前请确认显示的服务器 IP 可从用户和 Agent 网络访问；安装后浏览器需要信任本机私有 CA。' : '提交前请确认三个域名 DNS 已生效、服务器公网 80/443 可达。' }} 请保持 SSH 隧道连接。
+                {{ isIPMode ? '提交前请确认显示的服务器 IP 可从管理员网络访问；安装后浏览器需要信任本机私有 CA。' : '提交前请确认管理域名 DNS 已生效、服务器公网 80/443 可达。' }} 请保持 SSH 隧道连接。
               </div>
             </section>
 
@@ -313,9 +295,7 @@ const form = reactive({
   },
   network: { address: '' },
   domains: {
-    panel: '',
     admin: '',
-    agent: '',
   },
   tls: { email: '' },
   administrator: {
@@ -339,18 +319,10 @@ watch(isIPMode, (enabled) => {
 })
 const effectiveURLs = computed(() => {
   if (!isIPMode.value) {
-    return {
-      panel_url: payload.value.domains.panel ? `https://${payload.value.domains.panel}` : '尚未填写',
-      agent_url: payload.value.domains.agent ? `https://${payload.value.domains.agent}` : '尚未填写',
-      admin_url: payload.value.domains.admin ? `https://${payload.value.domains.admin}` : '尚未填写',
-    }
+    return { admin_url: payload.value.domains.admin ? `https://${payload.value.domains.admin}` : '尚未填写' }
   }
   if (setupDefaults.value?.server_ip === payload.value.network.address) return setupDefaults.value
-  return setupIPURLs(payload.value.network.address) || {
-    panel_url: '服务器 IP 无效',
-    agent_url: '服务器 IP 无效',
-    admin_url: '服务器 IP 无效',
-  }
+  return setupIPURLs(payload.value.network.address) || { admin_url: '服务器 IP 无效' }
 })
 const isRecovery = computed(() => serverStatus.value === 'recovery_required')
 const statusLabel = computed(() => ({
@@ -517,6 +489,18 @@ async function pollInstallationStatus() {
     if (serverStatus.value === 'recovery_required') {
       finishing.value = false
       clearCurrentSession()
+      return
+    }
+    if (serverStatus.value === 'pending' || serverStatus.value === 'configuring') {
+      finishing.value = false
+      clearCurrentSession()
+      clearFormSecrets()
+      try {
+        await establishSetupSession()
+        errorMessage.value = '服务器预检未通过，尚未接管正式服务。请检查域名解析、端口占用和现有 Nginx 状态，修正配置并重新输入密码后再提交。'
+      } catch (sessionError) {
+        errorMessage.value = `服务器预检未通过，重新建立安全会话失败：${sessionError?.message || '请检查 SSH 隧道后重试'}`
+      }
       return
     }
     scheduleStatusPoll()

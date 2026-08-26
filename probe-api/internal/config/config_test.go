@@ -15,6 +15,7 @@ import (
 )
 
 func TestLoadDefaults(t *testing.T) {
+	t.Setenv("PROBE_INSTALLATION_PROFILE", "")
 	t.Setenv("PROBE_API_LISTEN_ADDR", "")
 	t.Setenv("PROBE_DATABASE_URL", "")
 	t.Setenv("PROBE_LOG_LEVEL", "")
@@ -38,6 +39,51 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if err := cfg.ValidateServe(); err == nil {
 		t.Fatal("ValidateServe() accepted the example Agent origin")
+	}
+}
+
+func TestLoadManagementProfileAllowsAgentBootstrapToRemainUnconfigured(t *testing.T) {
+	t.Setenv("PROBE_INSTALLATION_PROFILE", "management")
+	t.Setenv("PROBE_AGENT_PUBLIC_URL", "")
+	t.Setenv("PROBE_AGENT_INSTALLER_URL", "")
+	t.Setenv("PROBE_AGENT_INSTALL_CA_FILE", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() rejected an Agent-free management profile: %v", err)
+	}
+	if cfg.AgentPublicURL != "" || cfg.AgentInstallerURL != "" || cfg.AgentRuntimeEnabled() {
+		t.Fatalf("management Agent state = url=%q installer=%q enabled=%t",
+			cfg.AgentPublicURL, cfg.AgentInstallerURL, cfg.AgentRuntimeEnabled())
+	}
+	if err := cfg.ValidateServe(); err != nil {
+		t.Fatalf("ValidateServe() rejected the management-only profile: %v", err)
+	}
+
+	t.Setenv("PROBE_AGENT_PUBLIC_URL", "https://agent.example.net:8443")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() accepted a partial management Agent bootstrap configuration")
+	}
+
+	t.Setenv("PROBE_AGENT_INSTALLER_URL", defaultAgentInstallerURL)
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() accepted a management Agent origin different from the management origin")
+	}
+	t.Setenv("PROBE_ADMIN_ORIGIN", "https://agent.example.net:8443")
+	t.Setenv("PROBE_INGRESS_MODE", "domain")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() rejected a complete management Agent bootstrap configuration: %v", err)
+	}
+	if !cfg.AgentRuntimeEnabled() {
+		t.Fatal("complete management Agent bootstrap configuration did not enable Agent runtime")
+	}
+}
+
+func TestLoadRejectsUnknownInstallationProfile(t *testing.T) {
+	t.Setenv("PROBE_INSTALLATION_PROFILE", "everything")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() accepted an unknown installation profile")
 	}
 }
 

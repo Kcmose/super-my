@@ -1,12 +1,30 @@
-# V1 最终架构与边界（v1.1 入口修订）
+# 架构与三产品部署边界
 
-状态：阶段 0 冻结稿；v1.0 原三域名入口在 v1.1 扩展为下述 `domain`/`ip` 二选一模式，本文以 v1.1 当前契约为准。
+状态：2026-08-25 产品拆分修订。与历史 `v1.1` 全量 Release 或本文旧段落冲突时，以本节的三产品独立安装规则为准。
 
-适用范围：`probe-agent/`、`probe-api/`、`probe-web/`、`probe-admin/` 及其部署配置
+适用范围：`probe-agent/`、`probe-api/`、`probe-web/`、`probe-admin/` 及各自的发行、安装和运行配置。
 
 ## 1. 架构决策
 
-V1 由六个独立部分组成：
+### 1.1 对外产品边界
+
+源码工程与对外安装产品不是同一个划分维度。对外固定为三个产品：
+
+| 产品 | 包含源码工程 | 不包含 | 当前顺序 |
+| --- | --- | --- | ---: |
+| 管理端 | 分别构建的 `probe-admin`、`probe-api`，以及迁移、Setup、PostgreSQL/Nginx 配置 | `probe-web`、`probe-agent` 和 Agent 下载目录 | 1 |
+| Agent | `probe-agent` 及其独立安装资产 | 任一前端、API 服务端和数据库 | 2 |
+| 访客前端 | `probe-web` 静态产物及只读 API 接入配置 | 管理 SPA、API 服务端、Agent | 3 |
+
+三者各有独立 Release、安装器、升级、回滚、卸载和验收。管理 SPA 与 API 配套交付不改变其源码和构建边界：API 仍不嵌入 SPA。
+
+固定实施顺序是：先安装管理端并创建管理员；再在管理界面创建节点、保存 Agent 采集参数；然后在目标服务器安装独立 Agent；最后才按需安装访客前端。管理端未配置全局 Agent 入口时，Agent 路由、Token 和安装命令失败关闭。
+
+管理端首次安装只建立一个管理入口：域名模式使用一个管理域名，IP 模式只使用 `18455`。历史游客 `18453`、Agent `18454` 和三域名不是管理端安装的前置条件。当前管理 IP 模式允许与配置有效的既有 Nginx 共存；管理域名模式仍使用独占 ACME，不能宣称与 active Nginx 共存。
+
+### 1.2 最终运行时组成
+
+三个产品都按需安装并完成显式接入后，最终运行态由六个独立部分组成：
 
 - `probe-agent`：Go 编写的 Linux 探针，只主动拉取配置和上报数据。
 - `probe-api`：Go `net/http` API，负责认证、授权、数据写入、查询、聚合、清理和审计。
@@ -15,7 +33,9 @@ V1 由六个独立部分组成：
 - PostgreSQL：唯一持久化数据库。
 - Nginx：唯一公网入口，负责 TLS、管理入口 IP/CIDR 白名单、反向代理、静态文件和基础限流。
 
-两个浏览器入口都固定为同源模式且互不共享静态产物。`PROBE_INGRESS_MODE=domain` 使用三个公信 HTTPS Host 和 80/443；`PROBE_INGRESS_MODE=ip` 使用同一规范 IP 的三个固定 HTTPS 端口：游客 18453、Agent 18454、管理 18455，并使用含该 IP SAN 的固定私有 CA 证书。两种模式只能选一个，都是生产契约，不得混用监听、Origin、Nginx 模板或 TLS 材料。
+两个浏览器入口都固定为同源模式且互不共享静态产物。下图和后续三入口说明描述的是三个产品全部接入后的目标运行态，不表示一个安装包会同时创建这些入口。各产品必须只增加自己拥有的入口和资产。
+
+最终目标可选择三个公信 HTTPS Host，或使用同一规范 IP 上彼此独立的端口：游客 18453、Agent 18454、管理 18455。后续 Agent、访客产品的入口细节必须在各自阶段单独冻结和验收，不能依赖旧全量安装器自动补齐。
 
 匿名游客通过游客入口只获得 `probe-web` 和 `/api/v1/panel/*`；管理员通过管理入口只获得 `probe-admin`、`/api/v1/auth/*`、`/api/v1/admin/*` 以及管理页面所需的只读 `/api/v1/panel/*`。两者都必须通过同一严格 IP/CIDR 白名单；游客匿名不代表公网开放。Agent 入口只暴露 Agent API、固定下载资产和默认关闭的可选 public API。任一前端都不跨入口调用其他逻辑入口。
 
@@ -82,7 +102,7 @@ mianban/
 2. `probe-api` 不使用 `embed` 或其他方式打包 `probe-web` 或 `probe-admin`；Nginx 分别服务两套静态文件和代理 API。
 3. `probe-web` 与 `probe-admin` 不相互导入、不导入 Go 源码、不连接 PostgreSQL，只依赖冻结的 HTTP/OpenAPI 契约。
 4. `probe-agent` 不依赖 `probe-api`、`probe-web` 或 `probe-admin` 的实现代码；共享概念通过协议文档表达，不通过跨目录源码引用表达。
-5. 迁移文件、OpenAPI 和 API 部署配置归 `probe-api/`；Agent 的 systemd 单元归 `probe-agent/`；游客和管理前端各自维护静态部署元数据。Nginx 同时配置三个入口，以 `probe-api/deploy/nginx/` 作为服务端接入层配置的归属。
+5. 迁移文件、OpenAPI 和 API 部署配置归 `probe-api/`；Agent 的 systemd 单元归 `probe-agent/`；游客和管理前端各自维护静态部署元数据。每个产品只安装自己拥有的 Nginx 片段；管理端阶段不得提前创建游客/Agent 入口或占位目录。
 6. 本地真实系统只保存源码和必要文档；依赖安装、测试、构建、运行及部署只在 Debian 13 虚拟机进行。
 
 ## 3. 运行时与允许的依赖方向
@@ -106,7 +126,7 @@ mianban/
 
 ## 4. Nginx 入口与路由边界
 
-下列三节表达逻辑入口。域名模式分别映射到 `panel.example.com`、`admin.example.com`、`api.example.com`，使用公信证书和 TCP 80/443；IP 模式分别映射到同一 IP 的 TCP 18453、18455、18454，使用固定私有 CA 签发的 IP SAN 证书。两种模式的路由权限不变。IP 模式中 Cookie 不按端口隔离，因此游客和 Agent 入口还必须清空上游 `Cookie` 并隐藏 `Set-Cookie`。
+下列三节表达三个产品全部接入后的逻辑入口，不是管理端安装器的输出清单。管理端当前只创建管理逻辑入口；Agent 和游客入口由各自后续安装/接入流程创建。域名最终态可分别映射到 `panel.example.com`、`admin.example.com`、`api.example.com`；IP 最终态可分别映射到同一 IP 的 TCP 18453、18455、18454。IP 模式中 Cookie 不按端口隔离，因此后续游客和 Agent 入口还必须清空上游 `Cookie` 并隐藏 `Set-Cookie`。
 
 ### 游客逻辑入口（`panel.example.com` 或 `IP:18453`）
 
@@ -212,7 +232,11 @@ V1 不引入 Redis、消息队列、ClickHouse、TimescaleDB、独立任务队�
 
 ## 9. 架构验收不变量
 
-- Nginx 只监听当前模式的入口端口：`domain` 为 80/443，`ip` 为 18453/18454/18455；关闭当前这组入口后，外部无法直接访问面板或 Agent API。API 8080 与 PostgreSQL 5432 始终只在 loopback。
+- 管理端独立安装包只能含 API、管理 SPA、迁移和管理部署资产；对包内容做负向检查，`probe-web`、`probe-agent`、Agent 下载目录及 full 专用入口资产必须不存在。
+- 管理端 IP 模式只新增 `18455`；既有 Nginx 的其他监听、站点、启用状态和 Certbot 状态不因管理端安装或失败回滚被停止、禁用或删除。管理域名模式在实现安全共存前必须明确拒绝 active Nginx/被占用的 80/443。
+- Finalizer 在接管正式资产前完成端口/DNS、目标路径、目录属主与权限、PostgreSQL 名称、现有 Nginx 状态和 Certbot 单元/证书命名空间状态的只读预检。此阶段失败只允许 `finalizing -> configuring` 重试，并保持 root 私有 Setup Socket 可用；只有 `installed` 或 `recovery_required` 才在 30 秒交接窗口后关闭 Setup。开始持久变更后的失败只能进入 `recovery_required`。生成 Probe 配置/证书后、创建数据库前还要把管理片段临时接入现有配置树做组合 `nginx -t`；该检查失败保留恢复现场，但不会创建数据库角色或管理员。
+- 管理端未配置 Agent 接入时不注册 `/api/v1/agent/*`，不签发注册命令或 Agent Token，但仍允许创建节点和保存结构化采集参数。
+- 三个产品全部安装后的最终入口才可能是域名 80/443 或 IP 18453/18454/18455；任何单个安装器只能管理本产品拥有的入口。API 8080 与 PostgreSQL 5432 始终只在 loopback。
 - 非白名单来源无法从 panel 或 admin Host 取得 HTML、JS、CSS，也无法调用 `/panel/*`、`/auth/*` 或 `/admin/*`。
 - 非白名单来源可到达 Agent API，但缺少有效 Agent 凭据时必须失败。
 - 伪造 `X-Forwarded-For`、`X-Real-IP` 等请求头不能改变白名单判定结果。

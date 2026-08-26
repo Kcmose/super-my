@@ -35,22 +35,43 @@ func loadInstalledAccess(path string) (installedAccessMetadata, error) {
 		}
 		key := string(keyBytes)
 		switch key {
-		case "PROBE_INGRESS_MODE", "PROBE_ADMIN_ORIGIN", "PROBE_AGENT_PUBLIC_URL", "PROBE_AGENT_INSTALL_CA_FILE":
+		case "PROBE_INSTALLATION_PROFILE", "PROBE_INGRESS_MODE", "PROBE_ADMIN_ORIGIN", "PROBE_AGENT_PUBLIC_URL", "PROBE_AGENT_INSTALLER_URL", "PROBE_AGENT_INSTALL_CA_FILE":
 			if _, exists := wanted[key]; exists {
 				return installedAccessMetadata{}, errors.New("installed API environment contains a duplicate handoff key")
 			}
 			wanted[key] = string(value)
 		}
 	}
-	for _, key := range []string{"PROBE_INGRESS_MODE", "PROBE_ADMIN_ORIGIN", "PROBE_AGENT_PUBLIC_URL", "PROBE_AGENT_INSTALL_CA_FILE"} {
+	for _, key := range []string{"PROBE_INGRESS_MODE", "PROBE_ADMIN_ORIGIN"} {
 		if _, exists := wanted[key]; !exists {
 			return installedAccessMetadata{}, errors.New("installed API environment is missing handoff metadata")
+		}
+	}
+	profile := InstallationProfileFull
+	if value, exists := wanted["PROBE_INSTALLATION_PROFILE"]; exists {
+		profile, err = ParseInstallationProfile(value)
+		if err != nil {
+			return installedAccessMetadata{}, errors.New("installed setup profile is invalid")
+		}
+	}
+	if profile == InstallationProfileFull {
+		for _, key := range []string{"PROBE_AGENT_PUBLIC_URL", "PROBE_AGENT_INSTALL_CA_FILE"} {
+			if _, exists := wanted[key]; !exists {
+				return installedAccessMetadata{}, errors.New("installed API environment is missing handoff metadata")
+			}
 		}
 	}
 
 	mode := IngressMode(wanted["PROBE_INGRESS_MODE"])
 	switch mode {
 	case IngressModeIP:
+		if profile == InstallationProfileManagement {
+			_, adminOrigin, err := validateInstalledIPOrigin(wanted["PROBE_ADMIN_ORIGIN"], AdminHTTPSPort)
+			if err != nil {
+				return installedAccessMetadata{}, err
+			}
+			return installedAccessMetadata{Mode: mode, AdminURL: adminOrigin + "/login"}, nil
+		}
 		if wanted["PROBE_AGENT_INSTALL_CA_FILE"] != DefaultPrivateCACertificatePath {
 			return installedAccessMetadata{}, errors.New("installed private CA path is invalid")
 		}
@@ -64,6 +85,13 @@ func loadInstalledAccess(path string) (installedAccessMetadata, error) {
 		}
 		return installedAccessMetadata{Mode: mode, AdminURL: adminOrigin + "/login"}, nil
 	case IngressModeDomain:
+		if profile == InstallationProfileManagement {
+			adminOrigin, err := validateInstalledDomainOrigin(wanted["PROBE_ADMIN_ORIGIN"])
+			if err != nil {
+				return installedAccessMetadata{}, err
+			}
+			return installedAccessMetadata{Mode: mode, AdminURL: adminOrigin + "/login"}, nil
+		}
 		if wanted["PROBE_AGENT_INSTALL_CA_FILE"] != "" {
 			return installedAccessMetadata{}, errors.New("installed domain mode unexpectedly configures a private CA")
 		}

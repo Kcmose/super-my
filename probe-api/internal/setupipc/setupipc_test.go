@@ -376,6 +376,30 @@ func TestRequestCodecRoundTripsPrivateCAIPv6Ingress(t *testing.T) {
 	}
 }
 
+func TestRequestCodecPreservesFixedManagementProfile(t *testing.T) {
+	request := validRequest()
+	request.Profile = setup.InstallationProfileManagement
+	request.Domains = setup.DomainInput{Admin: "admin.monitor.test"}
+	defer request.ClearSecrets()
+	encoded, err := encodeCompleteRequest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := setup.DecodeCompleteRequest(encoded)
+	clear(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer decoded.ClearSecrets()
+	access, err := decoded.AccessConfiguration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Profile != setup.InstallationProfileManagement || access.Profile != setup.InstallationProfileManagement || access.AdminOrigin != "https://admin.monitor.test" || access.PanelOrigin != "" || access.AgentOrigin != "" {
+		t.Fatalf("management IPC access = %#v", access)
+	}
+}
+
 func TestResultCodecIsStrictAndNeverAcceptsArbitrarySecret(t *testing.T) {
 	secret := "A-Unique-Administrator-Password-5678"
 	tests := []string{

@@ -56,14 +56,23 @@ func encodeCompleteRequest(request setup.CompleteRequest) ([]byte, error) {
 	if err := request.Validate(); err != nil {
 		return nil, ErrProtocol
 	}
+	profile, err := request.EffectiveProfile()
+	if err != nil {
+		return nil, ErrProtocol
+	}
 
 	// The setup validator bounds every field well below 64 KiB. Reserving the
 	// entire protocol limit prevents append from abandoning an older backing
 	// array that already contains plaintext before the final buffer is cleared.
 	encoded := make([]byte, 0, int(maxRequestBytes))
-	var err error
+	encoded = append(encoded, `{"profile":`...)
+	encoded, err = appendJSONString(encoded, []byte(profile))
+	if err != nil {
+		clear(encoded)
+		return nil, ErrProtocol
+	}
 
-	encoded = append(encoded, `{"database":{"mode":`...)
+	encoded = append(encoded, `,"database":{"mode":`...)
 	encoded, err = appendJSONString(encoded, []byte(request.Database.Mode))
 	if err != nil {
 		clear(encoded)

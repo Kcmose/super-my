@@ -1,0 +1,29 @@
+[Unit]
+Description=Probe Panel Go API (systemd 219 profile)
+After=network-online.target postgresql.service
+Wants=network-online.target postgresql.service
+
+[Service]
+Type=simple
+User=probe-api
+Group=probe-api
+EnvironmentFile=/srv/probe/config/probe-api.env
+ExecStart=/srv/probe/api/probe-api serve
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+UMask=0077
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+PrivateDevices=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadOnlyPaths=/srv/probe
+ReadOnlyPaths=/etc/probe-panel
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

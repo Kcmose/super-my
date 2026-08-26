@@ -2560,7 +2560,7 @@ install_service_assets() {
     # Keep the management-only lifecycle tools on the installed host.  They
     # consume the same reviewed runtime helper as install-release.sh, so host
     # validation and ordinary uninstall never fall back to the historical
-    # Debian-13/full-source deployment path.
+    # Debian-13/source-built deployment path.
     install -d -o root -g root -m 0755 -- "$PROBE_MANAGEMENT_LIB_DIR"
     local lifecycle_name lifecycle_source lifecycle_destination lifecycle_tmp
     local lifecycle_hash lifecycle_manifest_tmp

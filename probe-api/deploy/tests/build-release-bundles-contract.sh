@@ -434,6 +434,9 @@ for contract in \
     '$bundle_root/source/probe-api/deploy/scripts/install-release.sh' \
     'copy_management_runtime_script' \
     'runtime_functions=' \
+    'could not extract the reviewed management runtime header' \
+    'generated management runtime contains an unreviewed ProtectSystem=full occurrence' \
+    'ProtectSystem=reviewed-legacy-hardening' \
     '$0 !~ /^MANAGEMENT_ROLLBACK_(RELEASE_PROFILE|OLD_AGENT|OLD_WEB)=/' \
     'parse_management_os_release_token parse_management_os_release_name management_platform_id_from_release' \
     'management_platform_systemd_profile management_platform_systemd_minimum' \
@@ -479,6 +482,67 @@ for contract in \
     'No GitHub release was created or modified.'; do
     assert_contains "$contract" "$BUILDER"
 done
+
+assert_contains '"$api_source_root/deploy/scripts/deploy-common.sh"' "$BUILDER"
+
+# Exercise the actual runtime extractor. This catches drift between the
+# allowlisted functions and the final management-only scan before the release
+# builder recursively reaches this contract during a full candidate build.
+GENERATED_MANAGEMENT_RUNTIME=$TEST_ROOT/generated-management-runtime.sh
+/bin/bash -c '
+    set -Eeuo pipefail
+    source "$1"
+    copy_management_runtime_script "$2" "$3" "$4"
+    [[ -f "$4" && ! -L "$4" ]]
+    [[ "$(grep -Foc "ProtectSystem=full" "$4")" == 2 ]]
+    grep -Fxq "        grep -Fxq '\''ProtectSystem=full'\'' \"\$unit_file\" || die \"legacy probe-api unit must protect the system\"" "$4"
+    grep -Fxq "        grep -Fxq '\''ProtectSystem=full'\'' \"\$service_file\" ||" "$4"
+    ! grep -Fq "full-source" "$4"
+' probe-runtime-extractor-contract "$BUILDER" "$DEPLOY_COMMON" \
+    "$MANAGEMENT_RUNTIME" "$GENERATED_MANAGEMENT_RUNTIME" ||
+    fail 'management runtime extractor rejected its reviewed systemd legacy hardening checks'
+
+TAINTED_MANAGEMENT_RUNTIME=$TEST_ROOT/tainted-management-runtime.sh
+cp -- "$MANAGEMENT_RUNTIME" "$TAINTED_MANAGEMENT_RUNTIME"
+printf '\n%s\n' '# independent full release profile concern' >> "$TAINTED_MANAGEMENT_RUNTIME"
+if /bin/bash -c '
+    set -Eeuo pipefail
+    source "$1"
+    copy_management_runtime_script "$2" "$3" "$4"
+' probe-runtime-full-reject "$BUILDER" "$DEPLOY_COMMON" \
+    "$TAINTED_MANAGEMENT_RUNTIME" "$TEST_ROOT/tainted-generated.sh" \
+    >/dev/null 2>&1; then
+    fail 'management runtime extractor accepted an independent full-profile concern'
+fi
+
+EXTRA_HARDENING_RUNTIME=$TEST_ROOT/extra-hardening-runtime.sh
+cp -- "$MANAGEMENT_RUNTIME" "$EXTRA_HARDENING_RUNTIME"
+printf '\n%s\n' '# ProtectSystem=full' >> "$EXTRA_HARDENING_RUNTIME"
+if /bin/bash -c '
+    set -Eeuo pipefail
+    source "$1"
+    copy_management_runtime_script "$2" "$3" "$4"
+' probe-runtime-hardening-reject "$BUILDER" "$DEPLOY_COMMON" \
+    "$EXTRA_HARDENING_RUNTIME" "$TEST_ROOT/extra-hardening-generated.sh" \
+    >/dev/null 2>&1; then
+    fail 'management runtime extractor accepted an unreviewed ProtectSystem=full occurrence'
+fi
+
+BROKEN_BOUNDARY_COMMON=$TEST_ROOT/broken-boundary-deploy-common.sh
+sed 's/^cleanup_deploy_work_root() {/missing_deploy_work_root_boundary() {/' \
+    "$DEPLOY_COMMON" > "$BROKEN_BOUNDARY_COMMON"
+if /bin/bash -c '
+    set -Eeuo pipefail
+    source "$1"
+    copy_management_runtime_script "$2" "$3" "$4"
+' probe-runtime-boundary-reject "$BUILDER" "$BROKEN_BOUNDARY_COMMON" \
+    "$MANAGEMENT_RUNTIME" "$TEST_ROOT/broken-boundary-generated.sh" \
+    >"$TEST_ROOT/broken-boundary.stdout" 2>"$TEST_ROOT/broken-boundary.stderr"; then
+    fail 'management runtime extractor accepted a missing header boundary'
+fi
+grep -Fq 'could not extract the reviewed management runtime header' \
+    "$TEST_ROOT/broken-boundary.stderr" ||
+    fail 'management runtime extractor did not fail closed at its missing header boundary'
 
 if grep -Eq '^[[:space:]]*(cp|install)[[:space:]].*\$(\{)?(SUPER_MY_ROOT|ADMIN_ROOT|WEB_ROOT|AGENT_ROOT)' "$BUILDER"; then
     fail 'release builder must not stage source content from a live working tree'

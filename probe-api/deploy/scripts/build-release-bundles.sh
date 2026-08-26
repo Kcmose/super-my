@@ -490,7 +490,7 @@ stage_repository_commit() {
 
 copy_management_runtime_script() {
     local common_source="$1" management_source="$2" destination="$3"
-    local runtime_functions
+    local runtime_functions legacy_hardening_count scan_source scan_status
     runtime_functions='log warn die require_root validate_management_platform_id parse_management_os_release_token parse_management_os_release_name management_platform_id_from_release management_platform_nginx_dialect management_platform_systemd_profile management_platform_systemd_minimum management_platform_package_family management_platform_postgres_service management_platform_certbot_timer management_platform_postgres_bin_dir assert_runtime_platform_contract initialize_runtime_platform_contract runtime_platform_id runtime_systemd_profile runtime_postgres_service runtime_certbot_timer runtime_account_family runtime_postgres_command require_runtime_postgres_commands management_platform_id_from_os_release require_supported_runtime_platform require_commands acquire_root_lock acquire_deployment_lock login_defs_number assert_probe_api_service_account prepare_probe_api_service_account run_as_probe_api_no_environment canonical_directory clear_exported_probe_environment assert_secure_file assert_private_file assert_public_root_file require_integer_between canonical_ip_from_origin validate_closed_install_routes validate_management_nginx_fragment_structure validate_management_release_platform validate_allowlist_with_binary validate_static_artifact install_example_file selected_systemd_asset_name management_service_asset_paths validate_management_service_asset_kind management_service_asset_kind_matches validate_management_service_asset_snapshot_root remove_management_service_asset_temporaries cleanup_failed_service_asset_snapshot snapshot_management_service_assets restore_management_service_assets discard_management_service_asset_snapshot management_systemd_property capture_management_unit_activity capture_management_service_activity stop_management_unit_to_inactive restore_management_service_activity restore_management_postgres_activity run_management_rollback_step install_service_assets validate_systemd_unit_source validate_backup_unit_source verify_source_systemd_units validate_backup_service_assets validate_backup_credentials acquire_database_maintenance_lock assert_switchable_path atomic_release_link current_release_target create_database_backup persist_native_nginx_service run_migrations management_installed_nginx_template management_lifecycle_asset_names validate_management_lifecycle_manifest validate_management_lifecycle_assets validate_installed_management_host'
 
     {
@@ -501,13 +501,28 @@ copy_management_runtime_script() {
             '# Generated from reviewed source functions; never edit the bundled copy.' \
             ''
         awk '
-            /^set -Eeuo pipefail$/ { copying=1 }
-            /^cleanup_deploy_work_root\(\)/ { exit }
+            /^set -Eeuo pipefail$/ {
+                starts++
+                if (starts == 1 && boundaries == 0) copying=1
+                else invalid=1
+            }
+            /^cleanup_deploy_work_root\(\) \{$/ {
+                boundaries++
+                if (starts != 1 || !copying || boundaries != 1) invalid=1
+                copying=0
+                next
+            }
             copying &&
                 $0 !~ /^#/ &&
                 $0 !~ /^MANAGEMENT_ROLLBACK_(RELEASE_PROFILE|OLD_AGENT|OLD_WEB)=/ { print }
+            END {
+                if (starts != 1 || boundaries != 1 || invalid || copying) exit 30
+            }
         ' "$common_source"
-    } > "$destination"
+    } > "$destination" || {
+        rm -f -- "$destination"
+        die "could not extract the reviewed management runtime header"
+    }
     awk -v wanted="$runtime_functions" '
         BEGIN {
             count=split(wanted, names, / +/)
@@ -647,10 +662,47 @@ copy_management_runtime_script() {
     fi
     rm -rf -- "$selftest_root"
 
-    if grep -Eiq 'MANAGEMENT_BUNDLE_EXCLUDE|build_release_artifacts|deploy_release\(\)|npm[[:space:]]+run[[:space:]]+build|[.]/cmd/probe-agent|artifacts/(agent|web)|PROBE_(AGENT|WEB)_DIR|old_(agent|web)|probe-web|/srv/probe/(agent|web)|(^|[^[:alnum:]_])full([^[:alnum:]_]|$)' "$destination"; then
+    # CentOS 7's systemd 219 supports ProtectSystem=full but not strict.  Keep
+    # the two reviewed legacy hardening assertions without allowing that
+    # systemd value to become a blanket exception to the management-only scan.
+    grep -Fxq \
+        "        grep -Fxq 'ProtectSystem=full' \"\$unit_file\" || die \"legacy probe-api unit must protect the system\"" \
+        "$destination" || {
         rm -f -- "$destination"
-        die "management runtime deploy helper still contains forbidden full, Agent-artifact, visitor, or build logic"
-    fi
+        die "generated management runtime is missing the reviewed legacy API hardening assertion"
+    }
+    grep -Fxq \
+        "        grep -Fxq 'ProtectSystem=full' \"\$service_file\" ||" \
+        "$destination" || {
+        rm -f -- "$destination"
+        die "generated management runtime is missing the reviewed legacy backup hardening assertion"
+    }
+    legacy_hardening_count="$(grep -Foc 'ProtectSystem=full' "$destination")"
+    [[ "$legacy_hardening_count" == 2 ]] || {
+        rm -f -- "$destination"
+        die "generated management runtime contains an unreviewed ProtectSystem=full occurrence"
+    }
+
+    scan_source="${destination}.management-only-scan"
+    sed 's/ProtectSystem=full/ProtectSystem=reviewed-legacy-hardening/g' \
+        "$destination" > "$scan_source" || {
+        rm -f -- "$scan_source" "$destination"
+        die "could not prepare the generated management runtime content scan"
+    }
+    scan_status=0
+    grep -Eiq 'MANAGEMENT_BUNDLE_EXCLUDE|build_release_artifacts|deploy_release\(\)|npm[[:space:]]+run[[:space:]]+build|[.]/cmd/probe-agent|artifacts/(agent|web)|PROBE_(AGENT|WEB)_DIR|old_(agent|web)|probe-web|/srv/probe/(agent|web)|(^|[^[:alnum:]_])full([^[:alnum:]_]|$)' \
+        "$scan_source" || scan_status=$?
+    case "$scan_status" in
+        0)
+            rm -f -- "$scan_source" "$destination"
+            die "management runtime deploy helper still contains forbidden full, Agent-artifact, visitor, or build logic"
+            ;;
+        1) rm -f -- "$scan_source" ;;
+        *)
+            rm -f -- "$scan_source" "$destination"
+            die "could not scan the generated management runtime for forbidden release logic"
+            ;;
+    esac
 }
 
 assert_no_links_or_maps() {

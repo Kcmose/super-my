@@ -63,6 +63,8 @@ assert_contains '"upgrade_from_release": "v1.2.0"' "$SUPPORT_POLICY"
 assert_contains '"promotion_eligible": false' "$SUPPORT_LEDGER"
 assert_contains '"release-assets"' "$SUPPORT_GATE"
 assert_contains '"source-commit"' "$SUPPORT_GATE"
+assert_contains '"source-tag-object"' "$SUPPORT_GATE"
+assert_contains '"upgrade-from-tag-object"' "$SUPPORT_GATE"
 assert_contains 'must be provided together' "$SUPPORT_GATE"
 for installer_source in \
     "$INSTALLER" "$INSTALL_COMMON" "$INSTALL_GENERATOR" \
@@ -460,6 +462,7 @@ for contract in \
     'platform_ids=${MANAGEMENT_PLATFORM_IDS}' \
     'source_repository=${SOURCE_REPOSITORY}' \
     'source_commit=${SOURCE_COMMIT}' \
+    'source_tag_object=${SOURCE_TAG_OBJECT}' \
     'super_my_ref=${SUPER_MY_REF}' \
     '"$common_root" "$pristine_api_source" "$publish_root" "$PROFILE"' \
     '$bundle_root/source/probe-api/deploy/nginx/nginx.conf' \
@@ -476,8 +479,12 @@ for contract in \
     '.probe-release-build.' \
     'trap cleanup EXIT' \
     'mkdir -m 0700 -- "$WORK_ROOT"' \
-    'mv -T --no-clobber -- "$publish_root" "$OUTPUT_DIR"' \
-    'release output appeared concurrently; refusing to overwrite it' \
+    'publish_output_directory "$publish_root" "$OUTPUT_DIR"' \
+    'python3 -I -S - "$source" "$destination"' \
+    'renameat2 = getattr(libc, "renameat2", None)' \
+    'RENAME_NOREPLACE = 1' \
+    'release output could not be atomically published without overwriting' \
+    'atomic release publication did not produce a real output directory' \
     'rm -rf -- "$WORK_ROOT"' \
     'No GitHub release was created or modified.'; do
     assert_contains "$contract" "$BUILDER"
@@ -615,6 +622,81 @@ INPUT_FIXTURE=$TEST_ROOT/input-integrity-fixture
 ' probe-release-input-contract "$BUILDER" "$INPUT_FIXTURE" ||
     fail 'source input digest did not distinguish generated output from source pollution'
 
+# Exercise the same kernel-enforced no-replace path used by the builder. Every
+# destination kind must survive byte-for-byte; there is no check-then-rename or
+# cross-filesystem copy fallback.
+PUBLISH_FIXTURE=$TEST_ROOT/publish-fixture
+/bin/bash -c '
+    set -Eeuo pipefail
+    source "$1"
+    root=$2
+    mkdir -p "$root/staged-collision" "$root/existing"
+    printf "%s\n" staged > "$root/staged-collision/candidate"
+    printf "%s\n" preserve > "$root/existing/sentinel"
+    if ( publish_output_directory "$root/staged-collision" "$root/existing" \
+        >/dev/null 2>&1 ); then
+        exit 50
+    fi
+    [[ -f "$root/staged-collision/candidate" ]]
+    [[ "$(cat "$root/existing/sentinel")" == preserve ]]
+    [[ ! -e "$root/existing/candidate" ]]
+
+    mkdir -p "$root/staged-empty-directory" "$root/existing-empty-directory"
+    printf "%s\n" staged > "$root/staged-empty-directory/candidate"
+    if ( publish_output_directory "$root/staged-empty-directory" \
+        "$root/existing-empty-directory" >/dev/null 2>&1 ); then
+        exit 51
+    fi
+    [[ -f "$root/staged-empty-directory/candidate" ]]
+    [[ -d "$root/existing-empty-directory" && ! -L "$root/existing-empty-directory" ]]
+    [[ -z "$(find "$root/existing-empty-directory" -mindepth 1 -print -quit)" ]]
+
+    mkdir -p "$root/staged-symlink" "$root/symlink-target"
+    printf "%s\n" staged > "$root/staged-symlink/candidate"
+    printf "%s\n" preserve > "$root/symlink-target/sentinel"
+    ln -s "$root/symlink-target" "$root/existing-symlink"
+    symlink_before=$(readlink "$root/existing-symlink")
+    if ( publish_output_directory "$root/staged-symlink" \
+        "$root/existing-symlink" >/dev/null 2>&1 ); then
+        exit 52
+    fi
+    [[ -f "$root/staged-symlink/candidate" ]]
+    [[ -L "$root/existing-symlink" ]]
+    [[ "$(readlink "$root/existing-symlink")" == "$symlink_before" ]]
+    [[ "$(cat "$root/existing-symlink/sentinel")" == preserve ]]
+
+    mkdir -p "$root/staged-success"
+    printf "%s\n" candidate > "$root/staged-success/candidate"
+    publish_output_directory "$root/staged-success" "$root/published"
+    [[ ! -e "$root/staged-success" ]]
+    [[ "$(cat "$root/published/candidate")" == candidate ]]
+' probe-release-publish-contract "$BUILDER" "$PUBLISH_FIXTURE" ||
+    fail 'atomic release publication did not preserve a concurrent destination'
+
+SIGNAL_FIXTURE=$TEST_ROOT/signal-cleanup-fixture
+set +e
+/bin/bash -c '
+    set -Eeuo pipefail
+    source "$1"
+    mkdir -p "$2"
+    WORK_ROOT="$2/.probe-release-build.signal-contract"
+    trap cleanup EXIT
+    trap "exit 129" HUP
+    trap "exit 130" INT
+    trap "exit 143" TERM
+    mkdir -m 0700 -- "$WORK_ROOT"
+    printf "%s\n" temporary > "$WORK_ROOT/payload"
+    kill -TERM "$BASHPID"
+    exit 99
+' probe-release-signal-contract "$BUILDER" "$SIGNAL_FIXTURE" \
+    >"$TEST_ROOT/signal-cleanup.stdout" 2>"$TEST_ROOT/signal-cleanup.stderr"
+signal_status=$?
+set -e
+[ "$signal_status" -eq 143 ] ||
+    fail "release work-root signal trap returned $signal_status instead of 143"
+[ ! -e "$SIGNAL_FIXTURE/.probe-release-build.signal-contract" ] ||
+    fail 'release work-root signal trap left its private directory behind'
+
 # The sed program matches literal builder variables.
 # shellcheck disable=SC2016
 management_assembly="$({
@@ -712,6 +794,13 @@ work_copy_line=$(grep -n '^[[:space:]]*cp -a -- "$pristine_super_source" "$super
 # shellcheck disable=SC2016
 snapshot_validation_line=$(grep -n '^[[:space:]]*validate_sources "$super_source" "$api_source" "$super_source"' "$BUILDER" | cut -d: -f1)
 # shellcheck disable=SC2016
+last_artifact_go_build_line=$(grep -n '^[[:space:]]*go build -trimpath ' "$BUILDER" | tail -n 1 | cut -d: -f1)
+# shellcheck disable=SC2016
+admin_build_line=$(grep -n '^[[:space:]]*build_frontend probe-admin "$super_source" "$common_root/admin"$' "$BUILDER" | cut -d: -f1)
+# shellcheck disable=SC2016
+web_build_line=$(grep -n '^[[:space:]]*build_frontend probe-web "$web_source" "$common_root/web"$' "$BUILDER" | cut -d: -f1)
+first_shell_test_line=$(grep -n '^[[:space:]]*sh probe-api/deploy/tests/bootstrap-install-contract[.]sh$' "$BUILDER" | cut -d: -f1)
+# shellcheck disable=SC2016
 last_test_line=$(grep -n '^[[:space:]]*go vet ./[.][.]' "$BUILDER" | tail -n 1 | cut -d: -f1)
 # Exact no-argument calls bracket manifest assembly; the function declaration
 # and parameterized helper calls cannot satisfy this pattern.
@@ -726,7 +815,7 @@ input_revalidation_lines=$(grep -n '^[[:space:]]*revalidate_all_source_inputs "$
 # This grep pattern matches a literal source invocation, including its variable syntax.
 # shellcheck disable=SC2016
 assemble_line=$(grep -n '^[[:space:]]*assemble_bundle "$architecture"' "$BUILDER" | tail -n 1 | cut -d: -f1)
-publish_line=$(grep -n '^[[:space:]]*mv -T --no-clobber -- "$publish_root" "$OUTPUT_DIR"' "$BUILDER" | cut -d: -f1)
+publish_line=$(grep -n '^[[:space:]]*publish_output_directory "$publish_root" "$OUTPUT_DIR"$' "$BUILDER" | cut -d: -f1)
 main_section=$(sed -n '/^main() {$/,/^}$/p' "$BUILDER")
 work_path_line=$(printf '%s\n' "$main_section" | grep -n 'WORK_ROOT="${output_parent}/[.]probe-release-build[.]${BASHPID}[.]${RANDOM}${RANDOM}"' | cut -d: -f1)
 work_trap_line=$(printf '%s\n' "$main_section" | grep -n '^[[:space:]]*trap cleanup EXIT$' | cut -d: -f1)
@@ -737,6 +826,10 @@ if [ -z "$proof_line" ] ||
     [ -z "$snapshot_line" ] ||
     [ -z "$work_copy_line" ] ||
     [ -z "$snapshot_validation_line" ] ||
+    [ -z "$last_artifact_go_build_line" ] ||
+    [ -z "$admin_build_line" ] ||
+    [ -z "$web_build_line" ] ||
+    [ -z "$first_shell_test_line" ] ||
     [ -z "$last_test_line" ] ||
     [ -z "$remote_before_line" ] ||
     [ -z "$assemble_line" ] ||
@@ -750,6 +843,11 @@ if [ -z "$proof_line" ] ||
     [ "$proof_line" -ge "$snapshot_line" ] ||
     [ "$snapshot_line" -ge "$work_copy_line" ] ||
     [ "$work_copy_line" -ge "$snapshot_validation_line" ] ||
+    [ "$snapshot_validation_line" -ge "$last_artifact_go_build_line" ] ||
+    [ "$last_artifact_go_build_line" -ge "$admin_build_line" ] ||
+    [ "$admin_build_line" -ge "$web_build_line" ] ||
+    [ "$web_build_line" -ge "$first_shell_test_line" ] ||
+    [ "$first_shell_test_line" -ge "$last_test_line" ] ||
     [ "$snapshot_validation_line" -ge "$last_test_line" ] ||
     [ "$last_test_line" -ge "$remote_before_line" ] ||
     [ "$remote_before_line" -ge "$assemble_line" ] ||
@@ -757,7 +855,7 @@ if [ -z "$proof_line" ] ||
     [ "$remote_after_line" -ge "$publish_line" ] ||
     [ "$work_path_line" -ge "$work_trap_line" ] ||
     [ "$work_trap_line" -ge "$work_mkdir_line" ]; then
-    fail 'immutable snapshotting, tests, remote binding, assembly, and no-clobber publication are misordered'
+    fail 'immutable snapshotting, artifact builds, tests, remote binding, assembly, and atomic publication are misordered'
 fi
 
 if grep -Eq '(^|[[:space:]])(gh|curl)[[:space:]].*(release (create|upload|edit)|uploads[.]github[.]com)' "$BUILDER"; then
@@ -795,11 +893,22 @@ for contract in \
     '--version v1.2.0' \
     'probe-panel-management-v1.2.0-linux-amd64.tar.gz' \
     'probe-panel-management-v1.2.0-linux-arm64.tar.gz' \
+    'verify_management_candidate:' \
+    'needs: build_management' \
+    'Verify management v1.2.0 candidate on a fresh runner' \
+    'BASH_ENV: /dev/null' \
+    'probe-panel-management-v1.2.0-unverified' \
+    'uses: actions/download-artifact@v4' \
+    'Download the unverified management build' \
     '- name: Bind candidate tarballs to the verified tag commit' \
-    'git -C "$BUILD_SOURCE" rev-parse --verify' \
+    'trusted_git() (' \
+    'source_tag_object="$(trusted_git -C "$VERIFIER_SOURCE"' \
+    'https://github.com/Kcmose/super-my.git' \
+    '[[ "$remote_tag_object" == "$source_tag_object" ]]' \
     'go run ./cmd/probe-support-gate verify' \
-    '--release-assets "$RELEASE_OUTPUT"' \
+    '--release-assets "$UNVERIFIED_DOWNLOAD_ROOT"' \
     '--source-commit "$source_commit"' \
+    '--source-tag-object "$source_tag_object"' \
     '- name: Stage exactly the verified candidate for upload' \
     'CANDIDATE_UPLOAD_ROOT' \
     'cmp -- "$source_asset" "$staged_asset"' \
@@ -824,27 +933,39 @@ if grep -Fq 'branches:' "$WORKFLOW" || grep -Fq 'push:refs/heads/main' "$WORKFLO
 fi
 
 checkout_count=$(grep -Fc 'uses: actions/checkout@' "$WORKFLOW")
-[ "$checkout_count" -eq 1 ] ||
-    fail 'management release workflow must perform exactly one checkout'
+[ "$checkout_count" -eq 2 ] ||
+    fail 'management build and fresh verifier must each perform exactly one checkout'
 
 candidate_copy_line=$(grep -Fn -- '- name: Prepare a root-owned clean source copy' "$WORKFLOW" | cut -d: -f1)
 candidate_build_line=$(grep -Fn -- '- name: Build management-only release assets' "$WORKFLOW" | cut -d: -f1)
 candidate_shape_line=$(grep -Fn -- '- name: Require exactly the three management assets' "$WORKFLOW" | cut -d: -f1)
+unverified_stage_line=$(grep -Fn -- '- name: Stage exactly the built candidate for fresh-runner verification' "$WORKFLOW" | cut -d: -f1)
+unverified_upload_line=$(grep -Fn -- '- name: Upload the unverified management build' "$WORKFLOW" | cut -d: -f1)
+fresh_job_line=$(grep -Fn -- '  verify_management_candidate:' "$WORKFLOW" | cut -d: -f1)
+fresh_download_line=$(grep -Fn -- '- name: Download the unverified management build' "$WORKFLOW" | cut -d: -f1)
 candidate_binding_line=$(grep -Fn -- '- name: Bind candidate tarballs to the verified tag commit' "$WORKFLOW" | cut -d: -f1)
 candidate_stage_line=$(grep -Fn -- '- name: Stage exactly the verified candidate for upload' "$WORKFLOW" | cut -d: -f1)
 candidate_upload_line=$(grep -Fn -- '- name: Upload the unpublished management candidate' "$WORKFLOW" | cut -d: -f1)
 if [ -z "$candidate_copy_line" ] ||
     [ -z "$candidate_build_line" ] ||
     [ -z "$candidate_shape_line" ] ||
+    [ -z "$unverified_stage_line" ] ||
+    [ -z "$unverified_upload_line" ] ||
+    [ -z "$fresh_job_line" ] ||
+    [ -z "$fresh_download_line" ] ||
     [ -z "$candidate_binding_line" ] ||
     [ -z "$candidate_stage_line" ] ||
     [ -z "$candidate_upload_line" ] ||
     [ "$candidate_copy_line" -ge "$candidate_build_line" ] ||
     [ "$candidate_build_line" -ge "$candidate_shape_line" ] ||
-    [ "$candidate_shape_line" -ge "$candidate_binding_line" ] ||
+    [ "$candidate_shape_line" -ge "$unverified_stage_line" ] ||
+    [ "$unverified_stage_line" -ge "$unverified_upload_line" ] ||
+    [ "$unverified_upload_line" -ge "$fresh_job_line" ] ||
+    [ "$fresh_job_line" -ge "$fresh_download_line" ] ||
+    [ "$fresh_download_line" -ge "$candidate_binding_line" ] ||
     [ "$candidate_binding_line" -ge "$candidate_stage_line" ] ||
     [ "$candidate_stage_line" -ge "$candidate_upload_line" ]; then
-    fail 'candidate source must be copied, built, shape-checked, commit-bound, staged, and only then uploaded'
+    fail 'candidate must be built, handed to a fresh runner, commit-bound, staged, and only then uploaded'
 fi
 
 candidate_binding_section=$(sed -n \
@@ -853,15 +974,108 @@ candidate_binding_section=$(sed -n \
 # These are literal workflow shell variables and must not expand in this contract.
 # shellcheck disable=SC2016
 for binding_contract in \
-    'git -C "$BUILD_SOURCE" rev-parse --verify' \
+    'unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE' \
+    'unset GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES' \
+    'unset GIT_REPLACE_REF_BASE GIT_NAMESPACE GIT_EXEC_PATH' \
+    'unset GIT_CONFIG GIT_CONFIG_SYSTEM GIT_CONFIG_GLOBAL' \
+    'unset GIT_CONFIG_NOSYSTEM GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS' \
+    'unset GIT_ATTR_NOSYSTEM' \
+    'export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1' \
+    'export GIT_ATTR_NOSYSTEM=1 GIT_NO_REPLACE_OBJECTS=1' \
+    'command /usr/bin/git --no-replace-objects' \
+    '-c "safe.directory=$VERIFIER_SOURCE" "$@"' \
+    'trusted_git -C "$VERIFIER_SOURCE" rev-parse --verify' \
+    'cat-file -t' \
+    '"$source_tag_object")" == tag' \
+    'trusted_git -C / ls-remote --exit-code' \
+    'status --porcelain=v1 --untracked-files=all' \
+    'expected_checksum_names="$(printf' \
+    '$1 !~ /^[0-9a-f]{64}$/ { exit 2 }' \
+    'NF != 2 { exit 3 }' \
+    '[[ "$actual_checksum_names" == "$expected_checksum_names" ]]' \
+    '[[ "$source_tag_object" =~ ^[0-9a-f]{40}$ ]]' \
     '[[ "$source_commit" =~ ^[0-9a-f]{40}$ ]]' \
+    '[[ "$remote_tag_object" == "$source_tag_object" ]]' \
+    '[[ "$remote_tag_commit" == "$source_commit" ]]' \
     '--release v1.2.0' \
     '--require-zero-supported' \
-    '--release-assets "$RELEASE_OUTPUT"' \
-    '--source-commit "$source_commit"'; do
+    '--release-assets "$UNVERIFIED_DOWNLOAD_ROOT"' \
+    '--source-commit "$source_commit"' \
+    '--source-tag-object "$source_tag_object"'; do
     printf '%s\n' "$candidate_binding_section" | grep -Fq -- "$binding_contract" ||
         fail "candidate binding step is missing: $binding_contract"
 done
+
+build_job_section=$(sed -n \
+    '/^  build_management:$/,/^  verify_management_candidate:$/p' "$WORKFLOW")
+fresh_verifier_section=$(sed -n \
+    '/^  verify_management_candidate:$/,/^  verify_legacy:$/p' "$WORKFLOW")
+for fresh_contract in \
+    'needs: build_management' \
+    'image: debian:13-slim' \
+    'contents: read' \
+    'ref: refs/tags/v1.2.0' \
+    'cache: false' \
+    'uses: actions/download-artifact@v4' \
+    'name: probe-panel-management-v1.2.0-unverified' \
+    'path: ${{ runner.temp }}/probe-panel-management-unverified-v1.2.0' \
+    'BASH_ENV: /dev/null' \
+    'UNVERIFIED_DOWNLOAD_ROOT: ${{ runner.temp }}/probe-panel-management-unverified-v1.2.0' \
+    'VERIFIER_SOURCE: ${{ runner.temp }}/probe-panel-management-verifier-source-v1.2.0' \
+    'cp -a --no-preserve=ownership -- "$GITHUB_WORKSPACE" "$VERIFIER_SOURCE"' \
+    'find "$VERIFIER_SOURCE" ! -uid "$(id -u)"' \
+    'PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
+    'name: probe-panel-management-v1.2.0-candidate' \
+    'path: ${{ github.workspace }}/release-upload-v1.2.0/'; do
+    printf '%s\n' "$fresh_verifier_section" | grep -Fq -- "$fresh_contract" ||
+        fail "fresh verifier job is missing: $fresh_contract"
+done
+
+if [ "$(printf '%s\n' "$build_job_section" | grep -Fc 'uses: actions/checkout@')" -ne 1 ] ||
+    [ "$(printf '%s\n' "$fresh_verifier_section" | grep -Fc 'uses: actions/checkout@')" -ne 1 ]; then
+    fail 'build and fresh-verifier jobs must each own exactly one checkout'
+fi
+for build_forbidden in \
+    'Bind candidate tarballs to the verified tag commit' \
+    'go run ./cmd/probe-support-gate verify' \
+    'name: probe-panel-management-v1.2.0-candidate'; do
+    if printf '%s\n' "$build_job_section" | grep -Fq -- "$build_forbidden"; then
+        fail "build job crosses the fresh-verifier trust boundary: $build_forbidden"
+    fi
+done
+if printf '%s\n' "$fresh_verifier_section" | grep -Fq -- '--profile management'; then
+    fail 'fresh verifier must consume the build artifact without rebuilding it'
+fi
+if [ "$(grep -Fc 'name: probe-panel-management-v1.2.0-unverified' "$WORKFLOW")" -ne 2 ]; then
+    fail 'unverified artifact must have exactly one same-run upload and one named download'
+fi
+if [ "$(grep -Fc 'name: probe-panel-management-v1.2.0-candidate' "$WORKFLOW")" -ne 1 ]; then
+    fail 'only the fresh verifier may upload the final candidate artifact'
+fi
+
+download_step_section=$(sed -n \
+    '/^[[:space:]]*- name: Download the unverified management build$/,/^[[:space:]]*- name: Bind candidate tarballs to the verified tag commit$/p' \
+    "$WORKFLOW")
+for forbidden_download_input in \
+    'github-token:' 'repository:' 'run-id:' 'artifact-ids:' 'pattern:' \
+    'merge-multiple:'; do
+    if printf '%s\n' "$download_step_section" | grep -Fq -- "$forbidden_download_input"; then
+        fail "fresh verifier artifact download must stay bound to this run and exact name: $forbidden_download_input"
+    fi
+done
+
+gate_line=$(grep -Fn -- 'go run ./cmd/probe-support-gate verify' "$WORKFLOW" | cut -d: -f1)
+remote_after_line=$(grep -Fn -- 'remote_tags_after="$(trusted_git -C / ls-remote --exit-code' "$WORKFLOW" | cut -d: -f1)
+if [ -z "$gate_line" ] || [ -z "$remote_after_line" ] ||
+    [ "$gate_line" -ge "$remote_after_line" ] ||
+    [ "$remote_after_line" -ge "$candidate_stage_line" ]; then
+    fail 'fresh verifier must revalidate the remote annotated tag after the support gate and before staging'
+fi
+
+if printf '%s\n' "$candidate_binding_section" |
+    grep -Eq '(^|[^_[:alnum:]])git --no-replace-objects -C'; then
+    fail 'candidate binding must route every Git operation through trusted_git isolation'
+fi
 
 if grep -Eq '(Kcmose/my([.]git)?|my-agent|repository:[[:space:]].*/my)' "$WORKFLOW"; then
     fail 'management release workflow must not reference the visitor or Agent repositories'

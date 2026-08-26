@@ -11,7 +11,7 @@ import (
 
 func main() {
 	if len(os.Args) == 1 || os.Args[1] != "verify" {
-		fmt.Fprintln(os.Stderr, "usage: probe-support-gate verify [--support-root DIR] [--release VERSION] [--require-zero-supported] [--release-assets DIR --source-commit COMMIT --upgrade-from-assets DIR --upgrade-from-source-commit COMMIT]")
+		fmt.Fprintln(os.Stderr, "usage: probe-support-gate verify [--support-root DIR] [--release VERSION] [--require-zero-supported] [--release-assets DIR --source-commit COMMIT --source-tag-object OBJECT --upgrade-from-assets DIR --upgrade-from-source-commit COMMIT --upgrade-from-tag-object OBJECT]")
 		os.Exit(2)
 	}
 	flags := flag.NewFlagSet("verify", flag.ContinueOnError)
@@ -21,8 +21,10 @@ func main() {
 	requireZeroSupported := flags.Bool("require-zero-supported", false, "fail unless every matrix cell remains candidate")
 	releaseAssets := flags.String("release-assets", "", "directory containing both immutable management release tarballs")
 	sourceCommit := flags.String("source-commit", "", "trusted 40-character source commit for the release tag")
+	sourceTagObject := flags.String("source-tag-object", "", "trusted 40-character direct Git object ID for the release tag")
 	upgradeFromAssets := flags.String("upgrade-from-assets", "", "directory containing both immutable predecessor management release tarballs")
 	upgradeFromSourceCommit := flags.String("upgrade-from-source-commit", "", "trusted 40-character source commit for the predecessor release tag")
+	upgradeFromTagObject := flags.String("upgrade-from-tag-object", "", "trusted 40-character direct Git object ID for the predecessor release tag")
 	if err := flags.Parse(os.Args[2:]); err != nil {
 		os.Exit(2)
 	}
@@ -30,15 +32,17 @@ func main() {
 		fmt.Fprintln(os.Stderr, "probe-support-gate: positional arguments are not accepted")
 		os.Exit(2)
 	}
-	if (*releaseAssets == "") != (*sourceCommit == "") {
-		fmt.Fprintln(os.Stderr, "probe-support-gate: --release-assets and --source-commit must be provided together")
+	targetSubjectProvided := *releaseAssets != "" || *sourceCommit != "" || *sourceTagObject != ""
+	upgradeSubjectProvided := *upgradeFromAssets != "" || *upgradeFromSourceCommit != "" || *upgradeFromTagObject != ""
+	if targetSubjectProvided && (*releaseAssets == "" || *sourceCommit == "" || *sourceTagObject == "") {
+		fmt.Fprintln(os.Stderr, "probe-support-gate: --release-assets, --source-commit, and --source-tag-object must be provided together")
 		os.Exit(2)
 	}
-	if (*upgradeFromAssets == "") != (*upgradeFromSourceCommit == "") {
-		fmt.Fprintln(os.Stderr, "probe-support-gate: --upgrade-from-assets and --upgrade-from-source-commit must be provided together")
+	if upgradeSubjectProvided && (*upgradeFromAssets == "" || *upgradeFromSourceCommit == "" || *upgradeFromTagObject == "") {
+		fmt.Fprintln(os.Stderr, "probe-support-gate: --upgrade-from-assets, --upgrade-from-source-commit, and --upgrade-from-tag-object must be provided together")
 		os.Exit(2)
 	}
-	if *upgradeFromAssets != "" && *releaseAssets == "" {
+	if upgradeSubjectProvided && !targetSubjectProvided {
 		fmt.Fprintln(os.Stderr, "probe-support-gate: upgrade-from trusted release subject requires the target trusted release subject")
 		os.Exit(2)
 	}
@@ -46,8 +50,10 @@ func main() {
 		RequireZeroSupported:    *requireZeroSupported,
 		ReleaseAssetsDir:        *releaseAssets,
 		SourceCommit:            *sourceCommit,
+		SourceTagObject:         *sourceTagObject,
 		UpgradeFromAssetsDir:    *upgradeFromAssets,
 		UpgradeFromSourceCommit: *upgradeFromSourceCommit,
+		UpgradeFromTagObject:    *upgradeFromTagObject,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "probe-support-gate: %v\n", err)

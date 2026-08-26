@@ -424,6 +424,58 @@ assert_output_outside_sources() {
     done
 }
 
+publish_output_directory() {
+    local source="$1" destination="$2"
+    [[ -d "$source" && ! -L "$source" ]] ||
+        die "release publish source is not a real directory: $source"
+    # renameat2 with RENAME_NOREPLACE makes the existence check and directory
+    # rename one kernel operation.  Never fall back to mv(1): older coreutils
+    # implements --no-clobber as a check followed by rename, which can overwrite
+    # a destination created inside that race window.
+    if ! python3 -I -S - "$source" "$destination" <<'PY'; then
+import ctypes
+import os
+import sys
+
+AT_FDCWD = -100
+RENAME_NOREPLACE = 1
+
+libc = ctypes.CDLL(None, use_errno=True)
+renameat2 = getattr(libc, "renameat2", None)
+if renameat2 is None:
+    print("[probe-release] renameat2 is unavailable; refusing a non-atomic release publish", file=sys.stderr)
+    raise SystemExit(1)
+renameat2.argtypes = (
+    ctypes.c_int,
+    ctypes.c_char_p,
+    ctypes.c_int,
+    ctypes.c_char_p,
+    ctypes.c_uint,
+)
+renameat2.restype = ctypes.c_int
+result = renameat2(
+    AT_FDCWD,
+    os.fsencode(sys.argv[1]),
+    AT_FDCWD,
+    os.fsencode(sys.argv[2]),
+    RENAME_NOREPLACE,
+)
+if result != 0:
+    error_number = ctypes.get_errno()
+    print(
+        f"[probe-release] atomic no-replace publish failed: {os.strerror(error_number)}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+        die "release output could not be atomically published without overwriting: $destination"
+    fi
+    [[ ! -e "$source" && ! -L "$source" ]] ||
+        die "atomic release publication did not consume its staged directory: $source"
+    [[ -d "$destination" && ! -L "$destination" ]] ||
+        die "atomic release publication did not produce a real output directory: $destination"
+}
+
 stage_repository_commit() {
     local label="$1" root="$2" commit="$3" destination="$4"
     local snapshot_work archive_path snapshot_tree isolated_git source_object_dir
@@ -860,6 +912,7 @@ runtime_abi=${MANAGEMENT_RUNTIME_ABI}
 platform_ids=${MANAGEMENT_PLATFORM_IDS}
 source_repository=${SOURCE_REPOSITORY}
 source_commit=${SOURCE_COMMIT}
+source_tag_object=${SOURCE_TAG_OBJECT}
 super_my_ref=${SUPER_MY_REF}
 EOF
     if [[ "$profile" == full ]]; then
@@ -903,7 +956,7 @@ main() {
     require_debian_13
     local command_name
     for command_name in awk basename bash cat chmod cmp cp dirname file find git go grep gzip install \
-        mkdir mktemp mv npm readlink rm sh sha256sum shellcheck sort stat tar xargs; do
+        mkdir mktemp mv npm python3 readlink rm sh sha256sum shellcheck sort stat tar xargs; do
         require_command "$command_name"
     done
 
@@ -1009,9 +1062,27 @@ main() {
     )
     revalidate_all_source_inputs "$super_source" "$pristine_super_source" \
         "$web_source" "$agent_source"
+    if [[ "$PROFILE" == full ]]; then
+        log 'cross-building probe-agent from the verified work snapshot'
+        (
+            cd "$agent_source"
+            for architecture in amd64 arm64; do
+                CGO_ENABLED=0 GOOS=linux GOARCH="$architecture" \
+                    go build -trimpath -ldflags='-s -w' \
+                    -o "$binary_root/agent/linux-$architecture/probe-agent" ./cmd/probe-agent
+            done
+        )
+        revalidate_all_source_inputs "$super_source" "$pristine_super_source" \
+            "$web_source" "$agent_source"
+    fi
     build_frontend probe-admin "$super_source" "$common_root/admin"
     revalidate_all_source_inputs "$super_source" "$pristine_super_source" \
         "$web_source" "$agent_source"
+    if [[ "$PROFILE" == full ]]; then
+        build_frontend probe-web "$web_source" "$common_root/web"
+        revalidate_all_source_inputs "$super_source" "$pristine_super_source" \
+            "$web_source" "$agent_source"
+    fi
 
     log 'checking deployment Shell contracts'
     shellcheck "$super_source/install.sh" "$super_source/install/build-standalone.sh" \
@@ -1044,17 +1115,12 @@ main() {
         "$web_source" "$agent_source"
 
     if [[ "$PROFILE" == full ]]; then
-        log 'testing, vetting, and cross-building probe-agent'
+        log 'testing and vetting probe-agent after capturing its binaries'
         (
             cd "$agent_source"
             go test -count=1 ./...
             go vet ./...
             sh deploy/tests/install-contract.sh
-            for architecture in amd64 arm64; do
-                CGO_ENABLED=0 GOOS=linux GOARCH="$architecture" \
-                    go build -trimpath -ldflags='-s -w' \
-                    -o "$binary_root/agent/linux-$architecture/probe-agent" ./cmd/probe-agent
-            done
         )
     fi
     revalidate_all_source_inputs "$super_source" "$pristine_super_source" \
@@ -1083,12 +1149,6 @@ main() {
         )
     fi
 
-    if [[ "$PROFILE" == full ]]; then
-        build_frontend probe-web "$web_source" "$common_root/web"
-        revalidate_all_source_inputs "$super_source" "$pristine_super_source" \
-            "$web_source" "$agent_source"
-    fi
-
     # Bracket RELEASE-MANIFEST creation with exact remote-ref checks.  A tag
     # move during the build therefore fails closed instead of publishing a
     # manifest whose named ref no longer identifies source_commit.
@@ -1112,13 +1172,7 @@ main() {
         sha256sum --check --strict SHA256SUMS >/dev/null
     )
     revalidate_remote_source_refs
-    # GNU mv's no-clobber rename is the final atomic existence decision.  It
-    # reports success when it declines an overwrite, so also require that the
-    # hidden publish directory disappeared.
-    mv -T --no-clobber -- "$publish_root" "$OUTPUT_DIR" ||
-        die "release output could not be published without overwriting: $OUTPUT_DIR"
-    [[ ! -e "$publish_root" && ! -L "$publish_root" ]] ||
-        die "release output appeared concurrently; refusing to overwrite it: $OUTPUT_DIR"
+    publish_output_directory "$publish_root" "$OUTPUT_DIR"
     printf 'Probe Panel %s release assets created locally:\n  %s\n' "$VERSION" "$OUTPUT_DIR"
     printf 'No GitHub release was created or modified.\n'
 }

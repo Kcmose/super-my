@@ -22,10 +22,12 @@ type supportFixture struct {
 	ledger                  ReleaseLedger
 	assetsDir               string
 	sourceCommit            string
+	sourceTagObject         string
 	assets                  map[string]trustedAsset
 	upgradeFromRelease      string
 	upgradeFromAssetsDir    string
 	upgradeFromSourceCommit string
+	upgradeFromTagObject    string
 	upgradeFromAssets       map[string]trustedAsset
 }
 
@@ -293,8 +295,10 @@ func TestTrustedPredecessorCommitMustMatchItsReleaseManifest(t *testing.T) {
 	_, err := VerifyDirectory(fixture.root, fixture.release, VerifyOptions{
 		ReleaseAssetsDir:        fixture.assetsDir,
 		SourceCommit:            fixture.sourceCommit,
+		SourceTagObject:         fixture.sourceTagObject,
 		UpgradeFromAssetsDir:    fixture.upgradeFromAssetsDir,
 		UpgradeFromSourceCommit: strings.Repeat("e", 40),
+		UpgradeFromTagObject:    fixture.upgradeFromTagObject,
 	})
 	if err == nil || !strings.Contains(err.Error(), "source_commit must be") {
 		t.Fatalf("predecessor commit inconsistent with RELEASE-MANIFEST was accepted: %v", err)
@@ -328,12 +332,20 @@ func TestSupportedCellRequiresPairedTrustedReleaseInputs(t *testing.T) {
 	if _, err := VerifyDirectory(fixture.root, fixture.release, VerifyOptions{
 		ReleaseAssetsDir: fixture.assetsDir,
 		SourceCommit:     fixture.sourceCommit,
+	}); err == nil || !strings.Contains(err.Error(), "source_tag_object") {
+		t.Fatalf("trusted target without its direct tag object was accepted: %v", err)
+	}
+	if _, err := VerifyDirectory(fixture.root, fixture.release, VerifyOptions{
+		ReleaseAssetsDir: fixture.assetsDir,
+		SourceCommit:     fixture.sourceCommit,
+		SourceTagObject:  fixture.sourceTagObject,
 	}); err == nil || !strings.Contains(err.Error(), "requires target and upgrade-from trusted release subjects") {
 		t.Fatalf("supported cell without predecessor inputs was accepted: %v", err)
 	}
 	if _, err := VerifyDirectory(fixture.root, fixture.release, VerifyOptions{
 		UpgradeFromAssetsDir:    fixture.upgradeFromAssetsDir,
 		UpgradeFromSourceCommit: fixture.upgradeFromSourceCommit,
+		UpgradeFromTagObject:    fixture.upgradeFromTagObject,
 	}); err == nil || !strings.Contains(err.Error(), "requires the target trusted release subject") {
 		t.Fatalf("predecessor inputs without target inputs were accepted: %v", err)
 	}
@@ -346,6 +358,7 @@ func TestCandidateAndBaselineMayValidateTargetAssetsOnly(t *testing.T) {
 			_, err := VerifyDirectory(fixture.root, fixture.release, VerifyOptions{
 				ReleaseAssetsDir: fixture.assetsDir,
 				SourceCommit:     fixture.sourceCommit,
+				SourceTagObject:  fixture.sourceTagObject,
 			})
 			if err != nil {
 				t.Fatalf("candidate target-only asset verification failed: %v", err)
@@ -406,6 +419,7 @@ func TestTrustedReleaseAssetRejectsDuplicateCanonicalTarPath(t *testing.T) {
 	_, err := VerifyDirectory(fixture.root, fixture.release, VerifyOptions{
 		ReleaseAssetsDir: fixture.assetsDir,
 		SourceCommit:     fixture.sourceCommit,
+		SourceTagObject:  fixture.sourceTagObject,
 	})
 	if err == nil || !strings.Contains(err.Error(), "duplicate canonical path") {
 		t.Fatalf("release asset with directory aliases was accepted: %v", err)
@@ -418,9 +432,22 @@ func TestSupportedCellRejectsWrongTrustedSourceCommit(t *testing.T) {
 	_, err := VerifyDirectory(fixture.root, fixture.release, VerifyOptions{
 		ReleaseAssetsDir: fixture.assetsDir,
 		SourceCommit:     strings.Repeat("e", 40),
+		SourceTagObject:  fixture.sourceTagObject,
 	})
 	if err == nil || !strings.Contains(err.Error(), "source_commit must be") {
 		t.Fatalf("wrong trusted source commit was accepted: %v", err)
+	}
+}
+
+func TestTrustedReleaseAssetRejectsWrongDirectTagObject(t *testing.T) {
+	fixture := newSupportFixtureForRelease(t, "v1.2.0")
+	_, err := VerifyDirectory(fixture.root, fixture.release, VerifyOptions{
+		ReleaseAssetsDir: fixture.assetsDir,
+		SourceCommit:     fixture.sourceCommit,
+		SourceTagObject:  strings.Repeat("e", 40),
+	})
+	if err == nil || !strings.Contains(err.Error(), "source_tag_object must be") {
+		t.Fatalf("wrong trusted direct tag object was accepted: %v", err)
 	}
 }
 
@@ -461,6 +488,7 @@ func TestTrustedReleaseAssetRequiresUniqueReleaseManifest(t *testing.T) {
 	_, err := VerifyDirectory(fixture.root, fixture.release, VerifyOptions{
 		ReleaseAssetsDir: fixture.assetsDir,
 		SourceCommit:     fixture.sourceCommit,
+		SourceTagObject:  fixture.sourceTagObject,
 	})
 	if err == nil ||
 		!strings.Contains(err.Error(), "duplicate canonical path") ||
@@ -481,6 +509,7 @@ func TestTrustedReleaseManifestBindsExactTargetSubject(t *testing.T) {
 		{name: "profile", old: "profile=management", new: "profile=full"},
 		{name: "repository", old: "source_repository=Kcmose/super-my", new: "source_repository=someone/else"},
 		{name: "source commit", old: "source_commit=" + strings.Repeat("d", 40), new: "source_commit=" + strings.Repeat("e", 40)},
+		{name: "source tag object", old: "source_tag_object=" + strings.Repeat("b", 40), new: "source_tag_object=" + strings.Repeat("e", 40)},
 		{name: "source ref", old: "super_my_ref=refs/tags/v1.2.1", new: "super_my_ref=refs/heads/main"},
 	}
 	for _, test := range tests {
@@ -493,6 +522,7 @@ func TestTrustedReleaseManifestBindsExactTargetSubject(t *testing.T) {
 			_, err := VerifyDirectory(fixture.root, fixture.release, VerifyOptions{
 				ReleaseAssetsDir: fixture.assetsDir,
 				SourceCommit:     fixture.sourceCommit,
+				SourceTagObject:  fixture.sourceTagObject,
 			})
 			if err == nil || !strings.Contains(err.Error(), "RELEASE-MANIFEST") {
 				t.Fatalf("tampered target release manifest was accepted: %v", err)
@@ -701,7 +731,9 @@ func newSupportFixtureForRelease(t *testing.T, release string) *supportFixture {
 	policy := canonicalPolicy()
 	upgradeFromRelease, promotionEligible := promotionPredecessor(policy, release)
 	sourceCommit := strings.Repeat("d", 40)
+	sourceTagObject := testSourceTagObject(release)
 	upgradeFromSourceCommit := strings.Repeat("c", 40)
+	upgradeFromTagObject := testSourceTagObject(upgradeFromRelease)
 	if err := os.MkdirAll(filepath.Join(root, "releases"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -712,7 +744,7 @@ func newSupportFixtureForRelease(t *testing.T, release string) *supportFixture {
 	for _, architecture := range canonicalArchitectures {
 		writeTestReleaseAsset(t, assetsDir, release, architecture, sourceCommit)
 	}
-	assets, err := loadTrustedReleaseAssets(assetsDir, release, sourceCommit)
+	assets, err := loadTrustedReleaseAssets(assetsDir, release, sourceCommit, sourceTagObject)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -726,7 +758,7 @@ func newSupportFixtureForRelease(t *testing.T, release string) *supportFixture {
 		for _, architecture := range canonicalArchitectures {
 			writeTestReleaseAsset(t, upgradeFromAssetsDir, upgradeFromRelease, architecture, upgradeFromSourceCommit)
 		}
-		upgradeFromAssets, err = loadTrustedReleaseAssets(upgradeFromAssetsDir, upgradeFromRelease, upgradeFromSourceCommit)
+		upgradeFromAssets, err = loadTrustedReleaseAssets(upgradeFromAssetsDir, upgradeFromRelease, upgradeFromSourceCommit, upgradeFromTagObject)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -737,10 +769,12 @@ func newSupportFixtureForRelease(t *testing.T, release string) *supportFixture {
 		policy:                  policy,
 		assetsDir:               assetsDir,
 		sourceCommit:            sourceCommit,
+		sourceTagObject:         sourceTagObject,
 		assets:                  assets,
 		upgradeFromRelease:      upgradeFromRelease,
 		upgradeFromAssetsDir:    upgradeFromAssetsDir,
 		upgradeFromSourceCommit: upgradeFromSourceCommit,
+		upgradeFromTagObject:    upgradeFromTagObject,
 		upgradeFromAssets:       upgradeFromAssets,
 		ledger: ReleaseLedger{
 			Schema:            releaseSchema,
@@ -760,10 +794,12 @@ func (fixture *supportFixture) verify(requireZeroSupported bool) (Summary, error
 		RequireZeroSupported: requireZeroSupported,
 		ReleaseAssetsDir:     fixture.assetsDir,
 		SourceCommit:         fixture.sourceCommit,
+		SourceTagObject:      fixture.sourceTagObject,
 	}
 	if fixture.upgradeFromRelease != "" {
 		options.UpgradeFromAssetsDir = fixture.upgradeFromAssetsDir
 		options.UpgradeFromSourceCommit = fixture.upgradeFromSourceCommit
+		options.UpgradeFromTagObject = fixture.upgradeFromTagObject
 	}
 	return VerifyDirectory(fixture.root, fixture.release, options)
 }
@@ -940,7 +976,18 @@ func testReleaseManifest(release, architecture, sourceCommit string) []byte {
 	for _, platform := range canonicalPolicy().Platforms {
 		platformIDs = append(platformIDs, platform.ID)
 	}
-	return []byte(fmt.Sprintf("format=probe-panel-release-v1\nversion=%s\narchitecture=linux-%s\nprofile=management\nruntime_abi=%s\nplatform_ids=%s\nsource_repository=%s\nsource_commit=%s\nsuper_my_ref=refs/tags/%s\n", release, architecture, runtimeABI, strings.Join(platformIDs, ","), sourceRepository, sourceCommit, release))
+	return []byte(fmt.Sprintf("format=probe-panel-release-v1\nversion=%s\narchitecture=linux-%s\nprofile=management\nruntime_abi=%s\nplatform_ids=%s\nsource_repository=%s\nsource_commit=%s\nsource_tag_object=%s\nsuper_my_ref=refs/tags/%s\n", release, architecture, runtimeABI, strings.Join(platformIDs, ","), sourceRepository, sourceCommit, testSourceTagObject(release), release))
+}
+
+func testSourceTagObject(release string) string {
+	switch release {
+	case "v1.2.0":
+		return strings.Repeat("a", 40)
+	case "v1.2.1":
+		return strings.Repeat("b", 40)
+	default:
+		return strings.Repeat("f", 40)
+	}
 }
 
 func writeJSON(t *testing.T, filename string, value any) {

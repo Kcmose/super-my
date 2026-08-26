@@ -50,8 +50,8 @@ jobs:
               "$RUNNER_TEMP/probe-panel-management-release-v1.2.0"
             printf 'BUILD_SOURCE=%s\n' \
               "$RUNNER_TEMP/probe-panel-management-source-v1.2.0"
-            printf 'CANDIDATE_UPLOAD_ROOT=%s\n' \
-              "$GITHUB_WORKSPACE/release-upload-v1.2.0"
+            printf 'UNVERIFIED_UPLOAD_ROOT=%s\n' \
+              "$GITHUB_WORKSPACE/release-unverified-v1.2.0"
           } >> "$GITHUB_ENV"
 
       - name: Install Debian 13 build prerequisites
@@ -155,6 +155,10 @@ jobs:
 
       - name: Build management-only release assets
         shell: bash
+        env:
+          BASH_ENV: /dev/null
+          BUILD_SOURCE: ${{ runner.temp }}/probe-panel-management-source-v1.2.0
+          RELEASE_OUTPUT: ${{ runner.temp }}/probe-panel-management-release-v1.2.0
         run: |
           set -Eeuo pipefail
           bash "$BUILD_SOURCE/probe-api/deploy/scripts/build-release-bundles.sh" \
@@ -164,6 +168,10 @@ jobs:
 
       - name: Require exactly the three management assets
         shell: bash
+        env:
+          BASH_ENV: /dev/null
+          RELEASE_OUTPUT: ${{ runner.temp }}/probe-panel-management-release-v1.2.0
+          PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
         run: |
           set -Eeuo pipefail
           expected_assets="$(printf '%s\n' \
@@ -177,29 +185,220 @@ jobs:
           [[ -z "$(find "$RELEASE_OUTPUT" -mindepth 1 -maxdepth 1 ! -type f -print -quit)" ]]
           [[ "$(wc -l < "$RELEASE_OUTPUT/SHA256SUMS")" -eq 2 ]]
           full_bundle_prefix="probe-panel-${RELEASE_TAG}-linux-"
-          ! grep -Fq "$full_bundle_prefix" "$RELEASE_OUTPUT/SHA256SUMS"
+          if grep -Fq "$full_bundle_prefix" "$RELEASE_OUTPUT/SHA256SUMS"; then
+            printf 'full-profile asset leaked into management checksum list\n' >&2
+            exit 1
+          fi
           (
             cd "$RELEASE_OUTPUT"
             sha256sum --check --strict SHA256SUMS
           )
 
-      - name: Bind candidate tarballs to the verified tag commit
+      - name: Stage exactly the built candidate for fresh-runner verification
         shell: bash
+        env:
+          BASH_ENV: /dev/null
+          RELEASE_OUTPUT: ${{ runner.temp }}/probe-panel-management-release-v1.2.0
+          UNVERIFIED_UPLOAD_ROOT: ${{ github.workspace }}/release-unverified-v1.2.0
+          PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
         run: |
           set -Eeuo pipefail
-          source_commit="$(git -C "$BUILD_SOURCE" rev-parse --verify \
+          [[ "$UNVERIFIED_UPLOAD_ROOT" == \
+            "$GITHUB_WORKSPACE/release-unverified-v1.2.0" ]]
+          [[ ! -e "$UNVERIFIED_UPLOAD_ROOT" && ! -L "$UNVERIFIED_UPLOAD_ROOT" ]]
+          install -d -m 0755 "$UNVERIFIED_UPLOAD_ROOT"
+          for asset in \
+            SHA256SUMS \
+            probe-panel-management-v1.2.0-linux-amd64.tar.gz \
+            probe-panel-management-v1.2.0-linux-arm64.tar.gz; do
+            source_asset="$RELEASE_OUTPUT/$asset"
+            staged_asset="$UNVERIFIED_UPLOAD_ROOT/$asset"
+            [[ -f "$source_asset" && ! -L "$source_asset" ]]
+            install -m 0644 -- "$source_asset" "$staged_asset"
+            cmp -- "$source_asset" "$staged_asset"
+          done
+          expected_assets="$(printf '%s\n' \
+            SHA256SUMS \
+            probe-panel-management-v1.2.0-linux-amd64.tar.gz \
+            probe-panel-management-v1.2.0-linux-arm64.tar.gz | LC_ALL=C sort)"
+          actual_assets="$(find "$UNVERIFIED_UPLOAD_ROOT" -mindepth 1 -maxdepth 1 \
+            -type f -printf '%f\n' | LC_ALL=C sort)"
+          [[ "$actual_assets" == "$expected_assets" ]]
+          [[ "$(find "$UNVERIFIED_UPLOAD_ROOT" -mindepth 1 -maxdepth 1 | wc -l)" -eq 3 ]]
+          [[ -z "$(find "$UNVERIFIED_UPLOAD_ROOT" -mindepth 1 -maxdepth 1 \
+            ! -type f -print -quit)" ]]
+          (
+            cd "$UNVERIFIED_UPLOAD_ROOT"
+            sha256sum --check --strict SHA256SUMS
+          )
+
+      - name: Upload the unverified management build
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-panel-management-v1.2.0-unverified
+          path: ${{ github.workspace }}/release-unverified-v1.2.0/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: false
+
+  verify_management_candidate:
+    name: Verify management v1.2.0 candidate on a fresh runner
+    needs: build_management
+    if: >-
+      (github.event_name == 'push' &&
+      github.ref == 'refs/tags/v1.2.0') ||
+      (github.event_name == 'workflow_dispatch' && inputs.version == 'v1.2.0')
+    runs-on: ubuntu-24.04
+    container:
+      image: debian:13-slim
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: v1.2.0
+    steps:
+      - name: Install fresh-runner verification prerequisites
+        shell: bash
+        env:
+          BASH_ENV: /dev/null
+        run: |
+          set -Eeuo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates git
+          rm -rf /var/lib/apt/lists/*
+          [[ -x /usr/bin/git && ! -L /usr/bin/git ]]
+
+      - name: Check out the exact management tag for fresh verification
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: refs/tags/v1.2.0
+
+      - name: Set up Go 1.23 for fresh verification
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache: false
+
+      - name: Download the unverified management build
+        uses: actions/download-artifact@v4
+        with:
+          name: probe-panel-management-v1.2.0-unverified
+          path: ${{ runner.temp }}/probe-panel-management-unverified-v1.2.0
+
+      - name: Bind candidate tarballs to the verified tag commit
+        shell: bash
+        env:
+          BASH_ENV: /dev/null
+          UNVERIFIED_DOWNLOAD_ROOT: ${{ runner.temp }}/probe-panel-management-unverified-v1.2.0
+          VERIFIER_SOURCE: ${{ runner.temp }}/probe-panel-management-verifier-source-v1.2.0
+        run: |
+          set -Eeuo pipefail
+          [[ "$GITHUB_REPOSITORY" == Kcmose/super-my ]]
+          [[ "$GITHUB_WORKSPACE" == "$PWD" ]]
+          [[ "$UNVERIFIED_DOWNLOAD_ROOT" == \
+            "$RUNNER_TEMP/probe-panel-management-unverified-v1.2.0" ]]
+          [[ -d "$UNVERIFIED_DOWNLOAD_ROOT" && ! -L "$UNVERIFIED_DOWNLOAD_ROOT" ]]
+          [[ -d "$GITHUB_WORKSPACE/.git" && ! -L "$GITHUB_WORKSPACE/.git" ]]
+          [[ "$VERIFIER_SOURCE" == \
+            "$RUNNER_TEMP/probe-panel-management-verifier-source-v1.2.0" ]]
+          [[ ! -e "$VERIFIER_SOURCE" && ! -L "$VERIFIER_SOURCE" ]]
+          cp -a --no-preserve=ownership -- "$GITHUB_WORKSPACE" "$VERIFIER_SOURCE"
+          [[ -d "$VERIFIER_SOURCE/.git" && ! -L "$VERIFIER_SOURCE/.git" ]]
+          [[ -z "$(find "$VERIFIER_SOURCE" ! -uid "$(id -u)" -print -quit)" ]]
+          expected_assets="$(printf '%s\n' \
+            SHA256SUMS \
+            probe-panel-management-v1.2.0-linux-amd64.tar.gz \
+            probe-panel-management-v1.2.0-linux-arm64.tar.gz | LC_ALL=C sort)"
+          actual_assets="$(find "$UNVERIFIED_DOWNLOAD_ROOT" -mindepth 1 -maxdepth 1 \
+            -type f -printf '%f\n' | LC_ALL=C sort)"
+          [[ "$actual_assets" == "$expected_assets" ]]
+          [[ "$(find "$UNVERIFIED_DOWNLOAD_ROOT" -mindepth 1 -maxdepth 1 | wc -l)" -eq 3 ]]
+          [[ -z "$(find "$UNVERIFIED_DOWNLOAD_ROOT" -mindepth 1 -maxdepth 1 \
+            ! -type f -print -quit)" ]]
+          [[ "$(wc -l < "$UNVERIFIED_DOWNLOAD_ROOT/SHA256SUMS")" -eq 2 ]]
+          expected_checksum_names="$(printf '%s\n' \
+            probe-panel-management-v1.2.0-linux-amd64.tar.gz \
+            probe-panel-management-v1.2.0-linux-arm64.tar.gz | LC_ALL=C sort)"
+          actual_checksum_names="$(awk '
+            $1 !~ /^[0-9a-f]{64}$/ { exit 2 }
+            NF != 2 { exit 3 }
+            { print $2 }
+          ' "$UNVERIFIED_DOWNLOAD_ROOT/SHA256SUMS" | LC_ALL=C sort)"
+          [[ "$actual_checksum_names" == "$expected_checksum_names" ]]
+          (
+            cd "$UNVERIFIED_DOWNLOAD_ROOT"
+            sha256sum --check --strict SHA256SUMS
+          )
+
+          trusted_git() (
+            unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE
+            unset GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+            unset GIT_REPLACE_REF_BASE GIT_NAMESPACE GIT_EXEC_PATH
+            unset GIT_CONFIG GIT_CONFIG_SYSTEM GIT_CONFIG_GLOBAL
+            unset GIT_CONFIG_NOSYSTEM GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS
+            unset GIT_ATTR_NOSYSTEM
+            export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+            export GIT_ATTR_NOSYSTEM=1 GIT_NO_REPLACE_OBJECTS=1
+            command /usr/bin/git --no-replace-objects \
+              -c "safe.directory=$VERIFIER_SOURCE" "$@"
+          )
+          [[ -z "$(trusted_git -c core.fsmonitor=false -c core.untrackedCache=false \
+            -C "$VERIFIER_SOURCE" status --porcelain=v1 --untracked-files=all)" ]]
+          source_tag_object="$(trusted_git -C "$VERIFIER_SOURCE" \
+            rev-parse --verify refs/tags/v1.2.0)"
+          source_commit="$(trusted_git -C "$VERIFIER_SOURCE" rev-parse --verify \
             'refs/tags/v1.2.0^{commit}')"
+          [[ "$(trusted_git -C "$VERIFIER_SOURCE" rev-parse --verify \
+            'HEAD^{commit}')" == "$source_commit" ]]
+          [[ "$source_tag_object" =~ ^[0-9a-f]{40}$ ]]
           [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]]
-          cd "$BUILD_SOURCE/probe-api"
+          [[ "$(trusted_git -C "$VERIFIER_SOURCE" cat-file -t \
+            "$source_tag_object")" == tag ]]
+          remote_tags="$(trusted_git -C / ls-remote --exit-code \
+            https://github.com/Kcmose/super-my.git \
+            refs/tags/v1.2.0 'refs/tags/v1.2.0^{}')"
+          remote_tag_object="$(awk '$2 == "refs/tags/v1.2.0" { print $1 }' \
+            <<<"$remote_tags")"
+          remote_tag_commit="$(awk '$2 == "refs/tags/v1.2.0^{}" { print $1 }' \
+            <<<"$remote_tags")"
+          [[ "$(awk '$2 == "refs/tags/v1.2.0" { count++ } END { print count + 0 }' \
+            <<<"$remote_tags")" -eq 1 ]]
+          [[ "$(awk '$2 == "refs/tags/v1.2.0^{}" { count++ } END { print count + 0 }' \
+            <<<"$remote_tags")" -eq 1 ]]
+          [[ "$remote_tag_object" == "$source_tag_object" ]]
+          [[ "$remote_tag_commit" == "$source_commit" ]]
+          cd "$VERIFIER_SOURCE/probe-api"
           go run ./cmd/probe-support-gate verify \
             --support-root deploy/support \
             --release v1.2.0 \
             --require-zero-supported \
-            --release-assets "$RELEASE_OUTPUT" \
-            --source-commit "$source_commit"
+            --release-assets "$UNVERIFIED_DOWNLOAD_ROOT" \
+            --source-commit "$source_commit" \
+            --source-tag-object "$source_tag_object"
+          [[ -z "$(trusted_git -c core.fsmonitor=false -c core.untrackedCache=false \
+            -C "$VERIFIER_SOURCE" status --porcelain=v1 --untracked-files=all)" ]]
+          remote_tags_after="$(trusted_git -C / ls-remote --exit-code \
+            https://github.com/Kcmose/super-my.git \
+            refs/tags/v1.2.0 'refs/tags/v1.2.0^{}')"
+          [[ "$(awk '$2 == "refs/tags/v1.2.0" { count++ } END { print count + 0 }' \
+            <<<"$remote_tags_after")" -eq 1 ]]
+          [[ "$(awk '$2 == "refs/tags/v1.2.0^{}" { count++ } END { print count + 0 }' \
+            <<<"$remote_tags_after")" -eq 1 ]]
+          [[ "$(awk '$2 == "refs/tags/v1.2.0" { print $1 }' \
+            <<<"$remote_tags_after")" == "$source_tag_object" ]]
+          [[ "$(awk '$2 == "refs/tags/v1.2.0^{}" { print $1 }' \
+            <<<"$remote_tags_after")" == "$source_commit" ]]
 
       - name: Stage exactly the verified candidate for upload
         shell: bash
+        env:
+          BASH_ENV: /dev/null
+          UNVERIFIED_DOWNLOAD_ROOT: ${{ runner.temp }}/probe-panel-management-unverified-v1.2.0
+          CANDIDATE_UPLOAD_ROOT: ${{ github.workspace }}/release-upload-v1.2.0
+          PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
         run: |
           set -Eeuo pipefail
           [[ "$CANDIDATE_UPLOAD_ROOT" == \
@@ -210,7 +409,7 @@ jobs:
             SHA256SUMS \
             probe-panel-management-v1.2.0-linux-amd64.tar.gz \
             probe-panel-management-v1.2.0-linux-arm64.tar.gz; do
-            source_asset="$RELEASE_OUTPUT/$asset"
+            source_asset="$UNVERIFIED_DOWNLOAD_ROOT/$asset"
             staged_asset="$CANDIDATE_UPLOAD_ROOT/$asset"
             [[ -f "$source_asset" && ! -L "$source_asset" ]]
             install -m 0644 -- "$source_asset" "$staged_asset"

@@ -168,14 +168,17 @@ type EvidenceSubject struct {
 }
 
 // VerifyOptions supplies the trust root that cannot be taken from the
-// editable evidence ledger itself. ReleaseAssetsDir and SourceCommit must be
-// supplied together. Candidate-only ledgers may omit both.
+// editable evidence ledger itself. ReleaseAssetsDir, SourceCommit, and
+// SourceTagObject must be supplied together. Candidate-only ledgers may omit
+// all three.
 type VerifyOptions struct {
 	RequireZeroSupported    bool
 	ReleaseAssetsDir        string
 	SourceCommit            string
+	SourceTagObject         string
 	UpgradeFromAssetsDir    string
 	UpgradeFromSourceCommit string
+	UpgradeFromTagObject    string
 }
 
 type trustedAsset struct {
@@ -245,13 +248,13 @@ func VerifyDirectory(supportRoot, release string, options VerifyOptions) (Summar
 		return summary, err
 	}
 
-	targetSubjectProvided := options.ReleaseAssetsDir != "" || options.SourceCommit != ""
-	upgradeSubjectProvided := options.UpgradeFromAssetsDir != "" || options.UpgradeFromSourceCommit != ""
-	if (options.ReleaseAssetsDir == "") != (options.SourceCommit == "") {
-		return summary, errors.New("release_assets_dir and source_commit must be provided together")
+	targetSubjectProvided := options.ReleaseAssetsDir != "" || options.SourceCommit != "" || options.SourceTagObject != ""
+	upgradeSubjectProvided := options.UpgradeFromAssetsDir != "" || options.UpgradeFromSourceCommit != "" || options.UpgradeFromTagObject != ""
+	if targetSubjectProvided && (options.ReleaseAssetsDir == "" || options.SourceCommit == "" || options.SourceTagObject == "") {
+		return summary, errors.New("release_assets_dir, source_commit, and source_tag_object must be provided together")
 	}
-	if (options.UpgradeFromAssetsDir == "") != (options.UpgradeFromSourceCommit == "") {
-		return summary, errors.New("upgrade_from_assets_dir and upgrade_from_source_commit must be provided together")
+	if upgradeSubjectProvided && (options.UpgradeFromAssetsDir == "" || options.UpgradeFromSourceCommit == "" || options.UpgradeFromTagObject == "") {
+		return summary, errors.New("upgrade_from_assets_dir, upgrade_from_source_commit, and upgrade_from_tag_object must be provided together")
 	}
 	if upgradeSubjectProvided && !targetSubjectProvided {
 		return summary, errors.New("upgrade-from trusted release subject requires the target trusted release subject")
@@ -259,8 +262,14 @@ func VerifyDirectory(supportRoot, release string, options VerifyOptions) (Summar
 	if options.SourceCommit != "" && !commitPattern.MatchString(options.SourceCommit) {
 		return summary, errors.New("source_commit must be a lowercase 40-character Git object ID")
 	}
+	if options.SourceTagObject != "" && !commitPattern.MatchString(options.SourceTagObject) {
+		return summary, errors.New("source_tag_object must be a lowercase 40-character Git object ID")
+	}
 	if options.UpgradeFromSourceCommit != "" && !commitPattern.MatchString(options.UpgradeFromSourceCommit) {
 		return summary, errors.New("upgrade_from_source_commit must be a lowercase 40-character Git object ID")
+	}
+	if options.UpgradeFromTagObject != "" && !commitPattern.MatchString(options.UpgradeFromTagObject) {
+		return summary, errors.New("upgrade_from_tag_object must be a lowercase 40-character Git object ID")
 	}
 
 	var policy Policy
@@ -283,7 +292,7 @@ func VerifyDirectory(supportRoot, release string, options VerifyOptions) (Summar
 	trustedAssets := make(map[string]trustedAsset)
 	trustedUpgradeAssets := make(map[string]trustedAsset)
 	if options.ReleaseAssetsDir != "" {
-		trustedAssets, err = loadTrustedReleaseAssets(options.ReleaseAssetsDir, release, options.SourceCommit)
+		trustedAssets, err = loadTrustedReleaseAssets(options.ReleaseAssetsDir, release, options.SourceCommit, options.SourceTagObject)
 		if err != nil {
 			return summary, fmt.Errorf("release assets: %w", err)
 		}
@@ -293,7 +302,7 @@ func VerifyDirectory(supportRoot, release string, options VerifyOptions) (Summar
 		if !promotable {
 			return summary, fmt.Errorf("release %s has no promotion lineage for trusted upgrade inputs", release)
 		}
-		trustedUpgradeAssets, err = loadTrustedReleaseAssets(options.UpgradeFromAssetsDir, upgradeFromRelease, options.UpgradeFromSourceCommit)
+		trustedUpgradeAssets, err = loadTrustedReleaseAssets(options.UpgradeFromAssetsDir, upgradeFromRelease, options.UpgradeFromSourceCommit, options.UpgradeFromTagObject)
 		if err != nil {
 			return summary, fmt.Errorf("upgrade-from release assets: %w", err)
 		}
@@ -787,7 +796,7 @@ func canonicalDirectory(candidate string) (string, error) {
 	return absolute, nil
 }
 
-func loadTrustedReleaseAssets(assetsDir, release, sourceCommit string) (map[string]trustedAsset, error) {
+func loadTrustedReleaseAssets(assetsDir, release, sourceCommit, sourceTagObject string) (map[string]trustedAsset, error) {
 	root, err := canonicalDirectory(assetsDir)
 	if err != nil {
 		return nil, err
@@ -799,7 +808,7 @@ func loadTrustedReleaseAssets(assetsDir, release, sourceCommit string) (map[stri
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", name, err)
 		}
-		assetSHA256, manifestSHA256, err := hashReleaseAsset(filename, name, info, release, architecture, sourceCommit)
+		assetSHA256, manifestSHA256, err := hashReleaseAsset(filename, name, info, release, architecture, sourceCommit, sourceTagObject)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", name, err)
 		}
@@ -831,7 +840,7 @@ func canonicalTarEntryName(header *tar.Header) (string, bool) {
 	return name, true
 }
 
-func hashReleaseAsset(filename, assetName string, expectedInfo os.FileInfo, release, architecture, sourceCommit string) (string, string, error) {
+func hashReleaseAsset(filename, assetName string, expectedInfo os.FileInfo, release, architecture, sourceCommit, sourceTagObject string) (string, string, error) {
 	file, err := os.Open(filename)
 	if err != nil {
 		return "", "", err
@@ -914,7 +923,7 @@ func hashReleaseAsset(filename, assetName string, expectedInfo os.FileInfo, rele
 	if releaseManifestCount != 1 {
 		return "", "", fmt.Errorf("expected exactly one RELEASE-MANIFEST, found %d", releaseManifestCount)
 	}
-	if err := validateReleaseManifest(releaseManifest, release, architecture, sourceCommit); err != nil {
+	if err := validateReleaseManifest(releaseManifest, release, architecture, sourceCommit, sourceTagObject); err != nil {
 		return "", "", fmt.Errorf("RELEASE-MANIFEST: %w", err)
 	}
 	if _, err := io.Copy(io.Discard, limitedBundle); err != nil {
@@ -933,7 +942,7 @@ func hashReleaseAsset(filename, assetName string, expectedInfo os.FileInfo, rele
 	return hex.EncodeToString(assetHash.Sum(nil)), hex.EncodeToString(manifestHash[:]), nil
 }
 
-func validateReleaseManifest(data []byte, release, architecture, sourceCommit string) error {
+func validateReleaseManifest(data []byte, release, architecture, sourceCommit, sourceTagObject string) error {
 	if len(data) == 0 || data[len(data)-1] != '\n' || bytes.Contains(data, []byte{'\r'}) {
 		return errors.New("must be non-empty LF-terminated text")
 	}
@@ -961,6 +970,7 @@ func validateReleaseManifest(data []byte, release, architecture, sourceCommit st
 		"platform_ids":      strings.Join(platformIDs, ","),
 		"source_repository": sourceRepository,
 		"source_commit":     sourceCommit,
+		"source_tag_object": sourceTagObject,
 		"super_my_ref":      "refs/tags/" + release,
 	}
 	if len(values) != len(expected) {

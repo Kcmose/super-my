@@ -713,6 +713,7 @@ for contract in \
     "(github.event_name == 'workflow_dispatch' && inputs.version == 'v1.2.0')" \
     'image: debian:13-slim' \
     'contents: read' \
+    'ca-certificates curl file git gzip python3 tar xz-utils' \
     '- name: Install pinned ShellCheck 0.11.0' \
     'SHELLCHECK_ARCHIVE_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198' \
     '[[ "$(shellcheck --version | awk' \

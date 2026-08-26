@@ -2,8 +2,12 @@ name: Build management candidate and verify immutable legacy release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - v1.2.0
+    paths:
+      - .github/workflows/release.yml
   release:
     types: [published]
   workflow_dispatch:
@@ -14,6 +18,7 @@ on:
         type: choice
         default: v1.1.0
         options:
+          - v1.2.0
           - v1.1.0
 
 permissions:
@@ -26,7 +31,10 @@ concurrency:
 jobs:
   build_management:
     name: Build management v1.2.0 candidate
-    if: github.event_name == 'push' && github.ref == 'refs/tags/v1.2.0'
+    if: >-
+      (github.event_name == 'push' &&
+      (github.ref == 'refs/tags/v1.2.0' || github.ref == 'refs/heads/main')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.version == 'v1.2.0')
     runs-on: ubuntu-24.04
     container:
       image: debian:13-slim
@@ -34,8 +42,16 @@ jobs:
       contents: read
     env:
       RELEASE_TAG: v1.2.0
-      RELEASE_OUTPUT: ${{ runner.temp }}/probe-panel-management-release-v1.2.0
     steps:
+      - name: Initialize runner-local build paths
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ -n "${RUNNER_TEMP:-}" ]]
+          [[ "$RUNNER_TEMP" == /* ]]
+          printf 'RELEASE_OUTPUT=%s\n' \
+            "$RUNNER_TEMP/probe-panel-management-release-v1.2.0" >> "$GITHUB_ENV"
+
       - name: Install Debian 13 build prerequisites
         shell: bash
         run: |
@@ -68,8 +84,15 @@ jobs:
         run: |
           set -Eeuo pipefail
           [[ "$GITHUB_REPOSITORY" == Kcmose/super-my ]]
-          [[ "$GITHUB_REF" == refs/tags/v1.2.0 ]]
-          [[ "$GITHUB_REF_TYPE" == tag ]]
+          case "$GITHUB_EVENT_NAME:$GITHUB_REF" in
+            push:refs/tags/v1.2.0|push:refs/heads/main|workflow_dispatch:refs/heads/main)
+              ;;
+            *)
+              printf 'unexpected workflow trigger: %s:%s\n' \
+                "$GITHUB_EVENT_NAME" "$GITHUB_REF" >&2
+              exit 1
+              ;;
+          esac
           git remote set-url origin https://github.com/Kcmose/super-my.git
           [[ "$(git remote get-url origin)" == https://github.com/Kcmose/super-my.git ]]
           [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
@@ -158,10 +181,11 @@ jobs:
       contents: read
     env:
       RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.version }}
-      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Require the reviewed immutable release
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -Eeuo pipefail
           [[ "$RELEASE_TAG" == v1.1.0 ]]
@@ -181,6 +205,8 @@ jobs:
 
       - name: Download the published assets
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -Eeuo pipefail
           install -d "$RUNNER_TEMP/release-assets"

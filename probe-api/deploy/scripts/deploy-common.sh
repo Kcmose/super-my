@@ -1885,6 +1885,29 @@ build_release_artifacts() {
 }
 # MANAGEMENT_BUNDLE_EXCLUDE_BUILD_END
 
+management_deploy_helper_is_clean() {
+    local helper_file="$1" api_hardening_line backup_hardening_line
+    local legacy_hardening_count sanitized_helper scan_status=0
+    api_hardening_line="        grep -Fxq 'ProtectSystem=full' \"\$unit_file\" || die \"legacy probe-api unit must protect the system\""
+    backup_hardening_line="        grep -Fxq 'ProtectSystem=full' \"\$service_file\" ||"
+
+    [[ -f "$helper_file" && ! -L "$helper_file" ]] || return 1
+    grep -Fxq "$api_hardening_line" "$helper_file" || return 1
+    grep -Fxq "$backup_hardening_line" "$helper_file" || return 1
+    legacy_hardening_count="$(grep -Foc 'ProtectSystem=full' "$helper_file")" || return 1
+    [[ "$legacy_hardening_count" == 2 ]] || return 1
+    sanitized_helper="$(
+        sed 's/ProtectSystem=full/ProtectSystem=reviewed-legacy-hardening/g' "$helper_file"
+    )" || return 1
+    grep -Eiq 'MANAGEMENT_BUNDLE_EXCLUDE|build_release_artifacts|deploy_release\(\)|npm[[:space:]]+run[[:space:]]+build|[.]/cmd/probe-agent|artifacts/(agent|web)|PROBE_(AGENT|WEB)_DIR|old_(agent|web)|probe-web|/srv/probe/(agent|web)|(^|[^[:alnum:]_])full([^[:alnum:]_]|$)' \
+        <<< "$sanitized_helper" || scan_status=$?
+    case "$scan_status" in
+        0) return 1 ;;
+        1) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 validate_prebuilt_bundle() {
     local bundle_root="$1" profile="${2:-full}"
     validate_release_profile "$profile"
@@ -2017,7 +2040,7 @@ EOF
         [[ "$actual_deploy_files" == "$expected_deploy_files" ]] ||
             die "prebuilt management deploy assets differ from the reviewed runtime allowlist"
 
-        if grep -Eiq 'MANAGEMENT_BUNDLE_EXCLUDE|build_release_artifacts|deploy_release\(\)|npm[[:space:]]+run[[:space:]]+build|[.]/cmd/probe-agent|artifacts/(agent|web)|PROBE_(AGENT|WEB)_DIR|old_(agent|web)|probe-web|/srv/probe/(agent|web)|(^|[^[:alnum:]_])full([^[:alnum:]_]|$)' \
+        if ! management_deploy_helper_is_clean \
             "$bundle_root/source/probe-api/deploy/scripts/deploy-common.sh"; then
             die "prebuilt management deploy-common contains forbidden full, Agent-artifact, visitor, or build logic"
         fi

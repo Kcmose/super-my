@@ -482,6 +482,93 @@ PATH=$STUB_ROOT PROBE_BOOTSTRAP_TRUNCATION_MARKER=$MARKER /bin/bash "$WITHOUT_EN
     fail 'function-only installer should parse without executing'
 [ ! -e "$MARKER" ] || fail 'installer without final entrypoint executed an external command'
 
+# The management-only content policy permits exactly the two reviewed CentOS 7
+# systemd hardening token occurrences.  The unit-contract validator separately
+# checks their surrounding assertions.  This scan must reject an extra `full` or
+# any Agent/visitor/build marker.  Keep bootstrap and deployment copies exact.
+INSTALL_POLICY_SOURCE=$TEST_ROOT/install-management-content-policy.source
+COMMON_POLICY_SOURCE=$TEST_ROOT/common-management-content-policy.source
+DEPLOY_POLICY_SOURCE=$TEST_ROOT/deploy-management-content-policy.source
+sed -n '/^management_deploy_helper_is_clean()/,/^}/p' "$INSTALLER" > "$INSTALL_POLICY_SOURCE"
+sed -n '/^management_deploy_helper_is_clean()/,/^}/p' "$INSTALL_COMMON" > "$COMMON_POLICY_SOURCE"
+sed -n '/^management_deploy_helper_is_clean()/,/^}/p' "$DEPLOY_COMMON" > "$DEPLOY_POLICY_SOURCE"
+[ -s "$INSTALL_POLICY_SOURCE" ] || fail 'standalone installer is missing the management content policy'
+cmp -s "$INSTALL_POLICY_SOURCE" "$COMMON_POLICY_SOURCE" ||
+    fail 'standalone installer management content policy differs from its canonical source'
+cmp -s "$INSTALL_POLICY_SOURCE" "$DEPLOY_POLICY_SOURCE" ||
+    fail 'bootstrap and deployment management content policies differ'
+
+MANAGEMENT_HELPER_ALLOWED=$TEST_ROOT/management-helper-allowed
+printf '%s\n' \
+    'safe_management_runtime() {' \
+    "        grep -Fxq 'ProtectSystem=full' \"\$unit_file\" || die \"legacy probe-api unit must protect the system\"" \
+    "        grep -Fxq 'ProtectSystem=full' \"\$service_file\" ||" \
+    '            die "legacy PostgreSQL backup service must protect the system filesystem"' \
+    '    printf '\''%s\n'\'' management' \
+    '}' > "$MANAGEMENT_HELPER_ALLOWED"
+/bin/bash -c '
+    source "$1"
+    management_deploy_helper_is_clean "$2"
+' probe-management-content-policy "$WITHOUT_ENTRYPOINT" "$MANAGEMENT_HELPER_ALLOWED" ||
+    fail 'management content policy rejected the two reviewed legacy hardening assertions'
+
+MANAGEMENT_HELPER_FORBIDDEN=$TEST_ROOT/management-helper-forbidden
+cp "$MANAGEMENT_HELPER_ALLOWED" "$MANAGEMENT_HELPER_FORBIDDEN"
+printf '%s\n' 'probe-web' >> "$MANAGEMENT_HELPER_FORBIDDEN"
+if /bin/bash -c '
+    source "$1"
+    management_deploy_helper_is_clean "$2"
+' probe-management-content-policy "$WITHOUT_ENTRYPOINT" "$MANAGEMENT_HELPER_FORBIDDEN"; then
+    fail 'management content policy accepted a visitor marker'
+fi
+cp "$MANAGEMENT_HELPER_ALLOWED" "$MANAGEMENT_HELPER_FORBIDDEN"
+printf '%s\n' 'ProtectSystem=full' >> "$MANAGEMENT_HELPER_FORBIDDEN"
+if /bin/bash -c '
+    source "$1"
+    management_deploy_helper_is_clean "$2"
+' probe-management-content-policy "$WITHOUT_ENTRYPOINT" "$MANAGEMENT_HELPER_FORBIDDEN"; then
+    fail 'management content policy accepted an unreviewed full token'
+fi
+cp "$MANAGEMENT_HELPER_ALLOWED" "$MANAGEMENT_HELPER_FORBIDDEN"
+printf '%s\n' 'profile=full' >> "$MANAGEMENT_HELPER_FORBIDDEN"
+if /bin/bash -c '
+    source "$1"
+    management_deploy_helper_is_clean "$2"
+' probe-management-content-policy "$WITHOUT_ENTRYPOINT" "$MANAGEMENT_HELPER_FORBIDDEN"; then
+    fail 'management content policy did not exercise its general full-token rejection'
+fi
+sed '2d' "$MANAGEMENT_HELPER_ALLOWED" > "$MANAGEMENT_HELPER_FORBIDDEN"
+if /bin/bash -c '
+    source "$1"
+    management_deploy_helper_is_clean "$2"
+' probe-management-content-policy "$WITHOUT_ENTRYPOINT" "$MANAGEMENT_HELPER_FORBIDDEN"; then
+    fail 'management content policy accepted a missing legacy hardening assertion'
+fi
+if /bin/bash -c '
+    source "$1"
+    grep() {
+        if [[ ${1:-} == -Eiq ]]; then
+            return 2
+        fi
+        command grep "$@"
+    }
+    management_deploy_helper_is_clean "$2"
+' probe-management-content-policy "$WITHOUT_ENTRYPOINT" "$MANAGEMENT_HELPER_ALLOWED"; then
+    fail 'management content policy failed open when its forbidden-content scan errored'
+fi
+if /bin/bash -c '
+    source "$1"
+    grep() {
+        if [[ ${1:-} == -Foc ]]; then
+            return 2
+        fi
+        command grep "$@"
+    }
+    management_deploy_helper_is_clean "$2"
+' probe-management-content-policy "$WITHOUT_ENTRYPOINT" "$MANAGEMENT_HELPER_ALLOWED"; then
+    fail 'management content policy failed open when its hardening-count scan errored'
+fi
+
 # Every strict prefix of the final compound entrypoint must remain a syntax
 # error. Override main in the fixture so the old unsafe bare `main` prefix would
 # leave an unmistakable marker even on an EOL host that otherwise fails early.

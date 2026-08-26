@@ -84,6 +84,8 @@ jobs:
         run: |
           set -Eeuo pipefail
           [[ "$GITHUB_REPOSITORY" == Kcmose/super-my ]]
+          [[ "$GITHUB_WORKSPACE" == "$PWD" ]]
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           case "$GITHUB_EVENT_NAME:$GITHUB_REF" in
             push:refs/tags/v1.2.0|push:refs/heads/main|workflow_dispatch:refs/heads/main)
               ;;

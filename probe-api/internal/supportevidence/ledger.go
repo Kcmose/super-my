@@ -812,6 +812,25 @@ func loadTrustedReleaseAssets(assetsDir, release, sourceCommit string) (map[stri
 	return assets, nil
 }
 
+func canonicalTarEntryName(header *tar.Header) (string, bool) {
+	name := header.Name
+	// POSIX tar writers conventionally terminate directory names with one
+	// slash. Normalize only that type-specific marker; a trailing slash on any
+	// other entry remains invalid.
+	if header.Typeflag == tar.TypeDir && strings.HasSuffix(name, "/") {
+		name = strings.TrimSuffix(name, "/")
+	}
+	if name == "" || strings.Contains(name, "\\") || path.IsAbs(name) || path.Clean(name) != name {
+		return "", false
+	}
+	for _, component := range strings.Split(name, "/") {
+		if component == "" || component == "." || component == ".." {
+			return "", false
+		}
+	}
+	return name, true
+}
+
 func hashReleaseAsset(filename, assetName string, expectedInfo os.FileInfo, release, architecture, sourceCommit string) (string, string, error) {
 	file, err := os.Open(filename)
 	if err != nil {
@@ -838,6 +857,7 @@ func hashReleaseAsset(filename, assetName string, expectedInfo os.FileInfo, rele
 	expectedReleaseManifest := bundleRoot + "/RELEASE-MANIFEST"
 	manifestCount := 0
 	releaseManifestCount := 0
+	seenEntries := make(map[string]struct{})
 	var manifest []byte
 	var releaseManifest []byte
 	for {
@@ -848,10 +868,15 @@ func hashReleaseAsset(filename, assetName string, expectedInfo os.FileInfo, rele
 		if err != nil {
 			return "", "", fmt.Errorf("read tar stream: %w", err)
 		}
-		if header.Name == "" || strings.Contains(header.Name, "\\") || path.IsAbs(header.Name) || path.Clean(header.Name) != header.Name {
+		entryName, canonical := canonicalTarEntryName(header)
+		if !canonical {
 			return "", "", fmt.Errorf("tar contains non-canonical path %q", header.Name)
 		}
-		baseName := path.Base(header.Name)
+		if _, duplicate := seenEntries[entryName]; duplicate {
+			return "", "", fmt.Errorf("tar contains duplicate canonical path %q", entryName)
+		}
+		seenEntries[entryName] = struct{}{}
+		baseName := path.Base(entryName)
 		if baseName != "BUNDLE-SHA256SUMS" && baseName != "RELEASE-MANIFEST" {
 			continue
 		}
@@ -871,13 +896,13 @@ func hashReleaseAsset(filename, assetName string, expectedInfo os.FileInfo, rele
 		switch baseName {
 		case "BUNDLE-SHA256SUMS":
 			manifestCount++
-			if header.Name != expectedManifest {
+			if entryName != expectedManifest {
 				return "", "", fmt.Errorf("bundle manifest must be exactly %s", expectedManifest)
 			}
 			manifest = entry
 		case "RELEASE-MANIFEST":
 			releaseManifestCount++
-			if header.Name != expectedReleaseManifest {
+			if entryName != expectedReleaseManifest {
 				return "", "", fmt.Errorf("release manifest must be exactly %s", expectedReleaseManifest)
 			}
 			releaseManifest = entry

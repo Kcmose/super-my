@@ -354,6 +354,64 @@ func TestCandidateAndBaselineMayValidateTargetAssetsOnly(t *testing.T) {
 	}
 }
 
+func TestCanonicalTarEntryNameAllowsOnlySafeRelativePaths(t *testing.T) {
+	tests := []struct {
+		name     string
+		typeflag byte
+		want     string
+		valid    bool
+	}{
+		{name: "bundle/", typeflag: tar.TypeDir, want: "bundle", valid: true},
+		{name: "bundle", typeflag: tar.TypeDir, want: "bundle", valid: true},
+		{name: "bundle/nested/", typeflag: tar.TypeDir, want: "bundle/nested", valid: true},
+		{name: "bundle/file", typeflag: tar.TypeReg, want: "bundle/file", valid: true},
+		{name: "", typeflag: tar.TypeReg},
+		{name: "/absolute", typeflag: tar.TypeReg},
+		{name: "../escape", typeflag: tar.TypeReg},
+		{name: "bundle/../escape", typeflag: tar.TypeReg},
+		{name: "bundle/./file", typeflag: tar.TypeReg},
+		{name: "bundle//file", typeflag: tar.TypeReg},
+		{name: "bundle\\file", typeflag: tar.TypeReg},
+		{name: ".", typeflag: tar.TypeDir},
+		{name: "./", typeflag: tar.TypeDir},
+		{name: "bundle//", typeflag: tar.TypeDir},
+		{name: "bundle/file/", typeflag: tar.TypeReg},
+	}
+	for _, test := range tests {
+		t.Run(fmt.Sprintf("%d-%q", test.typeflag, test.name), func(t *testing.T) {
+			got, valid := canonicalTarEntryName(&tar.Header{Name: test.name, Typeflag: test.typeflag})
+			if valid != test.valid || got != test.want {
+				t.Fatalf("canonicalTarEntryName(%q, %d) = %q, %t; want %q, %t", test.name, test.typeflag, got, valid, test.want, test.valid)
+			}
+		})
+	}
+}
+
+func TestTrustedReleaseAssetRejectsDuplicateCanonicalTarPath(t *testing.T) {
+	fixture := newSupportFixtureForRelease(t, "v1.2.0")
+	assetName := "probe-panel-management-" + fixture.release + "-linux-amd64.tar.gz"
+	bundleRoot := strings.TrimSuffix(assetName, ".tar.gz")
+	manifestName := bundleRoot + "/BUNDLE-SHA256SUMS"
+	writeTestReleaseAssetArchive(
+		t,
+		filepath.Join(fixture.assetsDir, assetName),
+		fixture.release,
+		"amd64",
+		fixture.sourceCommit,
+		[]string{bundleRoot + "/", bundleRoot},
+		[]string{manifestName},
+		nil,
+		1,
+	)
+	_, err := VerifyDirectory(fixture.root, fixture.release, VerifyOptions{
+		ReleaseAssetsDir: fixture.assetsDir,
+		SourceCommit:     fixture.sourceCommit,
+	})
+	if err == nil || !strings.Contains(err.Error(), "duplicate canonical path") {
+		t.Fatalf("release asset with directory aliases was accepted: %v", err)
+	}
+}
+
 func TestSupportedCellRejectsWrongTrustedSourceCommit(t *testing.T) {
 	fixture := newSupportFixture(t)
 	fixture.supportCell(t, 16, nil)
@@ -388,7 +446,9 @@ func TestTrustedReleaseAssetRequiresUniqueBundleManifest(t *testing.T) {
 	assetName := "probe-panel-management-" + fixture.release + "-linux-amd64.tar.gz"
 	manifestName := strings.TrimSuffix(assetName, ".tar.gz") + "/BUNDLE-SHA256SUMS"
 	writeTestReleaseAssetEntries(t, filepath.Join(fixture.assetsDir, assetName), fixture.release, "amd64", fixture.sourceCommit, []string{manifestName, manifestName}, nil)
-	if _, err := fixture.verify(false); err == nil || !strings.Contains(err.Error(), "exactly one BUNDLE-SHA256SUMS") {
+	if _, err := fixture.verify(false); err == nil ||
+		!strings.Contains(err.Error(), "duplicate canonical path") ||
+		!strings.Contains(err.Error(), "BUNDLE-SHA256SUMS") {
 		t.Fatalf("release asset with duplicate bundle manifests was accepted: %v", err)
 	}
 }
@@ -402,7 +462,9 @@ func TestTrustedReleaseAssetRequiresUniqueReleaseManifest(t *testing.T) {
 		ReleaseAssetsDir: fixture.assetsDir,
 		SourceCommit:     fixture.sourceCommit,
 	})
-	if err == nil || !strings.Contains(err.Error(), "exactly one RELEASE-MANIFEST") {
+	if err == nil ||
+		!strings.Contains(err.Error(), "duplicate canonical path") ||
+		!strings.Contains(err.Error(), "RELEASE-MANIFEST") {
 		t.Fatalf("release asset with duplicate release manifests was accepted: %v", err)
 	}
 }
@@ -819,12 +881,27 @@ func writeTestReleaseAsset(t *testing.T, assetsDir, release, architecture, sourc
 
 func writeTestReleaseAssetEntries(t *testing.T, filename, release, architecture, sourceCommit string, manifestNames []string, releaseManifest []byte, releaseManifestCopies ...int) {
 	t.Helper()
+	copies := 1
+	if len(releaseManifestCopies) == 1 {
+		copies = releaseManifestCopies[0]
+	}
+	bundleRoot := strings.TrimSuffix(filepath.Base(filename), ".tar.gz")
+	writeTestReleaseAssetArchive(t, filename, release, architecture, sourceCommit, []string{bundleRoot + "/"}, manifestNames, releaseManifest, copies)
+}
+
+func writeTestReleaseAssetArchive(t *testing.T, filename, release, architecture, sourceCommit string, directoryNames, manifestNames []string, releaseManifest []byte, releaseManifestCopies int) {
+	t.Helper()
 	file, err := os.Create(filename)
 	if err != nil {
 		t.Fatal(err)
 	}
 	gzipWriter := gzip.NewWriter(file)
 	tarWriter := tar.NewWriter(gzipWriter)
+	for _, directoryName := range directoryNames {
+		if err := tarWriter.WriteHeader(&tar.Header{Name: directoryName, Mode: 0o755, Typeflag: tar.TypeDir}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	manifest := []byte("fixture  artifacts/api/probe-api\n")
 	for _, manifestName := range manifestNames {
 		if err := tarWriter.WriteHeader(&tar.Header{Name: manifestName, Mode: 0o644, Size: int64(len(manifest)), Typeflag: tar.TypeReg}); err != nil {
@@ -839,11 +916,7 @@ func writeTestReleaseAssetEntries(t *testing.T, filename, release, architecture,
 	if releaseManifest == nil {
 		releaseManifest = testReleaseManifest(release, architecture, sourceCommit)
 	}
-	copies := 1
-	if len(releaseManifestCopies) == 1 {
-		copies = releaseManifestCopies[0]
-	}
-	for index := 0; index < copies; index++ {
+	for index := 0; index < releaseManifestCopies; index++ {
 		if err := tarWriter.WriteHeader(&tar.Header{Name: releaseManifestName, Mode: 0o644, Size: int64(len(releaseManifest)), Typeflag: tar.TypeReg}); err != nil {
 			t.Fatal(err)
 		}

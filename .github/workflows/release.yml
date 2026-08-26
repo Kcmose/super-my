@@ -2,12 +2,8 @@ name: Build management candidate and verify immutable legacy release
 
 on:
   push:
-    branches:
-      - main
     tags:
       - v1.2.0
-    paths:
-      - .github/workflows/release.yml
   release:
     types: [published]
   workflow_dispatch:
@@ -33,7 +29,7 @@ jobs:
     name: Build management v1.2.0 candidate
     if: >-
       (github.event_name == 'push' &&
-      (github.ref == 'refs/tags/v1.2.0' || github.ref == 'refs/heads/main')) ||
+      github.ref == 'refs/tags/v1.2.0') ||
       (github.event_name == 'workflow_dispatch' && inputs.version == 'v1.2.0')
     runs-on: ubuntu-24.04
     container:
@@ -54,6 +50,8 @@ jobs:
               "$RUNNER_TEMP/probe-panel-management-release-v1.2.0"
             printf 'BUILD_SOURCE=%s\n' \
               "$RUNNER_TEMP/probe-panel-management-source-v1.2.0"
+            printf 'CANDIDATE_UPLOAD_ROOT=%s\n' \
+              "$GITHUB_WORKSPACE/release-upload-v1.2.0"
           } >> "$GITHUB_ENV"
 
       - name: Install Debian 13 build prerequisites
@@ -114,7 +112,7 @@ jobs:
           [[ "$GITHUB_WORKSPACE" == "$PWD" ]]
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           case "$GITHUB_EVENT_NAME:$GITHUB_REF" in
-            push:refs/tags/v1.2.0|push:refs/heads/main|workflow_dispatch:refs/heads/main)
+            push:refs/tags/v1.2.0|workflow_dispatch:refs/heads/main)
               ;;
             *)
               printf 'unexpected workflow trigger: %s:%s\n' \
@@ -200,14 +198,44 @@ jobs:
             --release-assets "$RELEASE_OUTPUT" \
             --source-commit "$source_commit"
 
+      - name: Stage exactly the verified candidate for upload
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ "$CANDIDATE_UPLOAD_ROOT" == \
+            "$GITHUB_WORKSPACE/release-upload-v1.2.0" ]]
+          [[ ! -e "$CANDIDATE_UPLOAD_ROOT" && ! -L "$CANDIDATE_UPLOAD_ROOT" ]]
+          install -d -m 0755 "$CANDIDATE_UPLOAD_ROOT"
+          for asset in \
+            SHA256SUMS \
+            probe-panel-management-v1.2.0-linux-amd64.tar.gz \
+            probe-panel-management-v1.2.0-linux-arm64.tar.gz; do
+            source_asset="$RELEASE_OUTPUT/$asset"
+            staged_asset="$CANDIDATE_UPLOAD_ROOT/$asset"
+            [[ -f "$source_asset" && ! -L "$source_asset" ]]
+            install -m 0644 -- "$source_asset" "$staged_asset"
+            cmp -- "$source_asset" "$staged_asset"
+          done
+          expected_assets="$(printf '%s\n' \
+            SHA256SUMS \
+            probe-panel-management-v1.2.0-linux-amd64.tar.gz \
+            probe-panel-management-v1.2.0-linux-arm64.tar.gz | LC_ALL=C sort)"
+          actual_assets="$(find "$CANDIDATE_UPLOAD_ROOT" -mindepth 1 -maxdepth 1 \
+            -type f -printf '%f\n' | LC_ALL=C sort)"
+          [[ "$actual_assets" == "$expected_assets" ]]
+          [[ "$(find "$CANDIDATE_UPLOAD_ROOT" -mindepth 1 -maxdepth 1 | wc -l)" -eq 3 ]]
+          [[ -z "$(find "$CANDIDATE_UPLOAD_ROOT" -mindepth 1 -maxdepth 1 \
+            ! -type f -print -quit)" ]]
+          (
+            cd "$CANDIDATE_UPLOAD_ROOT"
+            sha256sum --check --strict SHA256SUMS
+          )
+
       - name: Upload the unpublished management candidate
         uses: actions/upload-artifact@v4
         with:
           name: probe-panel-management-v1.2.0-candidate
-          path: |
-            ${{ runner.temp }}/probe-panel-management-release-v1.2.0/SHA256SUMS
-            ${{ runner.temp }}/probe-panel-management-release-v1.2.0/probe-panel-management-v1.2.0-linux-amd64.tar.gz
-            ${{ runner.temp }}/probe-panel-management-release-v1.2.0/probe-panel-management-v1.2.0-linux-arm64.tar.gz
+          path: ${{ github.workspace }}/release-upload-v1.2.0/
           if-no-files-found: error
           retention-days: 14
           compression-level: 0

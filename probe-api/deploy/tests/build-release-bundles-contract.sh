@@ -768,12 +768,10 @@ fi
 # shellcheck disable=SC2016
 for contract in \
     'push:' \
-    'branches:' \
-    '- main' \
     'tags:' \
     '- v1.2.0' \
     'workflow_dispatch:' \
-    "(github.ref == 'refs/tags/v1.2.0' || github.ref == 'refs/heads/main')) ||" \
+    "github.ref == 'refs/tags/v1.2.0') ||" \
     "(github.event_name == 'workflow_dispatch' && inputs.version == 'v1.2.0')" \
     'image: debian:13-slim' \
     'contents: read' \
@@ -802,6 +800,10 @@ for contract in \
     'go run ./cmd/probe-support-gate verify' \
     '--release-assets "$RELEASE_OUTPUT"' \
     '--source-commit "$source_commit"' \
+    '- name: Stage exactly the verified candidate for upload' \
+    'CANDIDATE_UPLOAD_ROOT' \
+    'cmp -- "$source_asset" "$staged_asset"' \
+    'path: ${{ github.workspace }}/release-upload-v1.2.0/' \
     'uses: actions/upload-artifact@v4' \
     'name: probe-panel-management-v1.2.0-candidate' \
     'if-no-files-found: error' \
@@ -817,6 +819,10 @@ for contract in \
     assert_contains "$contract" "$WORKFLOW"
 done
 
+if grep -Fq 'branches:' "$WORKFLOW" || grep -Fq 'push:refs/heads/main' "$WORKFLOW"; then
+    fail 'management candidate workflow must not run on branch pushes'
+fi
+
 checkout_count=$(grep -Fc 'uses: actions/checkout@' "$WORKFLOW")
 [ "$checkout_count" -eq 1 ] ||
     fail 'management release workflow must perform exactly one checkout'
@@ -825,17 +831,20 @@ candidate_copy_line=$(grep -Fn -- '- name: Prepare a root-owned clean source cop
 candidate_build_line=$(grep -Fn -- '- name: Build management-only release assets' "$WORKFLOW" | cut -d: -f1)
 candidate_shape_line=$(grep -Fn -- '- name: Require exactly the three management assets' "$WORKFLOW" | cut -d: -f1)
 candidate_binding_line=$(grep -Fn -- '- name: Bind candidate tarballs to the verified tag commit' "$WORKFLOW" | cut -d: -f1)
+candidate_stage_line=$(grep -Fn -- '- name: Stage exactly the verified candidate for upload' "$WORKFLOW" | cut -d: -f1)
 candidate_upload_line=$(grep -Fn -- '- name: Upload the unpublished management candidate' "$WORKFLOW" | cut -d: -f1)
 if [ -z "$candidate_copy_line" ] ||
     [ -z "$candidate_build_line" ] ||
     [ -z "$candidate_shape_line" ] ||
     [ -z "$candidate_binding_line" ] ||
+    [ -z "$candidate_stage_line" ] ||
     [ -z "$candidate_upload_line" ] ||
     [ "$candidate_copy_line" -ge "$candidate_build_line" ] ||
     [ "$candidate_build_line" -ge "$candidate_shape_line" ] ||
     [ "$candidate_shape_line" -ge "$candidate_binding_line" ] ||
-    [ "$candidate_binding_line" -ge "$candidate_upload_line" ]; then
-    fail 'candidate source must be copied, built, shape-checked, commit-bound, and only then uploaded'
+    [ "$candidate_binding_line" -ge "$candidate_stage_line" ] ||
+    [ "$candidate_stage_line" -ge "$candidate_upload_line" ]; then
+    fail 'candidate source must be copied, built, shape-checked, commit-bound, staged, and only then uploaded'
 fi
 
 candidate_binding_section=$(sed -n \

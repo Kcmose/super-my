@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -103,8 +102,8 @@ func tcpListenerPorts(output []byte) (map[string]struct{}, error) {
 		if len(fields) < 5 || fields[0] != "LISTEN" {
 			return nil, fmt.Errorf("unexpected ss listener record")
 		}
-		host, port, splitErr := net.SplitHostPort(fields[3])
-		if splitErr != nil || (host != "*" && !validListenerIP(host)) {
+		_, _, port, splitErr := splitSSListenerAddress(fields[3])
+		if splitErr != nil {
 			return nil, fmt.Errorf("unexpected ss listener address")
 		}
 		parsed, err := strconv.ParseUint(port, 10, 16)
@@ -116,9 +115,89 @@ func tcpListenerPorts(output []byte) (map[string]struct{}, error) {
 	return ports, nil
 }
 
-func validListenerIP(host string) bool {
+func splitSSListenerAddress(value string) (string, string, string, error) {
+	hostWithZone := ""
+	outsideZone := ""
+	outsideZoneSpecified := false
+	port := ""
+	bracketed := strings.HasPrefix(value, "[")
+	if bracketed {
+		closingBracket := strings.IndexByte(value, ']')
+		if closingBracket <= 1 {
+			return "", "", "", fmt.Errorf("invalid bracketed listener address")
+		}
+		hostWithZone = value[1:closingBracket]
+		suffix := value[closingBracket+1:]
+		switch {
+		case strings.HasPrefix(suffix, ":"):
+			port = suffix[1:]
+		case strings.HasPrefix(suffix, "%"):
+			portSeparator := strings.LastIndexByte(suffix, ':')
+			if portSeparator <= 1 {
+				return "", "", "", fmt.Errorf("invalid scoped listener address")
+			}
+			outsideZone = suffix[1:portSeparator]
+			outsideZoneSpecified = true
+			port = suffix[portSeparator+1:]
+		default:
+			return "", "", "", fmt.Errorf("invalid bracketed listener suffix")
+		}
+	} else {
+		portSeparator := strings.LastIndexByte(value, ':')
+		if portSeparator <= 0 {
+			return "", "", "", fmt.Errorf("invalid listener address")
+		}
+		hostWithZone = value[:portSeparator]
+		port = value[portSeparator+1:]
+	}
+
+	host := hostWithZone
+	zone := ""
+	insideZoneSpecified := false
+	if zoneSeparator := strings.IndexByte(hostWithZone, '%'); zoneSeparator >= 0 {
+		host = hostWithZone[:zoneSeparator]
+		zone = hostWithZone[zoneSeparator+1:]
+		insideZoneSpecified = true
+	}
+	if outsideZoneSpecified {
+		if insideZoneSpecified {
+			return "", "", "", fmt.Errorf("ambiguous listener IP zone")
+		}
+		zone = outsideZone
+	}
+	zoneSpecified := insideZoneSpecified || outsideZoneSpecified
+	if zoneSpecified && !validListenerZone(zone) {
+		return "", "", "", fmt.Errorf("invalid listener IP zone")
+	}
+	if host == "*" {
+		if bracketed {
+			return "", "", "", fmt.Errorf("invalid wildcard listener address")
+		}
+		return host, zone, port, nil
+	}
 	address, err := netip.ParseAddr(host)
-	return err == nil && address.IsValid() && address.Zone() == "" && !address.Is4In6()
+	if err != nil || !address.IsValid() || address.Is4In6() || (bracketed && address.Is4()) {
+		return "", "", "", fmt.Errorf("invalid listener IP address")
+	}
+	return host, zone, port, nil
+}
+
+func validListenerZone(zone string) bool {
+	// Linux interface names are limited to IFNAMSIZ-1 bytes. Match the relevant
+	// dev_valid_name boundary while rejecting NUL and ASCII whitespace
+	// delimiters so malformed ss(8) output still fails closed.
+	if len(zone) == 0 || len(zone) > 15 || zone == "." || zone == ".." {
+		return false
+	}
+	for index := 0; index < len(zone); index++ {
+		character := zone[index]
+		if character == 0 || character == '/' || character == ':' ||
+			character == ' ' || character == '\t' || character == '\n' ||
+			character == '\r' || character == '\v' || character == '\f' {
+			return false
+		}
+	}
+	return true
 }
 
 // tcpPortRestrictedToLoopback accepts a target port only when at least one
@@ -140,15 +219,21 @@ func tcpPortRestrictedToLoopback(output []byte, targetPort string) (bool, error)
 			continue
 		}
 		fields := strings.Fields(line)
-		host, port, err := net.SplitHostPort(fields[3])
+		host, zone, port, err := splitSSListenerAddress(fields[3])
 		if err != nil {
 			return false, fmt.Errorf("unexpected ss listener address")
 		}
 		if port != targetPort {
 			continue
 		}
+		if host == "*" || zone != "" {
+			return false, nil
+		}
 		address, err := netip.ParseAddr(host)
-		if err != nil || (address != ipv4Loopback && address != ipv6Loopback) {
+		if err != nil {
+			return false, fmt.Errorf("unexpected ss listener address")
+		}
+		if address != ipv4Loopback && address != ipv6Loopback {
 			return false, nil
 		}
 		found = true

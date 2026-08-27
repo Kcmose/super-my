@@ -16,7 +16,7 @@ Usage: install-release.sh --bundle-root PATH --release-id ID [options]
 Validate, migrate, and atomically activate a prebuilt Probe Panel release.
 
 Options:
-  --bundle-root PATH      Extracted, checksum-verified release bundle.
+  --bundle-root PATH      Bootstrap-staged, checksum-verified release bundle.
   --release-id ID         Immutable release label, for example v1.0.0.
   --profile PROFILE       Expected profile; v1.2 accepts management only.
   --check-platform ID     Read-only host/runtime and complete bundle preflight.

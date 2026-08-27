@@ -30,6 +30,7 @@ ProtectHome=true
 ReadOnlyPaths=/srv/probe/setup-ui
 ReadWritePaths=/etc/probe-panel
 ReadWritePaths=/var/lib/probe-panel/setup
+ReadWritePaths=/usr/local/lib/probe-panel
 ReadWritePaths=/etc/nginx/conf.d
 ReadWritePaths=/etc/systemd/system
 ReadWritePaths=/etc/letsencrypt

@@ -2065,10 +2065,75 @@ func TestRPMPostgreSQLRuntimeUsesPGDG14Paths(t *testing.T) {
 	}
 }
 
+func TestSSListenerAddressAcceptsKernelScopedForms(t *testing.T) {
+	for _, testCase := range []struct {
+		value string
+		host  string
+		zone  string
+		port  string
+	}{
+		{value: "127.0.0.53%lo:53", host: "127.0.0.53", zone: "lo", port: "53"},
+		{value: "[fe80::1]%eth0:5355", host: "fe80::1", zone: "eth0", port: "5355"},
+		{value: "[fe80::1%eth0]:5355", host: "fe80::1", zone: "eth0", port: "5355"},
+		{value: ":::22", host: "::", port: "22"},
+		{value: "::1:5432", host: "::1", port: "5432"},
+		{value: "fe80::1:5355", host: "fe80::1", port: "5355"},
+		{value: "fe80::1%eth0:5355", host: "fe80::1", zone: "eth0", port: "5355"},
+		{value: "*%eth0:18455", host: "*", zone: "eth0", port: "18455"},
+		{value: "127.0.0.53%bond0.100:53", host: "127.0.0.53", zone: "bond0.100", port: "53"},
+		{value: "127.0.0.53%br-x:53", host: "127.0.0.53", zone: "br-x", port: "53"},
+		{value: "127.0.0.53%if2:53", host: "127.0.0.53", zone: "if2", port: "53"},
+		{value: "127.0.0.53%name+peer:53", host: "127.0.0.53", zone: "name+peer", port: "53"},
+		{value: "127.0.0.53%name@peer:53", host: "127.0.0.53", zone: "name@peer", port: "53"},
+		{value: "127.0.0.53%name%peer:53", host: "127.0.0.53", zone: "name%peer", port: "53"},
+		{value: "127.0.0.53%123456789012345:53", host: "127.0.0.53", zone: "123456789012345", port: "53"},
+	} {
+		host, zone, port, err := splitSSListenerAddress(testCase.value)
+		if err != nil || host != testCase.host || zone != testCase.zone || port != testCase.port {
+			t.Fatalf("splitSSListenerAddress(%q) = host %q zone %q port %q error %v", testCase.value, host, zone, port, err)
+		}
+	}
+
+	for _, value := range []string{
+		"127.0.0.53%:53",
+		"127.0.0.53%.:53",
+		"127.0.0.53%..:53",
+		"127.0.0.53%lo/peer:53",
+		"127.0.0.53%lo:peer:53",
+		"127.0.0.53%white space:53",
+		"127.0.0.53%bad\x00name:53",
+		"127.0.0.53%1234567890123456:53",
+		"[fe80::1]%:5355",
+		"[fe80::1%inside]%outside:5355",
+		"[::ffff:127.0.0.1]:5355",
+		"[127.0.0.1]:53",
+		"not-an-ip%lo:53",
+	} {
+		if host, zone, port, err := splitSSListenerAddress(value); err == nil {
+			t.Fatalf("malformed listener %q parsed as host %q zone %q port %q", value, host, zone, port)
+		}
+	}
+
+	ports, err := tcpListenerPorts([]byte(strings.Join([]string{
+		"LISTEN 0 4096 127.0.0.53%lo:53 0.0.0.0:*",
+		"LISTEN 0 4096 [fe80::1]%eth0:5355 [::]:*",
+		"LISTEN 0 4096 *%eth0:18455 *:*", "",
+	}, "\n")))
+	if err != nil || len(ports) != 3 {
+		t.Fatalf("scoped listener port collection failed: ports=%v error=%v", ports, err)
+	}
+	for _, port := range []string{"53", "5355", "18455"} {
+		if _, exists := ports[port]; !exists {
+			t.Fatalf("scoped listener port %s was not treated as occupied", port)
+		}
+	}
+}
+
 func TestPostgreSQLListenerRestrictionAcceptsOnlyExactLoopback(t *testing.T) {
 	valid := map[string][]byte{
-		"IPv4": []byte("LISTEN 0 128 127.0.0.1:5432 0.0.0.0:*\n"),
-		"IPv6": []byte("LISTEN 0 128 [::1]:5432 [::]:*\n"),
+		"IPv4":        []byte("LISTEN 0 128 127.0.0.1:5432 0.0.0.0:*\n"),
+		"IPv6":        []byte("LISTEN 0 128 [::1]:5432 [::]:*\n"),
+		"legacy IPv6": []byte("LISTEN 0 128 ::1:5432 :::*\n"),
 		"dual stack": []byte(strings.Join([]string{
 			"LISTEN 0 128 127.0.0.1:5432 0.0.0.0:*",
 			"LISTEN 0 128 [::1]:5432 [::]:*", "",
@@ -2076,6 +2141,12 @@ func TestPostgreSQLListenerRestrictionAcceptsOnlyExactLoopback(t *testing.T) {
 		"unrelated external port": []byte(strings.Join([]string{
 			"LISTEN 0 128 127.0.0.1:5432 0.0.0.0:*",
 			"LISTEN 0 128 192.0.2.20:8080 0.0.0.0:*", "",
+		}, "\n")),
+		"unrelated scoped resolver ports": []byte(strings.Join([]string{
+			"LISTEN 0 128 127.0.0.1:5432 0.0.0.0:*",
+			"LISTEN 0 4096 127.0.0.53%lo:53 0.0.0.0:*",
+			"LISTEN 0 4096 [fe80::1]%eth0:5355 [::]:*",
+			"LISTEN 0 4096 *%eth0:5356 *:*", "",
 		}, "\n")),
 	}
 	for name, output := range valid {
@@ -2093,6 +2164,10 @@ func TestPostgreSQLListenerRestrictionAcceptsOnlyExactLoopback(t *testing.T) {
 		"private address":            []byte("LISTEN 0 128 192.168.33.253:5432 0.0.0.0:*\n"),
 		"other IPv4 loopback":        []byte("LISTEN 0 128 127.0.0.2:5432 0.0.0.0:*\n"),
 		"no PostgreSQL TCP listener": []byte("LISTEN 0 128 127.0.0.1:8080 0.0.0.0:*\n"),
+		"zoned target IPv4":          []byte("LISTEN 0 128 127.0.0.1%lo:5432 0.0.0.0:*\n"),
+		"zoned target IPv6":          []byte("LISTEN 0 128 [::1]%lo:5432 [::]:*\n"),
+		"scoped wildcard target":     []byte("LISTEN 0 128 *%eth0:5432 *:*\n"),
+		"mixed zoned target":         []byte("LISTEN 0 128 127.0.0.1:5432 0.0.0.0:*\nLISTEN 0 128 [::1]%lo:5432 [::]:*\n"),
 	} {
 		t.Run(name, func(t *testing.T) {
 			allowed, err := tcpPortRestrictedToLoopback(output, "5432")
@@ -2103,10 +2178,12 @@ func TestPostgreSQLListenerRestrictionAcceptsOnlyExactLoopback(t *testing.T) {
 	}
 
 	for name, output := range map[string][]byte{
-		"short row":    []byte("LISTEN broken\n"),
-		"mapped IPv4":  []byte("LISTEN 0 128 [::ffff:127.0.0.1]:5432 [::]:*\n"),
-		"zoned IPv6":   []byte("LISTEN 0 128 [fe80::1%eth0]:5432 [::]:*\n"),
-		"invalid port": []byte("LISTEN 0 128 127.0.0.1:not-a-port 0.0.0.0:*\n"),
+		"short row":           []byte("LISTEN broken\n"),
+		"mapped IPv4":         []byte("LISTEN 0 128 [::ffff:127.0.0.1]:5432 [::]:*\n"),
+		"empty scope zone":    []byte("LISTEN 0 128 127.0.0.53%:53 0.0.0.0:*\nLISTEN 0 128 127.0.0.1:5432 0.0.0.0:*\n"),
+		"unsafe scope zone":   []byte("LISTEN 0 128 127.0.0.53%lo/peer:53 0.0.0.0:*\nLISTEN 0 128 127.0.0.1:5432 0.0.0.0:*\n"),
+		"oversize scope zone": []byte("LISTEN 0 128 127.0.0.53%interface-name-too-long:53 0.0.0.0:*\nLISTEN 0 128 127.0.0.1:5432 0.0.0.0:*\n"),
+		"invalid port":        []byte("LISTEN 0 128 127.0.0.1:not-a-port 0.0.0.0:*\n"),
 	} {
 		t.Run(name, func(t *testing.T) {
 			if allowed, err := tcpPortRestrictedToLoopback(output, "5432"); err == nil || allowed {

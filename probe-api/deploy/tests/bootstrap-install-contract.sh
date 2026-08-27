@@ -426,6 +426,8 @@ assert_prebuilt_activation_order() {
 
 assert_prebuilt_activation_order "$DEPLOY_COMMON" common
 assert_prebuilt_activation_order "$DEPLOY_MANAGEMENT_RUNTIME" management
+assert_contains 'validate_bootstrap_managed_release_marker "$bundle_root"' "$DEPLOY_MANAGEMENT_RUNTIME"
+assert_contains '.probe-panel-bootstrap-managed' "$DEPLOY_MANAGEMENT_RUNTIME"
 
 # This is a literal source-code contract and must not expand in this process.
 # shellcheck disable=SC2016
@@ -2160,6 +2162,8 @@ second_systemd_preflight_line=$(grep -n '^[[:space:]]*preflight_systemd_host$' "
 manifest_download_line=$(grep -n '^[[:space:]]*download_file "[$]manifest"' "$INSTALL_ACTION_SOURCE" | cut -d: -f1)
 archive_download_line=$(grep -n '^[[:space:]]*download_file "[$]archive"' "$INSTALL_ACTION_SOURCE" | cut -d: -f1)
 release_validation_line=$(grep -n '^[[:space:]]*validate_release_bundle ' "$INSTALL_ACTION_SOURCE" | cut -d: -f1)
+install_release_marker_line=$(grep -n '^[[:space:]]*mark_bootstrap_managed_release "[$]bundle_root"$' "$INSTALL_ACTION_SOURCE" | cut -d: -f1)
+install_release_move_line=$(grep -n '^[[:space:]]*mv -T -- "[$]bundle_root" "[$]INSTALLED_RELEASE"$' "$INSTALL_ACTION_SOURCE" | cut -d: -f1)
 mutation_boundary_line=$(grep -n '^[[:space:]]*HOST_MUTATION_STARTED=1$' "$INSTALL_ACTION_SOURCE" | cut -d: -f1)
 account_mutation_line=$(grep -n '^[[:space:]]*prepare_probe_api_account$' "$INSTALL_ACTION_SOURCE" | cut -d: -f1)
 service_mutation_line=$(grep -n '^[[:space:]]*prepare_runtime_services "[$]PANEL_PROFILE"$' "$INSTALL_ACTION_SOURCE" | cut -d: -f1)
@@ -2169,7 +2173,8 @@ if [ -z "$first_runtime_preflight_line" ] || [ -z "$second_runtime_preflight_lin
     [ -z "$first_fresh_target_line" ] || [ -z "$second_fresh_target_line" ] ||
     [ -z "$first_systemd_preflight_line" ] || [ -z "$second_systemd_preflight_line" ] ||
     [ -z "$manifest_download_line" ] || [ -z "$archive_download_line" ] ||
-    [ -z "$release_validation_line" ] || [ -z "$mutation_boundary_line" ] ||
+    [ -z "$release_validation_line" ] || [ -z "$install_release_marker_line" ] ||
+    [ -z "$install_release_move_line" ] || [ -z "$mutation_boundary_line" ] ||
     [ -z "$runtime_dependency_line" ] || [ -z "$account_mutation_line" ] ||
     [ -z "$service_mutation_line" ] || [ -z "$permanent_directory_line" ] ||
     [ "$first_platform_select_line" -ge "$first_fresh_target_line" ] ||
@@ -2178,6 +2183,8 @@ if [ -z "$first_runtime_preflight_line" ] || [ -z "$second_runtime_preflight_lin
     [ "$first_runtime_preflight_line" -ge "$manifest_download_line" ] ||
     [ "$manifest_download_line" -ge "$archive_download_line" ] ||
     [ "$archive_download_line" -ge "$release_validation_line" ] ||
+    [ "$release_validation_line" -ge "$install_release_marker_line" ] ||
+    [ "$install_release_marker_line" -ge "$install_release_move_line" ] ||
     [ "$release_validation_line" -ge "$second_platform_select_line" ] ||
     [ "$second_platform_select_line" -ge "$second_fresh_target_line" ] ||
     [ "$second_fresh_target_line" -ge "$second_systemd_preflight_line" ] ||
@@ -2197,6 +2204,8 @@ fi
     fail 'install must validate the fresh target before and after release verification'
 [ "$(grep -c '^[[:space:]]*preflight_systemd_host$' "$INSTALL_ACTION_SOURCE")" -eq 2 ] ||
     fail 'install must validate systemd prerequisites before and after release verification'
+[ "$(grep -c '^[[:space:]]*mark_bootstrap_managed_release "[$]bundle_root"$' "$INSTALL_ACTION_SOURCE")" -eq 1 ] ||
+    fail 'install must add the reserved bootstrap marker exactly once before publishing the release'
 assert_contains 'release-verification prerequisites are missing' "$INSTALLER"
 assert_contains 'select_supported_platform()' "$INSTALLER"
 assert_contains 'os-release must declare exactly one ID and one VERSION_ID' "$INSTALLER"
@@ -2293,6 +2302,54 @@ if [ -z "$upgrade_lock_line" ] || [ -z "$upgrade_validation_line" ] ||
     [ "$upgrade_lock_line" -ge "$upgrade_validation_line" ]; then
     fail 'upgrade must acquire the bootstrap lock before validating or replacing the installed management release'
 fi
+upgrade_release_validation_line=$(grep -n '^[[:space:]]*validate_release_bundle ' "$UPGRADE_ACTION_SOURCE" | cut -d: -f1)
+upgrade_release_marker_line=$(grep -n '^[[:space:]]*mark_bootstrap_managed_release "[$]bundle_root"$' "$UPGRADE_ACTION_SOURCE" | cut -d: -f1)
+upgrade_bundled_install_line=$(grep -n '^[[:space:]]*"[$]install_release" --bundle-root "[$]bundle_root" ' "$UPGRADE_ACTION_SOURCE" | cut -d: -f1)
+if [ -z "$upgrade_release_validation_line" ] || [ -z "$upgrade_release_marker_line" ] ||
+    [ -z "$upgrade_bundled_install_line" ] ||
+    [ "$upgrade_release_validation_line" -ge "$upgrade_release_marker_line" ] ||
+    [ "$upgrade_release_marker_line" -ge "$upgrade_bundled_install_line" ]; then
+    fail 'upgrade must mark the verified release before invoking its bundled installer'
+fi
+[ "$(grep -c '^[[:space:]]*mark_bootstrap_managed_release "[$]bundle_root"$' "$UPGRADE_ACTION_SOURCE")" -eq 1 ] ||
+    fail 'upgrade must add the reserved bootstrap marker exactly once'
+[ "$(grep -c '^mark_bootstrap_managed_release() {$' "$INSTALLER")" -eq 1 ] ||
+    fail 'bootstrap release marker helper must be defined exactly once'
+[ "$(grep -c '^[[:space:]]*mark_bootstrap_managed_release "[$]bundle_root"$' "$INSTALLER")" -eq 2 ] ||
+    fail 'only install and upgrade may add the reserved bootstrap release marker'
+
+BOOTSTRAP_MARKER_HELPER_ROOT=$TEST_ROOT/bootstrap-marker-helper
+mkdir -m 0700 "$BOOTSTRAP_MARKER_HELPER_ROOT"
+/bin/bash -c '
+    source "$1"
+    expected_marker="$2/$MANAGED_MARKER"
+    chown() {
+        [[ "$#" -eq 2 && "$1" == root:root && "$2" == "$expected_marker" ]]
+    }
+    mark_bootstrap_managed_release "$2"
+    [[ -f "$expected_marker" && ! -L "$expected_marker" && ! -s "$expected_marker" ]]
+    [[ "$(stat -c "%a" -- "$expected_marker")" == 600 ]]
+' probe-bootstrap-marker-helper-valid "$WITHOUT_ENTRYPOINT" "$BOOTSTRAP_MARKER_HELPER_ROOT" ||
+    fail 'bootstrap marker helper did not create the exact empty private marker'
+
+if /bin/bash -c '
+    source "$1"
+    mark_bootstrap_managed_release "$2"
+' probe-bootstrap-marker-helper-existing "$WITHOUT_ENTRYPOINT" "$BOOTSTRAP_MARKER_HELPER_ROOT" \
+    >/dev/null 2>&1; then
+    fail 'bootstrap marker helper accepted a pre-existing regular marker'
+fi
+rm -f -- "$BOOTSTRAP_MARKER_HELPER_ROOT/.probe-panel-bootstrap-managed"
+ln -s /dev/null "$BOOTSTRAP_MARKER_HELPER_ROOT/.probe-panel-bootstrap-managed"
+if /bin/bash -c '
+    source "$1"
+    mark_bootstrap_managed_release "$2"
+' probe-bootstrap-marker-helper-link "$WITHOUT_ENTRYPOINT" "$BOOTSTRAP_MARKER_HELPER_ROOT" \
+    >/dev/null 2>&1; then
+    fail 'bootstrap marker helper accepted a pre-existing symbolic-link marker'
+fi
+rm -f -- "$BOOTSTRAP_MARKER_HELPER_ROOT/.probe-panel-bootstrap-managed"
+
 uninstall_lock_line=$(grep -n '^[[:space:]]*acquire_bootstrap_lock$' "$UNINSTALL_ACTION_SOURCE" | head -n 1 | cut -d: -f1)
 uninstall_product_line=$(grep -n '^[[:space:]]*if \[\[ -e /srv/probe/api/probe-api' "$UNINSTALL_ACTION_SOURCE" | head -n 1 | cut -d: -f1)
 if [ -z "$uninstall_lock_line" ] || [ -z "$uninstall_product_line" ] ||
@@ -2481,6 +2538,7 @@ for contract in \
     'ReadOnlyPaths=/srv/probe/setup-ui' \
     'ReadWritePaths=/etc/probe-panel' \
     'ReadWritePaths=/var/lib/probe-panel/setup' \
+    'ReadWritePaths=/usr/local/lib/probe-panel' \
     'ReadWritePaths=/etc/nginx/conf.d' \
     'ReadWritePaths=/etc/systemd/system' \
     'ReadWritePaths=/etc/letsencrypt' \
@@ -2499,6 +2557,14 @@ for contract in \
     'SocketBindDeny=any'; do
     assert_contains "$contract" "$FINALIZER_UNIT"
 done
+
+for finalizer_service in "$FINALIZER_UNIT" "$FINALIZER_LEGACY_UNIT"; do
+    [ "$(grep -Fc 'ReadWritePaths=/usr/local/lib/probe-panel' "$finalizer_service")" -eq 1 ] ||
+        fail "setup finalizer must grant exactly one narrow management lifecycle write path: $finalizer_service"
+done
+if grep -Fxq 'ReadWritePaths=/usr/local/lib' "$FINALIZER_UNIT" "$FINALIZER_LEGACY_UNIT"; then
+    fail 'setup finalizer must not make the shared /usr/local/lib directory writable'
+fi
 
 if grep -Fxq 'ReadWritePaths=/etc/nginx' "$FINALIZER_UNIT"; then
     fail 'finalizer must not make the entire Nginx configuration directory writable'

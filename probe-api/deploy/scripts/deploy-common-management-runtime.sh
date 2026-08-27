@@ -482,6 +482,17 @@ validate_release_artifacts() {
     "$artifact_root/api/probe-api" version >/dev/null
 }
 
+validate_bootstrap_managed_release_marker() {
+    local bundle_root="$1"
+    local marker="$bundle_root/.probe-panel-bootstrap-managed" owner_group mode
+    assert_private_file "$marker" root
+    owner_group="$(stat -c '%U:%G' -- "$marker")"
+    mode="$(stat -c '%a' -- "$marker")"
+    [[ "$owner_group" == root:root && "$mode" == 600 ]] ||
+        die "bootstrap-managed release marker must be root:root mode 0600"
+    [[ ! -s "$marker" ]] || die "bootstrap-managed release marker must be empty"
+}
+
 validate_prebuilt_bundle() {
     local bundle_root="$1" profile="${2:-management}"
     validate_release_profile "$profile"
@@ -490,6 +501,7 @@ validate_prebuilt_bundle() {
     [[ "$(release_bundle_profile "$bundle_root")" == "$profile" ]] ||
         die "prebuilt bundle profile changed during validation"
     validate_management_release_platform "$bundle_root"
+    validate_bootstrap_managed_release_marker "$bundle_root"
 
     local required
     for required in \
@@ -556,7 +568,7 @@ validate_prebuilt_bundle() {
         cd "$bundle_root" || die "could not enter management bundle root: $bundle_root"
         find . -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort
     )"
-    expected_root_entries="$(printf '%s\n' BUNDLE-SHA256SUMS RELEASE-MANIFEST artifacts setup source | LC_ALL=C sort)"
+    expected_root_entries="$(printf '%s\n' .probe-panel-bootstrap-managed BUNDLE-SHA256SUMS RELEASE-MANIFEST artifacts setup source | LC_ALL=C sort)"
     [[ "$actual_root_entries" == "$expected_root_entries" ]] ||
         die "prebuilt management bundle contains an unexpected top-level entry"
 

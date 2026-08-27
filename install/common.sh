@@ -2243,6 +2243,18 @@ write_setup_environment() {
     CREATED_ENV=1
 }
 
+mark_bootstrap_managed_release() {
+    local bundle_root="$1" marker="$1/$MANAGED_MARKER"
+    [[ -d "$bundle_root" && ! -L "$bundle_root" ]] ||
+        die "cannot mark an unsafe bootstrap release directory: $bundle_root"
+    [[ ! -e "$marker" && ! -L "$marker" ]] ||
+        die "release bundle already contains the reserved bootstrap marker: $marker"
+    ( set -o noclobber; : > "$marker" ) 2>/dev/null ||
+        die "could not exclusively create the bootstrap release marker: $marker"
+    chown root:root "$marker"
+    chmod 0600 "$marker"
+}
+
 remove_managed_tree() {
     local path="$1"
     local expected_amd64 expected_arm64
@@ -2464,8 +2476,7 @@ install_action() {
     INSTALLED_RELEASE="$RELEASES_ROOT/$(release_bundle_name "$PANEL_PROFILE" "$PANEL_VERSION" "$architecture")"
     [[ ! -e "$INSTALLED_RELEASE" && ! -L "$INSTALLED_RELEASE" ]] ||
         die "release directory already exists: $INSTALLED_RELEASE"
-    : > "$bundle_root/$MANAGED_MARKER"
-    chmod 0600 "$bundle_root/$MANAGED_MARKER"
+    mark_bootstrap_managed_release "$bundle_root"
     mv -T -- "$bundle_root" "$INSTALLED_RELEASE"
     chown -R root:root "$INSTALLED_RELEASE"
 
@@ -2609,6 +2620,7 @@ upgrade_action() {
     [[ "$(find "$extraction_root" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 1 ]] ||
         die 'release archive must contain exactly one root directory'
     validate_release_bundle "$bundle_root" "$architecture" "$PANEL_PROFILE"
+    mark_bootstrap_managed_release "$bundle_root"
 
     # Re-prove the exact target after the immutable bundle has been verified.
     # The packaged release installer owns the deployment/database locks and all

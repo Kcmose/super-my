@@ -275,7 +275,8 @@ func TestLegacySystemdAssetsKeepTheSystemd219SecurityBaseline(t *testing.T) {
 	finalizer := readDeployAsset(t, "setup", "probe-panel-finalizer-management-legacy.service")
 	for _, required := range []string{
 		"CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_NET_BIND_SERVICE CAP_SETGID CAP_SETUID\n",
-		"ProtectSystem=full\n", "ReadOnlyPaths=/srv/probe/setup-ui\n", "ReadWritePaths=/etc/systemd/system\n",
+		"ProtectSystem=full\n", "ReadOnlyPaths=/srv/probe/setup-ui\n", "ReadWritePaths=/usr/local/lib/probe-panel\n",
+		"ReadWritePaths=/etc/systemd/system\n",
 		"RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK\n",
 	} {
 		if !strings.Contains(finalizer, required) {

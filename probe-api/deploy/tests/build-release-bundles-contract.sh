@@ -509,6 +509,66 @@ GENERATED_MANAGEMENT_RUNTIME=$TEST_ROOT/generated-management-runtime.sh
     "$MANAGEMENT_RUNTIME" "$GENERATED_MANAGEMENT_RUNTIME" ||
     fail 'management runtime extractor rejected its reviewed systemd legacy hardening checks'
 
+BOOTSTRAP_MARKER_ROOT=$TEST_ROOT/bootstrap-managed-release
+mkdir "$BOOTSTRAP_MARKER_ROOT"
+: > "$BOOTSTRAP_MARKER_ROOT/.probe-panel-bootstrap-managed"
+chmod 0600 "$BOOTSTRAP_MARKER_ROOT/.probe-panel-bootstrap-managed"
+run_bootstrap_marker_validation() {
+    expected_owner=$1
+    expected_group=$2
+    PROBE_TEST_MARKER_OWNER=$expected_owner \
+    PROBE_TEST_MARKER_GROUP=$expected_group \
+    /bin/bash -c '
+        set -Eeuo pipefail
+        stat() {
+            if [[ ${1:-} == -c ]]; then
+                case ${2:-} in
+                    %U)
+                        printf "%s\n" "$PROBE_TEST_MARKER_OWNER"
+                        return 0
+                        ;;
+                    %U:%G)
+                        printf "%s:%s\n" "$PROBE_TEST_MARKER_OWNER" "$PROBE_TEST_MARKER_GROUP"
+                        return 0
+                        ;;
+                esac
+            fi
+            command stat "$@"
+        }
+        source "$1"
+        validate_bootstrap_managed_release_marker "$2"
+    ' probe-bootstrap-marker-validation "$GENERATED_MANAGEMENT_RUNTIME" "$BOOTSTRAP_MARKER_ROOT"
+}
+
+run_bootstrap_marker_validation root root ||
+    fail 'management runtime rejected the exact root-owned bootstrap release marker'
+
+if run_bootstrap_marker_validation nobody root >/dev/null 2>&1; then
+    fail 'management runtime accepted a bootstrap release marker not owned by root'
+fi
+if run_bootstrap_marker_validation root nogroup >/dev/null 2>&1; then
+    fail 'management runtime accepted a bootstrap release marker not grouped to root'
+fi
+
+printf '%s\n' tainted > "$BOOTSTRAP_MARKER_ROOT/.probe-panel-bootstrap-managed"
+if run_bootstrap_marker_validation root root >/dev/null 2>&1; then
+    fail 'management runtime accepted a non-empty bootstrap release marker'
+fi
+: > "$BOOTSTRAP_MARKER_ROOT/.probe-panel-bootstrap-managed"
+chmod 0644 "$BOOTSTRAP_MARKER_ROOT/.probe-panel-bootstrap-managed"
+if run_bootstrap_marker_validation root root >/dev/null 2>&1; then
+    fail 'management runtime accepted a public bootstrap release marker'
+fi
+rm -f -- "$BOOTSTRAP_MARKER_ROOT/.probe-panel-bootstrap-managed"
+ln -s /dev/null "$BOOTSTRAP_MARKER_ROOT/.probe-panel-bootstrap-managed"
+if run_bootstrap_marker_validation root root >/dev/null 2>&1; then
+    fail 'management runtime accepted a symbolic-link bootstrap release marker'
+fi
+rm -f -- "$BOOTSTRAP_MARKER_ROOT/.probe-panel-bootstrap-managed"
+if run_bootstrap_marker_validation root root >/dev/null 2>&1; then
+    fail 'management runtime accepted a missing bootstrap release marker'
+fi
+
 TAINTED_MANAGEMENT_RUNTIME=$TEST_ROOT/tainted-management-runtime.sh
 cp -- "$MANAGEMENT_RUNTIME" "$TAINTED_MANAGEMENT_RUNTIME"
 printf '\n%s\n' '# independent full release profile concern' >> "$TAINTED_MANAGEMENT_RUNTIME"

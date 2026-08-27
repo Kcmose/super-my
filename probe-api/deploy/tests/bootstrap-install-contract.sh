@@ -1602,10 +1602,12 @@ chmod 0755 "$PACKAGED_WRAPPER_TARGET" "$PACKAGED_WRAPPER_OTHER"
 ln -s "$PACKAGED_WRAPPER_TARGET" "$PACKAGED_WRAPPER_ENTRY"
 run_packaged_wrapper_contract() {
     expected_target=$1
-    package_owner=$2
+    target_package_owner=$2
+    entry_package_owner=${3:-$target_package_owner}
     PROBE_WRAPPER_ENTRY=$PACKAGED_WRAPPER_ENTRY \
         PROBE_WRAPPER_TARGET=$expected_target \
-        PROBE_WRAPPER_OWNER=$package_owner \
+        PROBE_WRAPPER_TARGET_OWNER=$target_package_owner \
+        PROBE_WRAPPER_ENTRY_OWNER=$entry_package_owner \
         /bin/bash -c '
         source "$1"
         stat() {
@@ -1622,7 +1624,12 @@ run_packaged_wrapper_contract() {
         dpkg-query() {
             case "$1" in
                 --search)
-                    printf "%s: %s\n" "$PROBE_WRAPPER_OWNER" "$2"
+                    if [[ "$2" == "$PROBE_WRAPPER_ENTRY" ]]; then
+                        queried_owner=$PROBE_WRAPPER_ENTRY_OWNER
+                    else
+                        queried_owner=$PROBE_WRAPPER_TARGET_OWNER
+                    fi
+                    printf "%s: %s\n" "$queried_owner" "$2"
                     ;;
                 --show)
                     printf "%s" "install ok installed"
@@ -1643,9 +1650,50 @@ if run_packaged_wrapper_contract "$PACKAGED_WRAPPER_OTHER" postgresql-client-com
     fail 'deb-family packaged-wrapper proof accepted an entrypoint resolving to another wrapper'
 fi
 if run_packaged_wrapper_contract "$PACKAGED_WRAPPER_TARGET" foreign-package \
-    >/dev/null 2>&1; then
-    fail 'deb-family packaged-wrapper proof accepted a wrapper registered to another package'
+    postgresql-client-common >/dev/null 2>&1; then
+    fail 'deb-family packaged-wrapper proof accepted a target registered to another package'
 fi
+if run_packaged_wrapper_contract "$PACKAGED_WRAPPER_TARGET" postgresql-client-common \
+    foreign-package \
+    >/dev/null 2>&1; then
+    fail 'deb-family packaged-wrapper proof accepted an entrypoint registered to another package'
+fi
+
+run_distribution_keyring_contract() {
+    platform_id=$1
+    keyring_path=$2
+    package_name=$3
+    /bin/bash -c '
+        source "$1"
+        PLATFORM_ID=$2
+        assert_deb_family_packaged_wrapper() {
+            printf "wrapper|%s|%s|%s\n" "$1" "$2" "$3"
+        }
+        assert_deb_family_packaged_file() {
+            printf "file|%s|%s\n" "$1" "$2"
+        }
+        assert_deb_family_distribution_keyring "$3" "$4"
+    ' probe-distribution-keyring "$WITHOUT_ENTRYPOINT" \
+        "$platform_id" "$keyring_path" "$package_name"
+}
+DEBIAN_13_KEYRING_RESULT=$(run_distribution_keyring_contract \
+    debian-13-systemd /usr/share/keyrings/debian-archive-keyring.gpg \
+    debian-archive-keyring)
+[ "$DEBIAN_13_KEYRING_RESULT" = \
+    'wrapper|/usr/share/keyrings/debian-archive-keyring.gpg|/usr/share/keyrings/debian-archive-keyring.pgp|debian-archive-keyring' ] ||
+    fail 'Debian 13 did not validate its package-owned archive-keyring symlink and target'
+DEBIAN_12_KEYRING_RESULT=$(run_distribution_keyring_contract \
+    debian-12-systemd /usr/share/keyrings/debian-archive-keyring.gpg \
+    debian-archive-keyring)
+[ "$DEBIAN_12_KEYRING_RESULT" = \
+    'file|/usr/share/keyrings/debian-archive-keyring.gpg|debian-archive-keyring' ] ||
+    fail 'Debian 12 did not retain its regular archive-keyring contract'
+UBUNTU_KEYRING_RESULT=$(run_distribution_keyring_contract \
+    ubuntu-24.04-systemd /usr/share/keyrings/ubuntu-archive-keyring.gpg \
+    ubuntu-keyring)
+[ "$UBUNTU_KEYRING_RESULT" = \
+    'file|/usr/share/keyrings/ubuntu-archive-keyring.gpg|ubuntu-keyring' ] ||
+    fail 'Ubuntu did not retain its regular archive-keyring contract'
 
 run_nginx_package_owner_contract() {
     platform_fixture=$1
@@ -2174,6 +2222,8 @@ assert_contains '/run/systemd/system/multi-user.target.wants/$service' "$INSTALL
 assert_contains 'PostgreSQL client commands must enter through /usr/bin/psql and /usr/bin/pg_isready' "$INSTALLER"
 assert_contains '/usr/bin/psql /usr/share/postgresql-common/pg_wrapper postgresql-client-common' "$INSTALLER"
 assert_contains '/usr/bin/pg_isready /usr/share/postgresql-common/pg_wrapper postgresql-client-common' "$INSTALLER"
+assert_contains 'debian-13-systemd:/usr/share/keyrings/debian-archive-keyring.gpg' "$INSTALLER"
+assert_contains '/usr/share/keyrings/debian-archive-keyring.pgp' "$INSTALLER"
 # shellcheck disable=SC2016
 assert_contains 'dpkg-query --search "$file_path"' "$INSTALLER"
 # shellcheck disable=SC2016

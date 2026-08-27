@@ -867,16 +867,35 @@ assert_platform_packaged_file() {
 
 assert_deb_family_packaged_wrapper() {
     local entry_path="$1" expected_target="$2" package_name="$3"
-    local resolved_target
+    local resolved_target package_owner
     [[ "$entry_path" == /* && "$expected_target" == /* ]] ||
         die 'deb-family wrapper validation requires absolute paths'
     [[ -L "$entry_path" ]] || die "$entry_path must be the deb-family symbolic-link entrypoint"
     [[ "$(stat -c '%u:%g' "$entry_path")" == 0:0 ]] ||
         die "$entry_path must be a root-owned symbolic link"
+    package_owner="$(dpkg-query --search "$entry_path" 2>/dev/null || :)"
+    [[ "$package_owner" == "$package_name: $entry_path" ]] ||
+        die "$entry_path is not owned by the expected deb-family package $package_name"
     resolved_target="$(readlink -f -- "$entry_path")"
     [[ "$resolved_target" == "$expected_target" ]] ||
         die "$entry_path does not resolve to the candidate deb-family wrapper: ${resolved_target:-missing}"
     assert_deb_family_packaged_file "$expected_target" "$package_name"
+}
+
+assert_deb_family_distribution_keyring() {
+    local entry_path="$1" package_name="$2"
+    case "$PLATFORM_ID:$entry_path" in
+        debian-13-systemd:/usr/share/keyrings/debian-archive-keyring.gpg)
+            # Debian 13 ships this apt-compatible .gpg entrypoint as a
+            # package-owned symlink to its package-owned .pgp keyring.
+            assert_deb_family_packaged_wrapper \
+                "$entry_path" /usr/share/keyrings/debian-archive-keyring.pgp \
+                "$package_name"
+            ;;
+        *)
+            assert_deb_family_packaged_file "$entry_path" "$package_name"
+            ;;
+    esac
 }
 
 assert_native_deb_family_postgresql_clients() {
@@ -958,7 +977,8 @@ deb_family_platform_prepare_package_sources() {
             ;;
         *) die 'the deb-family distribution keyring contract is unavailable' ;;
     esac
-    assert_deb_family_packaged_file "$distribution_keyring" "$distribution_keyring_package"
+    assert_deb_family_distribution_keyring \
+        "$distribution_keyring" "$distribution_keyring_package"
     [[ -s "$distribution_keyring" ]] ||
         die "the packaged distribution archive keyring is empty: $distribution_keyring"
 

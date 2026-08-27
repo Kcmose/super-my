@@ -46,8 +46,18 @@ grep -Fq "distribution_keyring='/usr/share/keyrings/ubuntu-archive-keyring.gpg'"
     fail 'Ubuntu base repositories are not bound to the packaged Ubuntu archive keyring'
 grep -Fq "distribution_keyring_package='ubuntu-keyring'" "$common" ||
     fail 'the Ubuntu archive keyring package ownership contract is missing'
-grep -Fq 'assert_deb_family_packaged_file "$distribution_keyring" "$distribution_keyring_package"' "$common" ||
-    fail 'the distribution archive keyring is not verified as a packaged secure file'
+package_source_body="$(sed -n '/^deb_family_platform_prepare_package_sources()/,/^}/p' "$common")"
+grep -Fq 'assert_deb_family_distribution_keyring' <<< "$package_source_body" ||
+    fail 'the distribution archive keyring is not verified through its platform-specific package contract'
+distribution_keyring_body="$(sed -n '/^assert_deb_family_distribution_keyring()/,/^}/p' "$common")"
+grep -Fq 'debian-13-systemd:/usr/share/keyrings/debian-archive-keyring.gpg)' <<< "$distribution_keyring_body" ||
+    fail 'Debian 13 is not narrowly matched for its packaged archive-keyring wrapper'
+grep -Fq 'assert_deb_family_packaged_wrapper' <<< "$distribution_keyring_body" ||
+    fail 'Debian 13 does not verify both the packaged archive-keyring wrapper and target'
+grep -Fq '/usr/share/keyrings/debian-archive-keyring.pgp' <<< "$distribution_keyring_body" ||
+    fail 'Debian 13 is not bound to the exact packaged archive-keyring target'
+grep -Fq 'assert_deb_family_packaged_file "$entry_path" "$package_name"' <<< "$distribution_keyring_body" ||
+    fail 'other Debian and Ubuntu releases do not retain the regular packaged-file contract'
 [[ "$(grep -Ec "^[[:space:]]*printf 'deb \\[arch=%s signed-by=%s( |\\])" "$common")" -eq 8 ]] ||
     fail 'every Debian/Ubuntu base repository must use its explicit distribution Signed-By keyring'
 
